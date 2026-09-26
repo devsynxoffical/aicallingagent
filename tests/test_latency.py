@@ -1,6 +1,7 @@
 
 import pytest
 from pipecat.frames.frames import (
+    LLMFullResponseStartFrame,
     LLMTextFrame,
     MetricsFrame,
     TTSSpeakFrame,
@@ -36,11 +37,13 @@ async def test_filler_speaks_when_model_is_slow():
     proc = FillerProcessor(delay_secs=0.05)
     down, _ = await run_test(
         proc,
-        frames_to_send=[UserStoppedSpeakingFrame(), SleepFrame(0.2), LLMTextFrame("So, the reason")],
-        expected_down_frames=[UserStoppedSpeakingFrame, TTSSpeakFrame, LLMTextFrame],
+        frames_to_send=[UserStoppedSpeakingFrame(), LLMFullResponseStartFrame(), SleepFrame(0.2), LLMTextFrame("So, the reason")],
+        expected_down_frames=[UserStoppedSpeakingFrame, LLMFullResponseStartFrame, TTSSpeakFrame, LLMTextFrame],
     )
     filler = [f for f in down if isinstance(f, TTSSpeakFrame)][0]
-    assert filler.text in FillerProcessor.__init__.__defaults__[1] if FillerProcessor.__init__.__defaults__ else True
+    from callagent.voice.fillers import NEUTRAL_FILLERS
+
+    assert filler.text in NEUTRAL_FILLERS
     assert filler.append_to_context is False
     assert proc.filler_count == 1
 
@@ -50,11 +53,15 @@ async def test_no_filler_when_model_is_fast_or_user_interrupts():
     proc = FillerProcessor(delay_secs=0.1)
     await run_test(
         proc,
-        frames_to_send=[UserStoppedSpeakingFrame(), LLMTextFrame("Hi"), SleepFrame(0.2),
-                        UserStoppedSpeakingFrame(), UserStartedSpeakingFrame(), SleepFrame(0.2)],
-        expected_down_frames=[UserStoppedSpeakingFrame, LLMTextFrame, UserStoppedSpeakingFrame, UserStartedSpeakingFrame],
+        frames_to_send=[UserStoppedSpeakingFrame(), LLMFullResponseStartFrame(), LLMTextFrame("Hi"), SleepFrame(0.2),
+                        # system frames (interruptions) overtake queued data frames; a tiny sleep keeps the order deterministic
+                        UserStoppedSpeakingFrame(), LLMFullResponseStartFrame(), SleepFrame(0.02), UserStartedSpeakingFrame(), SleepFrame(0.2),
+                        # a second model round in the same turn (after a tool call) must not add a second filler
+                        UserStoppedSpeakingFrame(), LLMFullResponseStartFrame(), SleepFrame(0.2), LLMFullResponseStartFrame(), SleepFrame(0.2)],
+        expected_down_frames=[UserStoppedSpeakingFrame, LLMFullResponseStartFrame, LLMTextFrame, UserStoppedSpeakingFrame, LLMFullResponseStartFrame,
+                              UserStartedSpeakingFrame, UserStoppedSpeakingFrame, LLMFullResponseStartFrame, TTSSpeakFrame, LLMFullResponseStartFrame],
     )
-    assert proc.filler_count == 0
+    assert proc.filler_count == 1  # only the third turn, and only once despite two model rounds
 
 
 @pytest.mark.asyncio

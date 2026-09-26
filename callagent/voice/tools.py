@@ -30,7 +30,9 @@ DISPOSITIONS = [
     "gatekeeper",
     "voicemail_left",
     "do_not_call",
+    "transferred_to_human",
     "no_answer",
+    "busy",
     "other",
 ]
 
@@ -247,6 +249,7 @@ async def transfer_to_human(session: CallSession, params: FunctionCallParams) ->
         return {"ok": False, "error": "no human transfer number configured; offer a callback instead"}
     session.end_reason = "transferred"
     session.ended_by_agent = True
+    session.disposition = "transferred_to_human"
     await asyncio.to_thread(twilio_client.transfer_call, session.twilio_call_sid, number, session.settings)
     return {"ok": True, "_run_llm": False}
 

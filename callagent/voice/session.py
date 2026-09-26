@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -30,7 +29,6 @@ class CallSession:
     idle_nudges: int = 0
     user_has_spoken: bool = False
     latency: dict[str, list[float]] = field(default_factory=dict)
-    _end_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def log_tool(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
         self.tool_events.append(

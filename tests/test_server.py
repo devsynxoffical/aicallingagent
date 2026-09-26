@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from callagent import db
-from callagent.config import get_settings
+from callagent.config import get_settings, resolve_api_token
 
 
 @pytest.fixture
@@ -18,8 +18,16 @@ def client(tmp_path, monkeypatch, sample_playbook):
     from callagent.server import app
 
     with TestClient(app) as c:
+        c.headers["Authorization"] = f"Bearer {resolve_api_token(get_settings())}"
         yield c
     get_settings.cache_clear()
+
+
+def test_api_requires_token(client):
+    assert client.get("/health").status_code == 200  # health is public
+    assert client.get("/api/campaigns", headers={"Authorization": ""}).status_code == 401
+    assert client.get("/api/campaigns", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert client.get("/api/campaigns").status_code == 200
 
 
 def test_campaign_lifecycle_and_twilio_webhooks(client, sample_playbook):

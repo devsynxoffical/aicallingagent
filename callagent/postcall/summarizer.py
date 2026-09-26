@@ -25,7 +25,9 @@ Disposition = Literal[
     "gatekeeper",
     "voicemail_left",
     "do_not_call",
+    "transferred_to_human",
     "no_answer",
+    "busy",
     "other",
 ]
 
@@ -159,13 +161,13 @@ async def finalize_call(
             return
         if lead.status == "callback" and lead.next_attempt_at and lead.next_attempt_at > now:
             return  # callback already scheduled by the in-call tool
-        terminal = {"meeting_booked", "sale_closed", "not_interested", "not_qualified", "wrong_number", "do_not_call"}
+        terminal = {"meeting_booked", "sale_closed", "not_interested", "not_qualified", "wrong_number", "do_not_call", "transferred_to_human"}
         if disposition in terminal:
             lead.status = "completed"
         elif review and review.retry_recommended and lead.attempts < settings.max_attempts:
             lead.status = "pending"
             lead.next_attempt_at = now + timedelta(hours=max(1, review.retry_after_hours))
-        elif disposition in {"no_answer", "voicemail_left", "gatekeeper", "callback_requested", "other"} and lead.attempts < settings.max_attempts:
+        elif disposition in {"no_answer", "busy", "voicemail_left", "gatekeeper", "callback_requested", "other"} and lead.attempts < settings.max_attempts:
             lead.status = "pending"
             lead.next_attempt_at = now + timedelta(minutes=settings.retry_delay_minutes)
         else:

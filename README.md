@@ -162,6 +162,29 @@ output tokens; it is Claude API only.
   `disclose_ai_if_asked`). Check your local rules on AI disclosure and calling hours;
   in many places both are legally required.
 
+## Security
+
+The server must be reachable by Twilio, so it is public. Two layers protect it:
+
+- Twilio webhooks (`/twilio/voice`, `/twilio/status`) are verified with the
+  `X-Twilio-Signature` header against your auth token. Keep `TWILIO_VALIDATE_SIGNATURE=true`.
+- The control API (`/api/*`, which can start campaigns and dial numbers) requires
+  `Authorization: Bearer <token>`. Set `API_TOKEN`, or let the server generate one into
+  `DATA_DIR/api_token` on first start. The CLI reads the same file, so on one machine it
+  just works. Toll fraud is real; do not disable this.
+
+## Deploying
+
+```bash
+docker compose up -d --build     # uses .env, persists data/ and the SQLite DB
+```
+
+Or any host with Python 3.11: `pip install .` and `callagent serve` behind an HTTPS
+reverse proxy that also passes WebSockets to `/ws`. Set `PUBLIC_BASE_URL` to that
+HTTPS origin. One process runs the dialer and every live call; scale the concurrency with
+`MAX_CONCURRENT_CALLS` (each live call uses roughly one CPU core for VAD, turn detection
+and audio resampling).
+
 ## Configuration
 
 Everything is in `.env` (see `.env.example`). The required keys for live calls:

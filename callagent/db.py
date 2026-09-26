@@ -10,11 +10,13 @@ from typing import Any, Callable, TypeVar
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
     String,
     Text,
+    TypeDecorator,
     create_engine,
     func,
     select,
@@ -30,6 +32,31 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class TZDateTime(TypeDecorator):
+    """Timezone-aware UTC datetimes on every backend.
+
+    SQLite has no timezone support and SQLAlchemy hands back naive datetimes from it,
+    which then blow up when compared with aware ones. Store UTC-naive, load UTC-aware.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -43,8 +70,8 @@ class Campaign(Base):
     playbook_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="draft")  # draft|ready|running|paused|done
     max_concurrent_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow, onupdate=utcnow)
 
     leads: Mapped[list["Lead"]] = relationship(back_populates="campaign", cascade="all, delete-orphan")
 
@@ -65,10 +92,10 @@ class Lead(Base):
     # pending | queued | calling | completed | callback | failed | dnc
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
-    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
     last_disposition: Mapped[str | None] = mapped_column(String(40), nullable=True)
     notes: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
     campaign: Mapped[Campaign] = relationship(back_populates="leads")
     calls: Mapped[list["CallRun"]] = relationship(back_populates="lead", cascade="all, delete-orphan")
@@ -89,8 +116,10 @@ class CallRun(Base):
     status: Mapped[str] = mapped_column(String(20), default="created")
     answered_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
     mode: Mapped[str] = mapped_column(String(20), default="live")  # live | voicemail
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # True once the media stream reached our server (someone or something answered and we talked).
+    stream_connected: Mapped[bool] = mapped_column(Boolean, default=False)
+    started_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     transcript: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     tool_events: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
@@ -111,7 +140,7 @@ class Appointment(Base):
     starts_at: Mapped[str] = mapped_column(String(64))  # ISO 8601 as spoken/confirmed
     timezone: Mapped[str] = mapped_column(String(64), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
 
 class DoNotCall(Base):
@@ -120,7 +149,7 @@ class DoNotCall(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     phone_e164: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     reason: Mapped[str] = mapped_column(String(200), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
 
 # --------------------------------------------------------------------------- engine

@@ -17,7 +17,7 @@ import anthropic
 from pydantic import BaseModel, Field
 
 from .config import Settings, get_settings
-from .llm import make_client, parse_structured, text_completion, text_of
+from .llm import live_call_completion, make_client, parse_structured, text_completion, text_of
 from .playbook.prompt_builder import build_system_prompt
 from .playbook.schema import Playbook
 from .voice.tools import build_tools_schema
@@ -98,15 +98,8 @@ def rehearse_once(
     for _ in range(max_turns):
         # --- agent turn (may call tools; stub them)
         while True:
-            reply = text_completion(
-                client,
-                model=settings.call_model,
-                system=agent_system,
-                messages=agent_messages,
-                effort=settings.call_effort,
-                max_tokens=settings.call_max_tokens + 200,
-                tools=tools,
-                settings=settings,
+            reply = live_call_completion(
+                client, system=agent_system, messages=agent_messages, tools=tools, settings=settings
             )
             agent_messages.append({"role": "assistant", "content": reply.content})
             spoken = text_of(reply)

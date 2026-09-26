@@ -1,9 +1,9 @@
 """Natural backchannel while the model is still composing its first word.
 
 Humans say "Mm-hm." or "Right." before a considered answer; dead air is what sounds
-robotic. When the prospect stops speaking we start a timer; if no model text has
-reached TTS by the deadline we speak one short filler, at most once per turn, and never
-when the prospect interrupts.
+robotic. When the model starts a response (the request goes out) we start a timer; if
+no model text has arrived by the deadline we speak one short filler, at most once per
+prospect turn, and never when the prospect is talking.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InterruptionFrame,
+    LLMFullResponseStartFrame,
     LLMTextFrame,
     TTSSpeakFrame,
     UserStartedSpeakingFrame,
@@ -48,6 +49,7 @@ class FillerProcessor(FrameProcessor):
             await asyncio.sleep(self._delay)
         except asyncio.CancelledError:
             return
+        self._timer = None
         if self._spoke_this_turn:
             return
         self._spoke_this_turn = True
@@ -61,9 +63,13 @@ class FillerProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, UserStoppedSpeakingFrame):
+            # New prospect turn: a filler is allowed again once the model starts answering.
             self._cancel_timer()
             self._spoke_this_turn = False
-            self._timer = self.create_task(self._fire())
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            # The request is on its way. If the first word is slow, bridge the gap.
+            if not self._spoke_this_turn and self._timer is None:
+                self._timer = self.create_task(self._fire())
         elif isinstance(frame, (UserStartedSpeakingFrame, InterruptionFrame)):
             self._cancel_timer()
             self._spoke_this_turn = True  # never talk over the prospect

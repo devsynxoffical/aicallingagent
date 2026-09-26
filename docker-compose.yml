@@ -1,0 +1,12 @@
+services:
+  callagent:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: sqlite:////app/data/callagent.db
+      DATA_DIR: /app/data
+    restart: unless-stopped

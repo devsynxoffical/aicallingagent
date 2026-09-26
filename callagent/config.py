@@ -77,6 +77,8 @@ class Settings(BaseSettings):
     server_port: int = 8000
     server_url: str = "http://localhost:8000"
     booking_webhook_url: str | None = None
+    # Bearer token for /api/*. Generated into DATA_DIR/api_token on first run if unset; the CLI reads the same file.
+    api_token: str | None = None
 
     @field_validator("calling_window_start", "calling_window_end", mode="before")
     @classmethod
@@ -115,6 +117,25 @@ class Settings(BaseSettings):
             "PUBLIC_BASE_URL": self.public_base_url,
         }
         return [k for k, v in required.items() if not v]
+
+
+def resolve_api_token(settings: "Settings") -> str:
+    """The shared secret between the CLI and the server. Env wins; otherwise a random token
+    is created once in DATA_DIR/api_token (mode 600) and reused."""
+    if settings.api_token:
+        return settings.api_token
+    import secrets
+
+    path = settings.data_dir / "api_token"
+    if path.exists():
+        return path.read_text().strip()
+    token = secrets.token_urlsafe(32)
+    path.write_text(token)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return token
 
 
 @lru_cache

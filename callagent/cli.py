@@ -21,7 +21,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from .config import get_settings
+from .config import get_settings, resolve_api_token
 from .db import Campaign, get_campaign_by_name, session_scope
 from .playbook.schema import Playbook, QAPair
 
@@ -282,8 +282,9 @@ def serve(host: str = typer.Option(None), port: int = typer.Option(None), reload
 
 def _api(method: str, path: str, **kwargs):
     settings = get_settings()
+    headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {resolve_api_token(settings)}"}
     try:
-        r = httpx.request(method, settings.server_url + path, timeout=60, **kwargs)
+        r = httpx.request(method, settings.server_url + path, timeout=60, headers=headers, **kwargs)
     except httpx.ConnectError:
         raise typer.Exit(console.print(f"[red]Cannot reach the server at {settings.server_url}. Start it with `callagent serve`.[/red]") or 1)
     if r.status_code >= 400:

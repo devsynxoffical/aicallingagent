@@ -9,13 +9,15 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket
+import secrets as _secrets
+
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import select
 
-from .config import Settings, get_settings
+from .config import Settings, get_settings, resolve_api_token
 from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, run_db
 from .dialer import twilio_client
 from .dialer.campaign_runner import CampaignRunner, apply_twilio_status
@@ -50,6 +52,14 @@ app = FastAPI(title="callagent", lifespan=lifespan)
 def _runner() -> CampaignRunner:
     assert runner is not None
     return runner
+
+
+async def require_api_token(authorization: str | None = Header(default=None), settings: Settings = Depends(get_settings)):
+    """Every /api route needs `Authorization: Bearer <token>`. Twilio routes use signature validation instead."""
+    expected = resolve_api_token(settings)
+    given = authorization.split(" ", 1)[1].strip() if authorization and authorization.lower().startswith("bearer ") else ""
+    if not given or not _secrets.compare_digest(given, expected):
+        raise HTTPException(status_code=401, detail="missing or invalid API token (see DATA_DIR/api_token or API_TOKEN)")
 
 
 # ----------------------------------------------------------------------------- Twilio
@@ -174,12 +184,12 @@ async def health(settings: Settings = Depends(get_settings)):
     return {"ok": True, "missing_for_calls": settings.missing_for_calls()}
 
 
-@app.get("/api/campaigns", response_model=list[CampaignOut])
+@app.get("/api/campaigns", response_model=list[CampaignOut], dependencies=[Depends(require_api_token)])
 async def list_campaigns():
     return await run_db(lambda s: [_campaign_out(s, c) for c in s.execute(select(Campaign)).scalars()])
 
 
-@app.post("/api/campaigns", response_model=CampaignOut)
+@app.post("/api/campaigns", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def create_campaign(body: CampaignIn):
     def _create(s):
         existing = get_campaign_by_name(s, body.name)
@@ -202,12 +212,12 @@ async def create_campaign(body: CampaignIn):
     return await run_db(_create)
 
 
-@app.get("/api/campaigns/{name}", response_model=CampaignOut)
+@app.get("/api/campaigns/{name}", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def get_campaign(name: str):
     return await run_db(lambda s: _campaign_out(s, _get_campaign(s, name)))
 
 
-@app.post("/api/campaigns/{name}/leads")
+@app.post("/api/campaigns/{name}/leads", dependencies=[Depends(require_api_token)])
 async def upload_leads(name: str, file: UploadFile = File(...), settings: Settings = Depends(get_settings)):
     suffix = Path(file.filename or "leads.csv").suffix or ".csv"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -220,7 +230,7 @@ async def upload_leads(name: str, file: UploadFile = File(...), settings: Settin
     return report.as_dict()
 
 
-@app.post("/api/campaigns/{name}/start", response_model=CampaignOut)
+@app.post("/api/campaigns/{name}/start", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def start_campaign(name: str, concurrency: int | None = None, force: bool = False, settings: Settings = Depends(get_settings)):
     missing = settings.missing_for_calls()
     if missing:
@@ -241,14 +251,14 @@ async def start_campaign(name: str, concurrency: int | None = None, force: bool 
     return await run_db(lambda s: _campaign_out(s, _get_campaign(s, name)))
 
 
-@app.post("/api/campaigns/{name}/pause", response_model=CampaignOut)
+@app.post("/api/campaigns/{name}/pause", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def pause_campaign(name: str):
     cid = await run_db(lambda s: _get_campaign(s, name).id)
     await _runner().stop(cid, status="paused")
     return await run_db(lambda s: _campaign_out(s, _get_campaign(s, name)))
 
 
-@app.post("/api/campaigns/{name}/dial")
+@app.post("/api/campaigns/{name}/dial", dependencies=[Depends(require_api_token)])
 async def dial_one(name: str, phone: str, first_name: str = "", settings: Settings = Depends(get_settings)):
     """Place a single test call to one number (added to the campaign as a lead)."""
     missing = settings.missing_for_calls()
@@ -274,7 +284,7 @@ async def dial_one(name: str, phone: str, first_name: str = "", settings: Settin
     return {"call_run_id": run_id}
 
 
-@app.get("/api/campaigns/{name}/calls")
+@app.get("/api/campaigns/{name}/calls", dependencies=[Depends(require_api_token)])
 async def list_calls(name: str, limit: int = 50):
     def _q(s):
         c = _get_campaign(s, name)
@@ -301,7 +311,7 @@ async def list_calls(name: str, limit: int = 50):
     return await run_db(_q)
 
 
-@app.get("/api/calls/{call_run_id}")
+@app.get("/api/calls/{call_run_id}", dependencies=[Depends(require_api_token)])
 async def get_call(call_run_id: int):
     def _q(s):
         r = s.get(CallRun, call_run_id)
@@ -324,7 +334,7 @@ async def get_call(call_run_id: int):
     return await run_db(_q)
 
 
-@app.get("/api/campaigns/{name}/export.csv")
+@app.get("/api/campaigns/{name}/export.csv", dependencies=[Depends(require_api_token)])
 async def export_csv(name: str):
     def _rows(s):
         c = _get_campaign(s, name)

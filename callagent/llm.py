@@ -122,5 +122,29 @@ def live_call_request_options(settings: Settings | None = None) -> dict[str, Any
     return opts
 
 
+def live_call_completion(
+    client: anthropic.Anthropic,
+    *,
+    system: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    settings: Settings | None = None,
+) -> anthropic.types.beta.BetaMessage:
+    """One agent turn with the same options the phone pipeline uses (see live_call_request_options)."""
+    settings = settings or get_settings()
+    opts = live_call_request_options(settings)
+    betas = opts.pop("betas")
+    kwargs: dict[str, Any] = dict(opts)
+    if betas:
+        kwargs["betas"] = betas
+    if tools:
+        kwargs["tools"] = tools
+    response = client.beta.messages.create(system=system, messages=messages, **kwargs)
+    if response.stop_reason == "refusal":
+        details = getattr(response, "stop_details", None)
+        raise RuntimeError(f"Claude declined the request: {getattr(details, 'explanation', '') or details}")
+    return response
+
+
 def text_of(message: Any) -> str:
     return "".join(block.text for block in message.content if getattr(block, "type", "") == "text").strip()

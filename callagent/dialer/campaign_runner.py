@@ -8,7 +8,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import case, or_, select
 from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
@@ -17,7 +17,7 @@ from . import twilio_client
 
 log = logging.getLogger(__name__)
 
-ACTIVE_CALL_STATUSES = ("created", "initiated", "ringing", "in-progress")
+ACTIVE_CALL_STATUSES = ("created", "queued", "initiated", "ringing", "in-progress")
 
 
 def in_calling_window(now_utc: datetime, tz_name: str | None, start: time, end: time, default_tz: str) -> bool:
@@ -48,16 +48,21 @@ def next_window_open(now_utc: datetime, tz_name: str | None, start: time, defaul
 
 def pick_next_lead(s: Session, campaign_id: int, settings: Settings) -> Lead | None:
     now = utcnow()
+    # Callbacks the prospect asked for are honored even past max_attempts, and go first.
     candidates = (
         s.execute(
             select(Lead)
             .where(
                 Lead.campaign_id == campaign_id,
                 Lead.status.in_(("pending", "callback")),
-                Lead.attempts < settings.max_attempts,
+                or_(Lead.attempts < settings.max_attempts, Lead.status == "callback"),
                 (Lead.next_attempt_at.is_(None)) | (Lead.next_attempt_at <= now),
             )
-            .order_by(Lead.status.desc(), Lead.next_attempt_at.asc().nulls_last(), Lead.id.asc())
+            .order_by(
+                case((Lead.status == "callback", 0), else_=1),
+                Lead.next_attempt_at.asc().nulls_last(),
+                Lead.id.asc(),
+            )
             .limit(50)
         )
         .scalars()
@@ -145,6 +150,17 @@ class CampaignRunner:
 
         await run_db(_mark)
 
+    async def _finish(self, campaign_id: int, status: str) -> None:
+        """Called from inside the loop task itself: mark the campaign and let the task return."""
+        self._tasks.pop(campaign_id, None)
+
+        def _mark(s):
+            c = s.get(Campaign, campaign_id)
+            if c:
+                c.status = status
+
+        await run_db(_mark)
+
     async def stop_all(self) -> None:
         for cid in list(self._tasks):
             await self.stop(cid)
@@ -200,7 +216,7 @@ class CampaignRunner:
             try:
                 snapshot = await run_db(lambda s: self._tick_snapshot(s, campaign_id))
                 if snapshot is None:
-                    await self.stop(campaign_id, status="done")
+                    await self._finish(campaign_id, status="paused")
                     return
                 max_conc, active, lead = snapshot
                 if active >= max_conc or lead is None:
@@ -209,7 +225,7 @@ class CampaignRunner:
                         remaining = await run_db(lambda s: self._remaining(s, campaign_id))
                         if remaining == 0:
                             log.info("campaign %s: all leads worked, finishing", campaign_id)
-                            await self.stop(campaign_id, status="done")
+                            await self._finish(campaign_id, status="done")
                             return
                     await asyncio.sleep(5)
                     continue
@@ -268,13 +284,13 @@ def apply_twilio_status(s: Session, call_run_id: int, form: dict[str, Any], sett
         if dur and str(dur).isdigit():
             run.duration_seconds = int(dur)
         lead = s.get(Lead, run.lead_id)
-        if lead and lead.status == "calling":
-            # Nobody talked to the agent: schedule a retry or give up.
-            if status != "completed" or not run.transcript:
-                run.disposition = run.disposition or "no_answer"
-                lead.last_disposition = run.disposition
-                if lead.attempts >= settings.max_attempts:
-                    lead.status = "failed" if status == "failed" else "completed"
-                else:
-                    lead.status = "pending"
-                    lead.next_attempt_at = utcnow() + timedelta(minutes=settings.retry_delay_minutes)
+        if lead and lead.status == "calling" and not run.stream_connected:
+            # The media stream never reached us: nobody (and no voicemail) picked up.
+            # If it did connect, post-call finalization owns the lead's next state.
+            run.disposition = run.disposition or ("busy" if status == "busy" else "no_answer")
+            lead.last_disposition = run.disposition
+            if lead.attempts >= settings.max_attempts:
+                lead.status = "failed" if status == "failed" else "completed"
+            else:
+                lead.status = "pending"
+                lead.next_attempt_at = utcnow() + timedelta(minutes=settings.retry_delay_minutes)

@@ -18,7 +18,7 @@ from typing import Any
 from fastapi import WebSocket
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import EndWorkerFrame, LLMMessagesAppendFrame, LLMRunFrame, TTSSpeakFrame
+from pipecat.frames.frames import EndWorkerFrame, LLMMessagesAppendFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -88,6 +88,7 @@ async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook,
             "attempts": lead.attempts,
         }
         run.status = "in-progress"
+        run.stream_connected = True
         return lead_dict, Playbook.model_validate(campaign.playbook_json), campaign.id, run.twilio_call_sid
 
     return await run_db(_load)
@@ -147,7 +148,8 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
     }
     if lang is not None:
         stt_settings["language"] = lang
-    if playbook.keyterms:
+    if playbook.keyterms and playbook.persona.language.lower().startswith("en"):
+        # Nova-3 keyterm prompting is English-only; Deepgram rejects it for other languages.
         stt_settings["keyterm"] = playbook.keyterms[:50]
     stt = DeepgramSTTService(api_key=settings.deepgram_api_key or "", settings=DeepgramSTTService.Settings(**stt_settings))
 
@@ -216,13 +218,17 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
 
     opener_timer: asyncio.Task | None = None
 
+    async def cue(text: str) -> None:
+        """Feed the model a stage direction and let it speak. Never runs on an empty context."""
+        await task.queue_frame(LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True))
+
     async def speak_first_after_delay():
         # On outbound calls the callee usually says "Hello?" first. Give them a moment;
         # if they stay silent, open the conversation ourselves.
         try:
             await asyncio.sleep(settings.opener_delay_seconds)
             if not session.user_has_spoken:
-                await task.queue_frame(LLMRunFrame())
+                await cue("(The call connected but the prospect hasn't said anything yet. Open the call naturally, as if they just picked up.)")
         except asyncio.CancelledError:
             pass
 
@@ -231,7 +237,7 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
         nonlocal opener_timer
         log.info("call %s connected (mode=%s)", call_run_id, mode)
         if mode == "voicemail":
-            await task.queue_frame(LLMRunFrame())
+            await cue("(You have reached voicemail and the beep has just played. Leave the message now.)")
         else:
             opener_timer = asyncio.create_task(speak_first_after_delay())
 
@@ -258,19 +264,9 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
             return
         session.idle_nudges += 1
         if session.idle_nudges == 1:
-            await task.queue_frame(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "user", "content": "(The line has gone quiet for a while. Check briefly if they are still there, in one short sentence.)"}],
-                    run_llm=True,
-                )
-            )
+            await cue("(The line has gone quiet for a while. Check briefly if they are still there, in one short sentence.)")
         elif session.idle_nudges == 2:
-            await task.queue_frame(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "user", "content": "(Still silence. Say a short, warm goodbye and call end_call with reason 'no response'.)"}],
-                    run_llm=True,
-                )
-            )
+            await cue("(Still silence. Say a short, warm goodbye and call end_call with reason 'no response'.)")
         else:
             session.end_reason = "silence"
             await task.queue_frames([TTSSpeakFrame("Alright, I'll let you go. Have a good one."), EndWorkerFrame(reason="silence")])
