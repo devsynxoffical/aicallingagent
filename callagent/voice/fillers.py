@@ -35,7 +35,8 @@ class FillerProcessor(FrameProcessor):
         self._delay = delay_secs
         self._fillers = fillers
         self._timer: asyncio.Task | None = None
-        self._spoke_this_turn = False
+        # Armed only after a real prospect turn: the opener and silence nudges get no filler.
+        self._spoke_this_turn = True
         self._last_filler: str | None = None
         self.filler_count = 0
 

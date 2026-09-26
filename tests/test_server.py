@@ -56,6 +56,10 @@ def test_campaign_lifecycle_and_twilio_webhooks(client, sample_playbook):
     r = client.post(f"/twilio/voice?call_run_id={rid}", data={"AnsweredBy": "human", "CallSid": "CA1"})
     assert r.status_code == 200 and "<Stream" in r.text and "live" in r.text and str(rid) in r.text
     assert 'url="wss://example.ngrok.app/ws"' in r.text
+    assert 'name="stream_token"' in r.text
+    with db.session_scope() as s:
+        token = s.get(db.CallRun, rid).stream_token
+    assert token and token in r.text
 
     # Voicemail beep: stream in voicemail mode.
     r = client.post(f"/twilio/voice?call_run_id={rid}", data={"AnsweredBy": "machine_end_beep", "CallSid": "CA1"})

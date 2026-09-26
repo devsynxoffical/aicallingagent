@@ -9,7 +9,9 @@ import anthropic
 from pydantic import BaseModel, Field
 
 from ..config import Settings, get_settings
-from ..db import CallRun, Lead, run_db
+from sqlalchemy import select
+
+from ..db import Appointment, CallRun, Lead, run_db
 from ..llm import make_client, parse_structured
 from ..playbook.schema import Playbook
 from ..voice.tools import DISPOSITIONS
@@ -46,6 +48,16 @@ class CallReview(BaseModel):
     coaching_notes: list[str] = Field(description="Specific, actionable notes to improve future calls.")
     playbook_suggestions: list[str] = Field(description="Concrete edits to the playbook this call suggests. Empty if none.")
 
+
+TERMINAL_DISPOSITIONS = {
+    "meeting_booked",
+    "sale_closed",
+    "not_interested",
+    "not_qualified",
+    "wrong_number",
+    "do_not_call",
+    "transferred_to_human",
+}
 
 REVIEW_SYSTEM = """You review transcripts of outbound sales calls made by an AI voice agent.
 You know the playbook the agent was running. Be honest and specific: the goal is to
@@ -147,6 +159,9 @@ async def finalize_call(
     disposition = (review.disposition if review else None) or agent_disposition
     if disposition is None:
         disposition = "voicemail_left" if mode == "voicemail" else ("other" if transcript else "no_answer")
+    # What the agent actually did on the call outranks the reviewer's reading of the transcript.
+    if agent_disposition in TERMINAL_DISPOSITIONS:
+        disposition = agent_disposition
 
     def _apply(s):
         run = s.get(CallRun, call_run_id)
@@ -161,8 +176,8 @@ async def finalize_call(
             return
         if lead.status == "callback" and lead.next_attempt_at and lead.next_attempt_at > now:
             return  # callback already scheduled by the in-call tool
-        terminal = {"meeting_booked", "sale_closed", "not_interested", "not_qualified", "wrong_number", "do_not_call", "transferred_to_human"}
-        if disposition in terminal:
+        booked = s.execute(select(Appointment.id).where(Appointment.call_run_id == call_run_id).limit(1)).first() is not None
+        if booked or disposition in TERMINAL_DISPOSITIONS:
             lead.status = "completed"
         elif review and review.retry_recommended and lead.attempts < settings.max_attempts:
             lead.status = "pending"

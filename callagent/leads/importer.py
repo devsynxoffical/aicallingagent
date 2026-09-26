@@ -16,11 +16,11 @@ from sqlalchemy.orm import Session
 
 from ..db import Campaign, Lead, is_dnc
 
-PHONE_COLUMNS = ("phone", "phone_number", "mobile", "cell", "telephone", "tel", "number", "phone number", "mobile number")
-FIRST_COLUMNS = ("first_name", "first name", "firstname", "given_name", "first")
-LAST_COLUMNS = ("last_name", "last name", "lastname", "surname", "family_name", "last")
+PHONE_COLUMNS = ("phone", "phone_number", "phone number", "mobile", "mobile number", "cell", "cellphone", "telephone", "tel")
+FIRST_COLUMNS = ("first_name", "first name", "firstname", "given_name", "given name", "vorname")
+LAST_COLUMNS = ("last_name", "last name", "lastname", "surname", "family_name", "family name", "nachname")
 NAME_COLUMNS = ("name", "full_name", "full name", "contact", "contact name", "owner")
-COMPANY_COLUMNS = ("company", "business", "company name", "business name", "organization", "organisation", "account")
+COMPANY_COLUMNS = ("company", "business", "company name", "business name", "organization", "organisation", "firma")
 EMAIL_COLUMNS = ("email", "e-mail", "email address")
 TZ_COLUMNS = ("timezone", "time zone", "tz")
 NOTES_COLUMNS = ("notes", "note", "comments", "comment")
@@ -46,15 +46,23 @@ class ImportReport:
         }
 
 
+def _tokens(header: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", header.lower()) if t]
+
+
 def _find_col(columns: list[str], candidates: tuple[str, ...]) -> str | None:
+    """Exact header match first, then whole-word match ("Phone Number" matches "phone",
+    "hotel" does not match "tel", "last_contacted" does not match "last")."""
     lowered = {c.lower().strip(): c for c in columns}
     for cand in candidates:
         if cand in lowered:
             return lowered[cand]
     for cand in candidates:
-        for low, orig in lowered.items():
-            if cand in low:
-                return orig
+        cand_tokens = _tokens(cand)
+        for col in columns:
+            toks = _tokens(col)
+            if all(t in toks for t in cand_tokens):
+                return col
     return None
 
 

@@ -118,6 +118,8 @@ class CallRun(Base):
     mode: Mapped[str] = mapped_column(String(20), default="live")  # live | voicemail
     # True once the media stream reached our server (someone or something answered and we talked).
     stream_connected: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Random secret handed to Twilio in the TwiML <Parameter>; the /ws handshake must present it.
+    stream_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)

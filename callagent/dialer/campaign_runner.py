@@ -87,8 +87,26 @@ def count_active_calls(s: Session, campaign_id: int) -> int:
     )
 
 
-def reap_stale_calls(s: Session, campaign_id: int, older_than_minutes: int = 20) -> int:
+TERMINAL_CALL_STATUSES = ("completed", "busy", "no-answer", "failed", "canceled")
+
+
+def reap_stale_calls(s: Session, campaign_id: int, settings: Settings | None = None) -> int:
+    """Two kinds of leftovers: calls that never got a final status, and leads left in
+    "calling" although their call already ended (process crash mid-call, lost webhook)."""
+    settings = settings or get_settings()
+    older_than_minutes = max(20, settings.call_time_limit_seconds // 60 + 5)
     cutoff = utcnow() - timedelta(minutes=older_than_minutes)
+    stuck_leads = (
+        s.execute(select(Lead).where(Lead.campaign_id == campaign_id, Lead.status == "calling")).scalars().all()
+    )
+    recovered = 0
+    for lead in stuck_leads:
+        last = s.execute(select(CallRun).where(CallRun.lead_id == lead.id).order_by(CallRun.id.desc()).limit(1)).scalar_one_or_none()
+        ended = last is not None and last.status in TERMINAL_CALL_STATUSES and last.ended_at is not None
+        if ended and last.ended_at < utcnow() - timedelta(minutes=5):
+            lead.status = "pending" if lead.attempts < settings.max_attempts else "completed"
+            lead.next_attempt_at = utcnow() + timedelta(minutes=settings.retry_delay_minutes)
+            recovered += 1
     stale = (
         s.execute(
             select(CallRun).where(
@@ -108,7 +126,7 @@ def reap_stale_calls(s: Session, campaign_id: int, older_than_minutes: int = 20)
         if lead and lead.status == "calling":
             lead.status = "pending"
             lead.next_attempt_at = utcnow() + timedelta(minutes=30)
-    return len(stale)
+    return len(stale) + recovered
 
 
 class CampaignRunner:
@@ -247,7 +265,7 @@ class CampaignRunner:
         campaign = s.get(Campaign, campaign_id)
         if campaign is None or campaign.status not in ("running",):
             return None
-        reap_stale_calls(s, campaign_id)
+        reap_stale_calls(s, campaign_id, self.settings)
         max_conc = campaign.max_concurrent_calls or self.settings.max_concurrent_calls
         active = count_active_calls(s, campaign_id)
         lead = pick_next_lead(s, campaign_id, self.settings) if active < max_conc else None
@@ -259,7 +277,7 @@ class CampaignRunner:
                 select(Lead.id).where(
                     Lead.campaign_id == campaign_id,
                     Lead.status.in_(("pending", "callback", "queued", "calling")),
-                    Lead.attempts < self.settings.max_attempts,
+                    or_(Lead.attempts < self.settings.max_attempts, Lead.status == "callback"),
                 )
             ).all()
         )
@@ -274,8 +292,8 @@ def apply_twilio_status(s: Session, call_run_id: int, form: dict[str, Any], sett
     run.twilio_call_sid = run.twilio_call_sid or form.get("CallSid")
     if form.get("AnsweredBy"):
         run.answered_by = form.get("AnsweredBy")
-    if status:
-        run.status = status
+    if status and not (run.status in TERMINAL_CALL_STATUSES and status not in TERMINAL_CALL_STATUSES):
+        run.status = status  # a late "ringing" must not resurrect a finished call
     if form.get("RecordingUrl"):
         run.recording_url = form.get("RecordingUrl")
     if status in ("completed", "busy", "no-answer", "failed", "canceled"):

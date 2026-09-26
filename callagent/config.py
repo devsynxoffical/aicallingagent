@@ -19,9 +19,12 @@ class Settings(BaseSettings):
     onboarding_effort: str = "high"
     call_model: str = "claude-opus-5"
     call_effort: str = "low"
-    call_max_tokens: int = 300
-    # "disabled" = answer immediately (recommended for phone); "adaptive" = let the model think.
-    call_thinking: str = "disabled"
+    # Headroom so a goodbye plus log_call_outcome + end_call never truncates (streaming, so no latency cost).
+    call_max_tokens: int = 1024
+    # "adaptive" (recommended): the model decides per turn and rarely thinks on small talk; effort low keeps it short.
+    # "disabled": lowest latency, but Opus 5 can then occasionally write a tool call as text, which the
+    # speech sanitizer catches. Measure both with `callagent chat`.
+    call_thinking: str = "adaptive"
     # Fast mode: same model, up to 2.5x output speed, premium price (Claude API only, Opus 5 / 4.8).
     call_fast_mode: bool = False
     # Speak a short "Mm-hm." if the model has not produced its first word within filler_delay_ms.

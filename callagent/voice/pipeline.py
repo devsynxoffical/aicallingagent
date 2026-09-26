@@ -34,7 +34,9 @@ from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
 from ..config import Settings, get_settings
-from ..db import CallRun, Lead, Campaign, run_db, utcnow
+from datetime import timedelta
+
+from ..db import CallRun, Campaign, Lead, run_db, utcnow
 from ..playbook.prompt_builder import build_system_prompt
 from ..playbook.schema import Playbook
 from ..postcall.summarizer import finalize_call
@@ -42,6 +44,7 @@ from .fillers import FillerProcessor
 from .latency import LatencyMonitor, summarize
 from .llm_service import LowLatencyAnthropicLLMService
 from .session import CallSession
+from .speech_filter import SpeechSanitizer
 from .tools import build_tools_schema, register_tool_handlers
 from .transcript import TranscriptCollector
 
@@ -94,19 +97,45 @@ async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook,
     return await run_db(_load)
 
 
+async def mark_call_setup_failed(call_run_id: int, error: str, settings: Settings) -> None:
+    """The stream connected but we could not build the pipeline: close the run and give the lead a retry."""
+
+    def _fail(s):
+        run = s.get(CallRun, call_run_id)
+        if run is None:
+            return
+        run.status = "failed"
+        run.error = error[:2000]
+        run.ended_at = utcnow()
+        lead = s.get(Lead, run.lead_id)
+        if lead and lead.status == "calling":
+            lead.status = "pending" if lead.attempts < settings.max_attempts else "completed"
+            lead.next_attempt_at = utcnow() + timedelta(minutes=settings.retry_delay_minutes)
+
+    await run_db(_fail)
+
+
 async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: dict[str, Any], settings: Settings | None = None) -> None:
     settings = settings or get_settings()
     call_run_id = int(body.get("call_run_id", 0))
     mode = str(body.get("mode", "live"))
     lead, playbook, campaign_id, stored_sid = await load_call_context(call_run_id)
+    try:
+        await _run_call(websocket, stream_sid, stored_sid or call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings)
+    except Exception as e:
+        log.exception("call %s: could not start the voice pipeline", call_run_id)
+        await mark_call_setup_failed(call_run_id, f"pipeline setup failed: {e}", settings)
+        raise
 
+
+async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings) -> None:
     session = CallSession(
         call_run_id=call_run_id,
         lead=lead,
         campaign_id=campaign_id,
         playbook=playbook,
         settings=settings,
-        twilio_call_sid=call_sid or stored_sid or "",
+        twilio_call_sid=call_sid or "",
         mode=mode,
     )
 
@@ -173,7 +202,11 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
     }
     if lang is not None:
         tts_settings["language"] = lang
-    tts = ElevenLabsTTSService(api_key=settings.elevenlabs_api_key or "", settings=ElevenLabsTTSService.Settings(**tts_settings))
+    tts = ElevenLabsTTSService(
+        api_key=settings.elevenlabs_api_key or "",
+        settings=ElevenLabsTTSService.Settings(**tts_settings),
+        text_filters=[SpeechSanitizer()],
+    )
 
     # ---- memory & turn-taking
     capabilities = {c.key for c in playbook.required_capabilities}
@@ -255,12 +288,28 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
     @aggregators.user().event_handler("on_user_turn_started")
     async def on_user_turn_started(_agg, *_):
         session.user_has_spoken = True
+        session.idle_nudges = 0  # they are still with us
         if opener_timer and not opener_timer.done():
             opener_timer.cancel()
 
+    @aggregators.user().event_handler("on_user_turn_message_added")
+    async def on_user_turn_message_added(_agg, message, *_):
+        # The user aggregator consumes TranscriptionFrames, so the prospect's words are
+        # captured here, from the same aggregated text the model receives.
+        text = getattr(message, "content", None)
+        if isinstance(text, str) and text.strip():
+            collector.flush_bot()
+            session.add_transcript("user", text)
+
     @aggregators.user().event_handler("on_user_turn_idle")
     async def on_user_idle(_agg, *_):
-        if mode == "voicemail" or session.ended_by_agent:
+        if session.ended_by_agent:
+            return
+        if mode == "voicemail":
+            # Idle fires once the bot has finished speaking: the message is delivered, hang up
+            # even if the model forgot end_call.
+            session.end_reason = session.end_reason or "voicemail delivered"
+            await task.queue_frame(EndWorkerFrame(reason="voicemail delivered"))
             return
         session.idle_nudges += 1
         if session.idle_nudges == 1:

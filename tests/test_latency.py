@@ -17,12 +17,18 @@ from callagent.voice.fillers import FillerProcessor
 from callagent.voice.latency import LatencyMonitor, summarize
 
 
-def test_live_call_options_default_to_no_thinking_pause():
+def test_live_call_options_defaults():
     opts = live_call_request_options(Settings(anthropic_api_key="x"))
     assert opts["model"] == "claude-opus-5"
-    assert opts["thinking"] == {"type": "disabled"}
+    assert opts["thinking"] == {"type": "adaptive"}  # thinks only when a turn needs it
     assert opts["output_config"] == {"effort": "low"}
+    assert opts["max_tokens"] >= 1024  # goodbye + log_call_outcome + end_call never truncate
     assert opts["betas"] == [] and "speed" not in opts
+
+
+def test_live_call_options_thinking_can_be_disabled():
+    opts = live_call_request_options(Settings(anthropic_api_key="x", call_thinking="disabled"))
+    assert opts["thinking"] == {"type": "disabled"}
 
 
 def test_live_call_options_fast_mode_and_adaptive():

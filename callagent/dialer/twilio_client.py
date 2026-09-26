@@ -53,13 +53,15 @@ async def place_call_async(call_run_id: int, to_number: str, settings: Settings 
     return await asyncio.to_thread(place_call, call_run_id, to_number, settings)
 
 
-def stream_twiml(call_run_id: int, mode: str, settings: Settings) -> str:
-    """TwiML that connects the call's audio to our WebSocket media stream."""
+def stream_twiml(call_run_id: int, mode: str, settings: Settings, stream_token: str) -> str:
+    """TwiML that connects the call's audio to our WebSocket media stream. The token
+    proves the WebSocket that shows up was opened by Twilio for this call."""
     response = VoiceResponse()
     connect = Connect()
     stream = connect.stream(url=settings.ws_url)
     stream.parameter(name="call_run_id", value=str(call_run_id))
     stream.parameter(name="mode", value=mode)
+    stream.parameter(name="stream_token", value=stream_token)
     response.append(connect)
     return str(response)
 

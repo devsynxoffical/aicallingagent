@@ -18,9 +18,9 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import select
 
 from .config import Settings, get_settings, resolve_api_token
-from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, run_db
+from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db
 from .dialer import twilio_client
-from .dialer.campaign_runner import CampaignRunner, apply_twilio_status
+from .dialer.campaign_runner import TERMINAL_CALL_STATUSES, CampaignRunner, apply_twilio_status
 from .leads.importer import import_leads
 from .playbook.schema import Playbook
 from .voice.pipeline import run_call
@@ -104,11 +104,13 @@ async def twilio_voice(request: Request, call_run_id: int = Query(...), settings
 
     def _mode(s):
         run = s.get(CallRun, call_run_id)
-        if run:
-            run.mode = mode
+        if run.stream_token is None:
+            run.stream_token = _secrets.token_urlsafe(24)
+        run.mode = mode
+        return run.stream_token
 
-    await run_db(_mode)
-    return Response(content=twilio_client.stream_twiml(call_run_id, mode, settings), media_type="application/xml")
+    token = await run_db(_mode)
+    return Response(content=twilio_client.stream_twiml(call_run_id, mode, settings, token), media_type="application/xml")
 
 
 @app.post("/twilio/status")
@@ -133,14 +135,37 @@ async def media_stream(websocket: WebSocket):
         await websocket.close()
         return
     body = dict(call_data.get("body", {}) or {})
-    if "call_run_id" not in body:
-        log.warning("media stream without call_run_id; closing")
-        await websocket.close()
+    reason = await run_db(lambda s: authorize_stream(s, body, call_data.get("call_id")))
+    if reason:
+        log.warning("rejected media stream: %s", reason)
+        await websocket.close(code=4003)
         return
     try:
         await run_call(websocket, call_data["stream_id"], call_data["call_id"], body, settings)
     except Exception:
         log.exception("call session crashed")
+
+
+def authorize_stream(s, body: dict, call_sid: str | None) -> str | None:
+    """The WebSocket is public. Only Twilio, carrying the per-call token from our own TwiML
+    for a call that is live and not yet streamed, gets a pipeline. Returns a rejection reason."""
+    try:
+        call_run_id = int(body.get("call_run_id", ""))
+    except (TypeError, ValueError):
+        return "missing call_run_id"
+    run = s.get(CallRun, call_run_id)
+    if run is None:
+        return "unknown call_run_id"
+    token = str(body.get("stream_token", ""))
+    if not run.stream_token or not token or not _secrets.compare_digest(token, run.stream_token):
+        return "bad stream token"
+    if run.stream_connected:
+        return "stream already connected for this call"
+    if run.status in TERMINAL_CALL_STATUSES:
+        return "call already ended"
+    if run.twilio_call_sid and call_sid and call_sid != run.twilio_call_sid:
+        return "call sid mismatch"
+    return None
 
 
 # ----------------------------------------------------------------------------- control API
@@ -272,6 +297,8 @@ async def dial_one(name: str, phone: str, first_name: str = "", settings: Settin
 
     def _lead(s):
         c = _get_campaign(s, name)
+        if is_dnc(s, e164):
+            raise HTTPException(400, f"{e164} is on the do-not-call list")
         lead = s.execute(select(Lead).where(Lead.campaign_id == c.id, Lead.phone_e164 == e164)).scalar_one_or_none()
         if lead is None:
             lead = Lead(campaign_id=c.id, phone_e164=e164, raw_phone=phone, first_name=first_name)

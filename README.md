@@ -111,7 +111,7 @@ Every hop is streaming, and every knob that costs time is exposed:
 |---|---|---|---|
 | Prospect stops talking -> turn detected | Silero VAD + Smart Turn v3 | 0.25-0.5 s | `USE_SMART_TURN` |
 | Deepgram final transcript | Nova-3, endpointing 300 ms | 0.2-0.4 s | `DEEPGRAM_ENDPOINTING_MS` |
-| Claude first word | Opus 5, **thinking disabled**, effort low, prompt caching | 0.5-0.9 s | `CALL_THINKING`, `CALL_FAST_MODE`, `CALL_MODEL` |
+| Claude first word | Opus 5, adaptive thinking at effort low (rarely thinks on small talk), prompt caching | 0.5-1.0 s | `CALL_THINKING`, `CALL_FAST_MODE`, `CALL_MODEL` |
 | ElevenLabs first audio | `eleven_flash_v2_5` | 0.1-0.3 s | `ELEVENLABS_MODEL` |
 
 So the natural gap between the prospect finishing and the agent starting is about one
@@ -121,9 +121,13 @@ second, which is human range. Two things keep it from ever feeling like dead air
   (700 ms), the agent says a short "Mm-hm." or "Right." first, exactly as a person does
   before a considered answer. Never when the prospect is interrupting, at most once per
   turn, and not written into the conversation memory. `CALL_FILLERS=false` turns it off.
-- **Short replies by design**: `CALL_MAX_TOKENS=300` and the prompt's "one or two
-  sentences, lead with the direct part" rule mean the first sentence reaches the voice
-  almost immediately and the prospect can jump in.
+- **Short replies by design**: the prompt's "one or two sentences, lead with the direct
+  part" rule means the first sentence reaches the voice almost immediately and the
+  prospect can jump in. (`CALL_MAX_TOKENS` is a safety ceiling, not a target; it is high
+  enough that a goodbye plus the end-of-call tool calls never truncate.)
+- **Nothing weird is ever read aloud**: a speech sanitizer sits in front of the voice and
+  strips XML tags, markdown, stage directions and anything that looks like a tool call or
+  JSON, so a rare model slip is silent instead of spoken.
 
 Measure, don't guess:
 
@@ -139,11 +143,12 @@ Every call's record (`GET /api/calls/{id}`, field `summary.latency`) has p50/p95
 speech-to-text, model first token and voice first byte, so you can see exactly where any
 delay is coming from. Server logs also print "first token after X s" on every turn.
 
-Model choice: Opus 5 with thinking disabled is the default for the best judgment on the
-phone. If you want to shave a few hundred milliseconds more, `CALL_MODEL=claude-sonnet-5`;
-if you want the model to reason on hard objections at the cost of pauses,
-`CALL_THINKING=adaptive`. Fast mode (`CALL_FAST_MODE=true`) keeps Opus 5 and speeds up
-output tokens; it is Claude API only.
+Model choice: Opus 5 with adaptive thinking at low effort is the default: it answers
+small talk instantly and only pauses to think on a genuinely hard objection, and fillers
+cover that pause. `CALL_THINKING=disabled` removes even that at a small cost in tool-call
+reliability (the sanitizer catches the failure mode). `CALL_MODEL=claude-sonnet-5` shaves
+a few hundred milliseconds more. Fast mode (`CALL_FAST_MODE=true`) keeps Opus 5 and
+speeds up output tokens; it is Claude API only.
 
 ## What makes it sound human
 
@@ -168,6 +173,10 @@ The server must be reachable by Twilio, so it is public. Two layers protect it:
 
 - Twilio webhooks (`/twilio/voice`, `/twilio/status`) are verified with the
   `X-Twilio-Signature` header against your auth token. Keep `TWILIO_VALIDATE_SIGNATURE=true`.
+- The media-stream WebSocket (`/ws`) only accepts a connection that presents the
+  per-call random token our own TwiML handed to Twilio, for a call that is live, not yet
+  streamed, and whose Twilio call SID matches. Anything else is closed before a single
+  model or voice request is made.
 - The control API (`/api/*`, which can start campaigns and dial numbers) requires
   `Authorization: Bearer <token>`. Set `API_TOKEN`, or let the server generate one into
   `DATA_DIR/api_token` on first start. The CLI reads the same file, so on one machine it

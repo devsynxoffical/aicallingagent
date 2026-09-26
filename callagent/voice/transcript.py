@@ -17,12 +17,17 @@ from .session import CallSession
 
 
 class TranscriptCollector(FrameProcessor):
-    """Place after ``transport.output()``: sees final user transcriptions and the bot's spoken text."""
+    """Place after ``transport.output()``: records the bot's spoken text. The prospect's
+    words are added by the pipeline from the user aggregator's events (the aggregator
+    consumes TranscriptionFrames, so they never reach this processor)."""
 
     def __init__(self, session: CallSession, **kwargs):
         super().__init__(**kwargs)
         self._session = session
         self._bot_buffer: list[str] = []
+
+    def flush_bot(self) -> None:
+        self._flush_bot()
 
     def _flush_bot(self) -> None:
         if self._bot_buffer:
