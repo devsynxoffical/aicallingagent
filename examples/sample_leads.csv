@@ -1,0 +1,6 @@
+First Name,Last Name,Company,Phone,Email,Timezone,Notes
+Maria,Lopez,Lopez Accounting,(415) 555-0134,maria@lopezcpa.example,America/Los_Angeles,Referred by partner
+James,Okafor,Okafor & Sons CPA,+1 212 555 0198,james@okafor.example,America/New_York,
+Priya,Natarajan,Summit Books,720-555-0111,priya@summitbooks.example,America/Denver,Uses QuickBooks
+Bad,Row,Nowhere Inc,12345,bad@example.com,,
+Duplicate,Lopez,Lopez Accounting,4155550134,dup@example.com,,
