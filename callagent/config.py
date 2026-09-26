@@ -19,13 +19,22 @@ class Settings(BaseSettings):
     onboarding_effort: str = "high"
     call_model: str = "claude-opus-5"
     call_effort: str = "low"
-    call_max_tokens: int = 400
+    call_max_tokens: int = 300
+    # "disabled" = answer immediately (recommended for phone); "adaptive" = let the model think.
+    call_thinking: str = "disabled"
+    # Fast mode: same model, up to 2.5x output speed, premium price (Claude API only, Opus 5 / 4.8).
+    call_fast_mode: bool = False
+    # Speak a short "Mm-hm." if the model has not produced its first word within filler_delay_ms.
+    call_fillers: bool = True
+    filler_delay_ms: int = 700
     postcall_model: str | None = None  # defaults to onboarding_model
     enable_refusal_fallbacks: bool = True
 
     # Deepgram
     deepgram_api_key: str | None = None
     deepgram_model: str = "nova-3-general"
+    # How quickly Deepgram finalizes a transcript after speech pauses (ms). Lower = snappier.
+    deepgram_endpointing_ms: int = 300
 
     # ElevenLabs
     elevenlabs_api_key: str | None = None

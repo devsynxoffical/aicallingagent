@@ -179,6 +179,43 @@ def rehearse(
         console.print("[green]Playbook updated.[/green] Run rehearse again to verify.")
 
 
+@app.command()
+def chat(
+    name: str = typer.Argument(..., help="Campaign name."),
+    model: str = typer.Option(None, help="Override CALL_MODEL for this session (e.g. claude-sonnet-5)."),
+    thinking: str = typer.Option(None, help="Override CALL_THINKING: disabled | adaptive."),
+    fast: bool = typer.Option(False, help="Use fast mode for this session."),
+):
+    """Talk to the agent in the terminal with the live-call model settings. Shows time-to-first-word per turn."""
+    from .chat import ChatSession
+
+    pb, _ = _load_playbook(name)
+    settings = get_settings().model_copy(update={k: v for k, v in {"call_model": model, "call_thinking": thinking, "call_fast_mode": fast or None}.items() if v})
+    session = ChatSession(pb, settings)
+    console.print(Panel.fit(
+        f"model [bold]{settings.call_model}[/bold] · thinking {settings.call_thinking} · effort {settings.call_effort}"
+        f"{' · fast mode' if settings.call_fast_mode else ''}\nYou are the prospect. Type what you'd say on the phone. Ctrl-C to stop.",
+        title=f"Chat with {pb.persona.agent_name}"))
+    user_text = "Hello?"
+    console.print(f"[magenta]You[/magenta]: {user_text}")
+    try:
+        while not session.ended:
+            console.print(f"[cyan]{pb.persona.agent_name}[/cyan]: ", end="")
+            reply, st = session.say(user_text, on_text=lambda t: console.print(t, end="", highlight=False))
+            console.print()
+            tools = f"  tools: {', '.join(st.tools)}" if st.tools else ""
+            console.print(f"[dim]  first word {st.ttft_secs:.2f}s · full reply {st.total_secs:.2f}s · {st.output_tokens} tokens{tools}[/dim]")
+            if session.ended:
+                break
+            user_text = Prompt.ask("[magenta]You[/magenta]")
+    except KeyboardInterrupt:
+        pass
+    if session.stats:
+        ttfts = sorted(s.ttft_secs for s in session.stats)
+        console.print(f"\n[bold]Model latency this session[/bold]: first word p50 {ttfts[len(ttfts)//2]:.2f}s, max {ttfts[-1]:.2f}s over {len(ttfts)} turns. "
+                      "On the phone add roughly 0.3s for speech recognition and 0.2s for the voice.")
+
+
 @playbook_app.command("show")
 def playbook_show(name: str, full: bool = typer.Option(False, help="Print the whole JSON.")):
     pb, _ = _load_playbook(name)

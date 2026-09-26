@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Any, Literal
 
 import anthropic
 from pydantic import BaseModel, Field
@@ -99,6 +99,7 @@ async def finalize_call(
     mode: str,
     agent_disposition: str | None,
     settings: Settings | None = None,
+    latency: dict[str, Any] | None = None,
 ) -> CallReview | None:
     """Persist transcript, run the review, update the lead's status/retry schedule."""
     settings = settings or get_settings()
@@ -110,6 +111,8 @@ async def finalize_call(
             return None
         run.transcript = transcript
         run.tool_events = tool_events
+        if latency:
+            run.summary = {**(run.summary or {}), "latency": latency}
         run.ended_at = run.ended_at or now
         if run.started_at:
             run.duration_seconds = int((run.ended_at - run.started_at).total_seconds())

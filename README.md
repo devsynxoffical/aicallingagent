@@ -103,6 +103,48 @@ detection. Voicemail gets a short natural message; a human gets the conversation
 every call a review model writes a summary, disposition, interest level, objections,
 next action and coaching notes, and decides whether to retry.
 
+## Latency: what to expect and how to tune it
+
+Every hop is streaming, and every knob that costs time is exposed:
+
+| Hop | Default | Typical | Knob |
+|---|---|---|---|
+| Prospect stops talking -> turn detected | Silero VAD + Smart Turn v3 | 0.25-0.5 s | `USE_SMART_TURN` |
+| Deepgram final transcript | Nova-3, endpointing 300 ms | 0.2-0.4 s | `DEEPGRAM_ENDPOINTING_MS` |
+| Claude first word | Opus 5, **thinking disabled**, effort low, prompt caching | 0.5-0.9 s | `CALL_THINKING`, `CALL_FAST_MODE`, `CALL_MODEL` |
+| ElevenLabs first audio | `eleven_flash_v2_5` | 0.1-0.3 s | `ELEVENLABS_MODEL` |
+
+So the natural gap between the prospect finishing and the agent starting is about one
+second, which is human range. Two things keep it from ever feeling like dead air:
+
+- **Backchannel fillers**: if the model's first word is not out within `FILLER_DELAY_MS`
+  (700 ms), the agent says a short "Mm-hm." or "Right." first, exactly as a person does
+  before a considered answer. Never when the prospect is interrupting, at most once per
+  turn, and not written into the conversation memory. `CALL_FILLERS=false` turns it off.
+- **Short replies by design**: `CALL_MAX_TOKENS=300` and the prompt's "one or two
+  sentences, lead with the direct part" rule mean the first sentence reaches the voice
+  almost immediately and the prospect can jump in.
+
+Measure, don't guess:
+
+```bash
+callagent chat "BrightBooks Q4"                     # talk to it in the terminal, see first-word time per turn
+callagent chat "BrightBooks Q4" --fast              # try fast mode (2.5x output speed, premium price)
+callagent chat "BrightBooks Q4" --model claude-sonnet-5
+callagent test-call "BrightBooks Q4" +1yournumber   # then a real call
+callagent campaign calls "BrightBooks Q4"           # each call stores stt/llm/tts p50/p95 in its summary
+```
+
+Every call's record (`GET /api/calls/{id}`, field `summary.latency`) has p50/p95 for
+speech-to-text, model first token and voice first byte, so you can see exactly where any
+delay is coming from. Server logs also print "first token after X s" on every turn.
+
+Model choice: Opus 5 with thinking disabled is the default for the best judgment on the
+phone. If you want to shave a few hundred milliseconds more, `CALL_MODEL=claude-sonnet-5`;
+if you want the model to reason on hard objections at the cost of pauses,
+`CALL_THINKING=adaptive`. Fast mode (`CALL_FAST_MODE=true`) keeps Opus 5 and speeds up
+output tokens; it is Claude API only.
+
 ## What makes it sound human
 
 - **Prompting for speech, not text**: short turns, one question at a time, reacting before
@@ -115,8 +157,7 @@ next action and coaching notes, and decides whether to retry.
 - **Knows when you're done talking**: Pipecat's bundled Smart Turn v3 model detects
   semantic end-of-turn, so the agent doesn't jump in on a pause mid-sentence
   (`USE_SMART_TURN=false` falls back to a plain silence timeout).
-- **Latency**: flash TTS, streaming STT, prompt caching, and low-effort thinking on the call
-  model.
+- **No dead air**: backchannel fillers cover the rare slow first word (see Latency above).
 - **Honesty**: if asked whether it is an AI, it says so (configurable per playbook,
   `disclose_ai_if_asked`). Check your local rules on AI disclosure and calling hours;
   in many places both are legally required.

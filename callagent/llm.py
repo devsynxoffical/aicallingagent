@@ -96,5 +96,31 @@ def text_completion(
     return response
 
 
+FAST_MODE_BETA = "fast-mode-2026-02-01"
+
+
+def live_call_request_options(settings: Settings | None = None) -> dict[str, Any]:
+    """Request options for the *live phone conversation*: tuned for time-to-first-word.
+
+    Shared by the Pipecat LLM service (voice/llm_service.py) and `callagent chat`, so
+    what you hear on the phone is what you test in the terminal.
+    """
+    settings = settings or get_settings()
+    opts: dict[str, Any] = {
+        "model": settings.call_model,
+        "max_tokens": settings.call_max_tokens,
+        "output_config": {"effort": settings.call_effort},
+        "betas": [],
+    }
+    if settings.call_thinking == "disabled":
+        opts["thinking"] = {"type": "disabled"}
+    else:
+        opts["thinking"] = {"type": "adaptive"}
+    if settings.call_fast_mode:
+        opts["speed"] = "fast"
+        opts["betas"].append(FAST_MODE_BETA)
+    return opts
+
+
 def text_of(message: Any) -> str:
     return "".join(block.text for block in message.content if getattr(block, "type", "") == "text").strip()

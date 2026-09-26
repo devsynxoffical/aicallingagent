@@ -28,7 +28,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transcriptions.language import Language
@@ -39,6 +38,9 @@ from ..db import CallRun, Lead, Campaign, run_db, utcnow
 from ..playbook.prompt_builder import build_system_prompt
 from ..playbook.schema import Playbook
 from ..postcall.summarizer import finalize_call
+from .fillers import FillerProcessor
+from .latency import LatencyMonitor, summarize
+from .llm_service import LowLatencyAnthropicLLMService
 from .session import CallSession
 from .tools import build_tools_schema, register_tool_handlers
 from .transcript import TranscriptCollector
@@ -141,6 +143,7 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
         "smart_format": True,
         "punctuate": True,
         "interim_results": True,
+        "endpointing": settings.deepgram_endpointing_ms,
     }
     if lang is not None:
         stt_settings["language"] = lang
@@ -148,16 +151,11 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
         stt_settings["keyterm"] = playbook.keyterms[:50]
     stt = DeepgramSTTService(api_key=settings.deepgram_api_key or "", settings=DeepgramSTTService.Settings(**stt_settings))
 
-    # ---- brain
-    llm = AnthropicLLMService(
+    # ---- brain (thinking off by default, prompt caching on, optional fast mode)
+    llm = LowLatencyAnthropicLLMService(
         api_key=settings.anthropic_api_key or "",
-        settings=AnthropicLLMService.Settings(
-            model=settings.call_model,
-            system_instruction=system_prompt,
-            max_tokens=settings.call_max_tokens,
-            enable_prompt_caching=True,
-            extra={"output_config": {"effort": settings.call_effort}},
-        ),
+        system_prompt=system_prompt,
+        settings=settings,
     )
     register_tool_handlers(llm, session)
 
@@ -196,19 +194,13 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
 
     aggregators = LLMContextAggregatorPair(context, user_params=user_params)
     collector = TranscriptCollector(session)
+    latency_monitor = LatencyMonitor(session.latency)
 
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            aggregators.user(),
-            llm,
-            tts,
-            transport.output(),
-            collector,
-            aggregators.assistant(),
-        ]
-    )
+    processors = [transport.input(), stt, aggregators.user(), llm]
+    if settings.call_fillers and mode == "live":
+        processors.append(FillerProcessor(delay_secs=settings.filler_delay_ms / 1000))
+    processors += [tts, transport.output(), collector, latency_monitor, aggregators.assistant()]
+    pipeline = Pipeline(processors)
 
     task = PipelineWorker(
         pipeline,
@@ -311,6 +303,8 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
             mode,
             session.disposition,
             settings,
+            latency=summarize(session.latency),
         )
     except Exception:
         log.exception("call %s: post-call processing failed", call_run_id)
+    log.info("call %s latency: %s", call_run_id, summarize(session.latency))

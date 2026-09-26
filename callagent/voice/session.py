@@ -29,6 +29,7 @@ class CallSession:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     idle_nudges: int = 0
     user_has_spoken: bool = False
+    latency: dict[str, list[float]] = field(default_factory=dict)
     _end_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def log_tool(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
