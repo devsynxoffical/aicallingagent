@@ -98,3 +98,18 @@ def test_status_callback_defers_to_finalization_when_stream_connected(tmp_path):
         assert run.status == "completed" and run.duration_seconds == 95
         assert run.disposition is None  # the post-call review decides
         assert s.get(db.Lead, run.lead_id).status == "calling"  # finalize_call will move it
+
+
+def test_saving_a_ready_playbook_marks_new_campaign_ready(tmp_path, monkeypatch, sample_playbook):
+    from callagent.config import get_settings
+    from callagent import cli
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    get_settings.cache_clear()
+    db.reset_engine_for_tests(f"sqlite:///{tmp_path / 'ready.db'}")
+    draft = cli._save_campaign("c1", sample_playbook, "script")
+    assert draft.status == "draft"  # blocking question open
+    sample_playbook.open_questions = []
+    ready = cli._save_campaign("c2", sample_playbook, "script")
+    assert ready.status == "ready"
+    get_settings.cache_clear()

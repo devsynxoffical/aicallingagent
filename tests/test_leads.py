@@ -22,6 +22,7 @@ def test_sample_sheet_mapping_and_dedupe():
     assert mapping["phone"] == "Phone"
     assert mapping["first_name"] == "First Name"
     assert mapping["company"] == "Company"
+    assert "name" not in mapping  # first/last present, so no full-name column is claimed
     rows, report = rows_to_leads(df, mapping, "US")
     assert len(rows) == 3
     assert report.invalid_phone == 1

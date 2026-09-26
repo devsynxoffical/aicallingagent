@@ -49,10 +49,11 @@ def _save_campaign(name: str, playbook: Playbook, script_text: str) -> Campaign:
     with session_scope() as s:
         c = get_campaign_by_name(s, name)
         if c is None:
-            c = Campaign(name=name)
+            c = Campaign(name=name, status="draft")
             s.add(c)
         c.playbook_json = playbook.model_dump()
         c.script_text = script_text or c.script_text
+        # Running/paused/done campaigns keep their state; drafts become ready once nothing blocks.
         if c.status in ("draft", "ready"):
             c.status = "ready" if playbook.is_ready else "draft"
         s.flush()

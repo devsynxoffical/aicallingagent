@@ -111,8 +111,10 @@ def map_columns(df: pd.DataFrame) -> dict[str, str]:
         ("timezone", TZ_COLUMNS),
         ("notes", NOTES_COLUMNS),
     ):
+        if key == "name" and "first_name" in mapping:
+            continue  # a full-name column only matters when there is no first-name column
         col = _find_col(cols, cands)
-        if col:
+        if col and col not in mapping.values():
             mapping[key] = col
     if "phone" not in mapping:
         raise ValueError(f"Could not find a phone column. Columns seen: {cols}")
