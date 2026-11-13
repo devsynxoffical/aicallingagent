@@ -65,6 +65,8 @@ def _publish(s: Session, campaign: Campaign, version: PlaybookVersion, approved_
     previous = _active(s, campaign)
     if previous is not None and previous.id != version.id:
         previous.status = "archived"
+        # Written first: the database allows one active version per campaign at any instant.
+        s.flush()
     version.status = "active"
     version.approved_by = approved_by
     version.activated_at = utcnow()

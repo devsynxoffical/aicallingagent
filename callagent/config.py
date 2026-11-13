@@ -97,6 +97,16 @@ class Settings(BaseSettings):
 
     # Storage / server
     database_url: str = "sqlite:///./callagent.db"
+    # Connection pool for a server database (ignored by SQLite). Size it to the number of
+    # calls in progress plus API traffic; every call uses a connection for short moments only.
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout_seconds: int = 10
+    db_pool_recycle_seconds: int = 1800
+    # How long a SQLite writer waits for another writer before giving up.
+    sqlite_busy_timeout_seconds: int = 15
+    # Longest we wait for the telephony provider's API before treating the request as unanswered.
+    provider_timeout_seconds: float = 15.0
     data_dir: Path = Path("./data")
     server_host: str = "0.0.0.0"
     server_port: int = 8000

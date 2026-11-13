@@ -14,11 +14,13 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     TypeDecorator,
     create_engine,
+    event,
     func,
     inspect,
     select,
@@ -66,6 +68,11 @@ class Base(DeclarativeBase):
 
 DEFAULT_ORGANIZATION = "default"
 
+# A call in one of these states may still be ringing or talking at the provider.
+ACTIVE_CALL_STATUSES = ("created", "queued", "initiated", "ringing", "in-progress")
+TERMINAL_CALL_STATUSES = ("completed", "busy", "no-answer", "failed", "canceled")
+_ACTIVE_SQL = "status IN ('created', 'queued', 'initiated', 'ringing', 'in-progress')"
+
 
 class Organization(Base):
     """A customer company. Every piece of business data belongs to exactly one."""
@@ -100,6 +107,11 @@ class Campaign(Base):
 
     leads: Mapped[list["Lead"]] = relationship(back_populates="campaign", cascade="all, delete-orphan")
 
+    __table_args__ = (
+        # One number is answered by one campaign.
+        Index("uq_campaigns_inbound_number", "inbound_number", unique=True),
+    )
+
 
 class Lead(Base):
     __tablename__ = "leads"
@@ -129,6 +141,13 @@ class Lead(Base):
 
     campaign: Mapped[Campaign] = relationship(back_populates="leads")
     calls: Mapped[list["CallRun"]] = relationship(back_populates="lead", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        # A phone number is one lead per campaign, however it arrived (sheet, API, inbound call).
+        Index("uq_leads_campaign_phone", "campaign_id", "phone_e164", unique=True),
+        # The dialer's "who is due next" query.
+        Index("ix_leads_due", "campaign_id", "status", "next_attempt_at"),
+    )
 
     @property
     def full_name(self) -> str:
@@ -172,6 +191,21 @@ class CallRun(Base):
 
     lead: Mapped[Lead] = relationship(back_populates="calls")
 
+    __table_args__ = (
+        # A provider call is one record, even when its webhook is delivered twice at once.
+        Index("uq_call_runs_twilio_call_sid", "twilio_call_sid", unique=True),
+        # A person is never rung twice at the same time: at most one unfinished outbound call per lead.
+        Index(
+            "uq_call_runs_one_active_outbound_per_lead",
+            "lead_id",
+            unique=True,
+            sqlite_where=text(f"direction = 'outbound' AND {_ACTIVE_SQL}"),
+            postgresql_where=text(f"direction = 'outbound' AND {_ACTIVE_SQL}"),
+        ),
+        Index("ix_call_runs_campaign_status", "campaign_id", "status"),
+        Index("ix_call_runs_lead_latest", "lead_id", "id"),
+    )
+
 
 class Appointment(Base):
     __tablename__ = "appointments"
@@ -183,6 +217,11 @@ class Appointment(Base):
     timezone: Mapped[str] = mapped_column(String(64), default="")
     notes: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+    __table_args__ = (
+        # Booking the same time twice on one call is one meeting.
+        Index("uq_appointments_call_start", "call_run_id", "starts_at", unique=True),
+    )
 
 
 class TrainingDocument(Base):
@@ -247,6 +286,18 @@ class PlaybookVersion(Base):
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
     activated_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
 
+    __table_args__ = (
+        Index("uq_playbook_versions_campaign_version", "campaign_id", "version", unique=True),
+        # Calls run exactly one version.
+        Index(
+            "uq_playbook_versions_one_active",
+            "campaign_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
+
 
 class Experiment(Base):
     """A controlled A/B test of two playbook versions on one campaign."""
@@ -266,6 +317,17 @@ class Experiment(Base):
     ended_by: Mapped[str] = mapped_column(String(200), default="")
     started_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+    __table_args__ = (
+        # Two tests can never share a campaign's leads.
+        Index(
+            "uq_experiments_one_running",
+            "campaign_id",
+            unique=True,
+            sqlite_where=text("status = 'running'"),
+            postgresql_where=text("status = 'running'"),
+        ),
+    )
 
 
 class TrainingRun(Base):
@@ -298,16 +360,44 @@ _engine = None
 _SessionLocal: sessionmaker[Session] | None = None
 
 
+def _engine_options(url: str) -> dict[str, Any]:
+    """Connection settings. SQLite is one file with one writer; a server database gets a
+    bounded pool whose connections are checked before use."""
+    settings = get_settings()
+    if url.startswith("sqlite"):
+        return {"connect_args": {"check_same_thread": False, "timeout": settings.sqlite_busy_timeout_seconds}}
+    return {
+        "pool_size": settings.db_pool_size,
+        "max_overflow": settings.db_max_overflow,
+        "pool_timeout": settings.db_pool_timeout_seconds,
+        "pool_recycle": settings.db_pool_recycle_seconds,
+        "pool_pre_ping": True,  # a connection the server dropped is replaced, not handed to a request
+    }
+
+
+def _configure_sqlite(engine) -> None:
+    @event.listens_for(engine, "connect")
+    def _pragmas(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")  # SQLite ignores foreign keys unless asked
+        cursor.execute("PRAGMA journal_mode=WAL")  # readers do not block the writer (no effect on :memory:)
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+
+
 def get_engine(database_url: str | None = None):
     global _engine, _SessionLocal
     if _engine is None:
+        from .migrate import upgrade
+
         url = database_url or get_settings().database_url
-        connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-        _engine = create_engine(url, connect_args=connect_args, future=True)
-        _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
-        Base.metadata.create_all(_engine)
-        add_missing_columns(_engine)
-        bootstrap_organizations(_engine)
+        engine = create_engine(url, future=True, **_engine_options(url))
+        if url.startswith("sqlite"):
+            _configure_sqlite(engine)
+        upgrade(engine)
+        bootstrap_organizations(engine)
+        _SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+        _engine = engine
     return _engine
 
 
@@ -343,36 +433,41 @@ def campaign_organization_id(s: Session, campaign: "Campaign") -> int:
     return campaign.organization_id
 
 
-def add_missing_columns(engine) -> list[str]:
-    """Bring a database created by an older version up to date.
+def add_missing_columns(conn) -> list[str]:
+    """Adopt a database created before migrations existed.
 
     ``create_all`` creates missing tables but never alters existing ones, so columns
-    added in later releases are added here. Additive only: nothing is dropped, renamed
-    or retyped, which keeps it safe to run on every start. Returns what was added.
+    added by releases before the first migration are added here. Additive only. This
+    runs once, when a database without a migration record is first seen (see
+    ``migrate.upgrade``); every later schema change is a numbered migration.
     """
     added: list[str] = []
-    inspector = inspect(engine)
-    with engine.begin() as conn:
-        for table in Base.metadata.sorted_tables:
-            existing = {c["name"] for c in inspector.get_columns(table.name)}
-            for column in table.columns:
-                if column.name in existing:
-                    continue
-                ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column.type.compile(engine.dialect)}'
-                default = getattr(column.default, "arg", None)
-                if isinstance(default, str):
-                    ddl += " DEFAULT '" + default.replace("'", "''") + "'"
-                elif isinstance(default, bool):
-                    ddl += f" DEFAULT {'TRUE' if default else 'FALSE'}" if engine.dialect.name != "sqlite" else f" DEFAULT {int(default)}"
-                elif isinstance(default, int):
-                    ddl += f" DEFAULT {default}"
-                conn.execute(text(ddl))
-                added.append(f"{table.name}.{column.name}")
+    inspector = inspect(conn)
+    tables = set(inspector.get_table_names())
+    for table in Base.metadata.sorted_tables:
+        if table.name not in tables:
+            continue
+        existing = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column.type.compile(conn.dialect)}'
+            default = getattr(column.default, "arg", None)
+            if isinstance(default, str):
+                ddl += " DEFAULT '" + default.replace("'", "''") + "'"
+            elif isinstance(default, bool):
+                ddl += f" DEFAULT {'TRUE' if default else 'FALSE'}" if conn.dialect.name != "sqlite" else f" DEFAULT {int(default)}"
+            elif isinstance(default, int):
+                ddl += f" DEFAULT {default}"
+            conn.execute(text(ddl))
+            added.append(f"{table.name}.{column.name}")
     return added
 
 
 def reset_engine_for_tests(database_url: str) -> None:
     global _engine, _SessionLocal
+    if _engine is not None:
+        _engine.dispose()
     _engine = None
     _SessionLocal = None
     get_engine(database_url)

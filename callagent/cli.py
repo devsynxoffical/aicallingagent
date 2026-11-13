@@ -34,6 +34,8 @@ app.add_typer(leads_app, name="leads")
 app.add_typer(campaign_app, name="campaign")
 app.add_typer(playbook_app, name="playbook")
 app.add_typer(train_app, name="train")
+db_app = typer.Typer(help="Database schema: status, upgrade, integrity check.")
+app.add_typer(db_app, name="db")
 
 console = Console()
 
@@ -472,6 +474,53 @@ def leads_import(
     for k, v in report.as_dict().items():
         t.add_row(k, json.dumps(v) if isinstance(v, (dict, list)) else str(v))
     console.print(t)
+
+
+@db_app.command("status")
+def db_status():
+    """Which migration the database is at, and whether a newer one is waiting."""
+    from sqlalchemy import create_engine
+
+    from . import migrate
+
+    engine = create_engine(get_settings().database_url)
+    with engine.connect() as connection:
+        current = migrate.current_revision(connection)
+    head = migrate.head_revision()
+    console.print(f"database: {current or 'not tracked yet'}   newest migration: {head}")
+    if current != head:
+        console.print("[yellow]Run `callagent db upgrade` (the server also upgrades when it starts).[/yellow]")
+
+
+@db_app.command("upgrade")
+def db_upgrade():
+    """Apply every migration the database has not seen. Back the database up first."""
+    from .db import get_engine
+
+    try:
+        get_engine()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print("[green]The database is at the newest migration.[/green]")
+
+
+@db_app.command("check")
+def db_check():
+    """List rows that break a uniqueness rule (duplicates a migration would refuse)."""
+    from sqlalchemy import create_engine
+
+    from . import migrate
+
+    engine = create_engine(get_settings().database_url)
+    with engine.connect() as connection:
+        problems = migrate.integrity_problems(connection)
+    if not problems:
+        console.print("[green]No duplicates found.[/green]")
+        return
+    for problem in problems:
+        console.print(f"[red]- {problem}[/red]")
+    raise typer.Exit(1)
 
 
 @app.command()
