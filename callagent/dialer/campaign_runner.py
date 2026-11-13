@@ -217,14 +217,18 @@ class CampaignRunner:
                 raise ValueError("lead not found")
             lead.status = "calling"
             lead.attempts += 1
-            from ..training import versions
+            from ..intelligence import experiments
 
             campaign = s.get(Campaign, campaign_id)
+            # In an A/B test the lead's side, and so the playbook version, is fixed for every attempt.
+            experiment_id, arm, version = experiments.assign(s, campaign, lead) if campaign else (None, None, None)
             run = CallRun(
                 lead_id=lead.id,
                 campaign_id=campaign_id,
                 status="created",
-                playbook_version=versions.active_number(s, campaign) if campaign else None,
+                playbook_version=version,
+                experiment_id=experiment_id,
+                experiment_arm=arm,
             )
             s.add(run)
             s.flush()

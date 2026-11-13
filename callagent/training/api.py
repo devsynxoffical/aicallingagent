@@ -165,6 +165,22 @@ async def get_version(name: str, number: int):
     return await run_db(_get)
 
 
+@router.get("/versions/{number}/diff")
+async def diff_version(name: str, number: int):
+    """What this version changes compared with the live one, field by field."""
+
+    def _diff(s):
+        campaign = get_campaign(s, name)
+        try:
+            v = versions.get_version(s, campaign, number)
+        except versions.VersionError as e:
+            raise HTTPException(404, str(e)) from None
+        live = versions.active_number(s, campaign)
+        return {"version": v.version, "compared_with": live, "changes": versions.diff(campaign.playbook_json or {}, v.playbook_json or {})}
+
+    return await run_db(_diff)
+
+
 @router.post("/versions/{number}/approve")
 async def approve_version(name: str, number: int, body: ApprovalIn | None = None):
     """Make this version the one calls run. Approving an older version is a rollback."""

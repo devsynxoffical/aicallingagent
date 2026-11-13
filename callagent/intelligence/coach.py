@@ -124,5 +124,5 @@ def propose_improvements(s: Session, campaign: Campaign, *, client=None, setting
         return {"version": None, "changes": [], "reviewed_calls": reviewed}
 
     note = f"Coach proposal from {reviewed} reviewed calls.\n" + "\n".join(f"- {c.change} (evidence: {c.evidence})" for c in proposal.changes)
-    draft = versions.propose(s, campaign, improved, source="coach", note=note, by=by)
+    draft = versions.propose(s, campaign, improved, source="coach", note=note, by=by, changes=[c.model_dump() for c in proposal.changes])
     return {"version": draft.version, "changes": [c.model_dump() for c in proposal.changes], "reviewed_calls": reviewed}

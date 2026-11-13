@@ -147,6 +147,9 @@ class CallRun(Base):
     answered_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
     mode: Mapped[str] = mapped_column(String(20), default="live")  # live | voicemail | inbound
     direction: Mapped[str] = mapped_column(String(10), default="outbound")  # outbound | inbound
+    # Set when the call was part of an A/B test: which test, and which side ("control" | "variant").
+    experiment_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    experiment_arm: Mapped[str | None] = mapped_column(String(10), nullable=True)
     # Playbook version this call ran, so results can be compared between versions.
     playbook_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Estimated cost of this call from the configured rates. None until the call ends.
@@ -237,10 +240,32 @@ class PlaybookVersion(Base):
     status: Mapped[str] = mapped_column(String(20), default="draft")  # draft | active | archived | rejected
     source: Mapped[str] = mapped_column(String(30), default="")  # onboard | import | training | api | rollback ...
     note: Mapped[str] = mapped_column(Text, default="")
+    # Coach proposals: [{"change": ..., "evidence": ...}], so each recommendation can be shown with its evidence.
+    changes_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     created_by: Mapped[str] = mapped_column(String(200), default="")
     approved_by: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
     activated_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
+class Experiment(Base):
+    """A controlled A/B test of two playbook versions on one campaign."""
+
+    __tablename__ = "experiments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200), default="")
+    status: Mapped[str] = mapped_column(String(20), default="running")  # running | stopped | promoted
+    control_version: Mapped[int] = mapped_column(Integer)
+    variant_version: Mapped[int] = mapped_column(Integer)
+    variant_share: Mapped[float] = mapped_column(Float, default=0.5)  # share of eligible leads that get the variant
+    min_answered_per_arm: Mapped[int] = mapped_column(Integer, default=50)
+    created_by: Mapped[str] = mapped_column(String(200), default="")
+    ended_by: Mapped[str] = mapped_column(String(200), default="")
+    started_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
 
 
 class TrainingRun(Base):

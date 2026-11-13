@@ -100,7 +100,9 @@ def record_active(s: Session, campaign: Campaign, playbook: dict[str, Any], *, s
     return version
 
 
-def propose(s: Session, campaign: Campaign, playbook: dict[str, Any], *, source: str, note: str = "", by: str = "") -> PlaybookVersion:
+def propose(
+    s: Session, campaign: Campaign, playbook: dict[str, Any], *, source: str, note: str = "", by: str = "", changes: list[dict[str, Any]] | None = None
+) -> PlaybookVersion:
     """Add a draft for review. Live calls are not affected."""
     ensure_baseline(s, campaign)
     version = PlaybookVersion(
@@ -112,10 +114,53 @@ def propose(s: Session, campaign: Campaign, playbook: dict[str, Any], *, source:
         source=source,
         note=note,
         created_by=by,
+        changes_json=list(changes or []),
     )
     s.add(version)
     s.flush()
     return version
+
+
+# Fields compared, in the order a reviewer reads a playbook. Lists are compared item by item.
+_DIFF_FIELDS = (
+    ("opening_line", "Opening line"), ("permission_line", "Permission line"), ("stages", "Call stages"),
+    ("qualification_questions", "Qualification questions"), ("objections", "Objection answers"), ("closing_script", "Closing"),
+    ("voicemail_script", "Voicemail"), ("callback_policy", "Callback policy"), ("value_props", "Value propositions"),
+    ("proof_points", "Proof points"), ("pricing_and_terms", "Pricing and terms"), ("must_say", "Must say"), ("must_not_say", "Must not say"),
+    ("offer_summary", "Offer"), ("target_customer", "Target customer"), ("call_goal_details", "Call goal"), ("persona", "Persona"),
+    ("additional_languages", "Languages"), ("disclose_ai_upfront", "AI disclosure up front"), ("open_questions", "Open questions"),
+)
+
+
+def _lines(value: Any) -> list[str]:
+    """A field as readable lines, so a list of objections diffs one objection at a time."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, dict):
+                out.append(" | ".join(f"{k}: {v}" for k, v in item.items() if v not in ("", None, [])))
+            else:
+                out.append(str(item))
+        return out
+    if isinstance(value, dict):
+        return [f"{k}: {v}" for k, v in value.items() if v not in ("", None, [])]
+    return [str(value)]
+
+
+def diff(base: dict[str, Any], other: dict[str, Any]) -> list[dict[str, Any]]:
+    """What ``other`` changes compared with ``base``: one entry per changed field, with the
+    lines removed and added. Unchanged fields are left out."""
+    changes = []
+    for field, label in _DIFF_FIELDS:
+        before, after = _lines(base.get(field)), _lines(other.get(field))
+        if before == after:
+            continue
+        changes.append(
+            {"field": field, "label": label, "removed": [l for l in before if l not in after], "added": [l for l in after if l not in before]}
+        )
+    return changes
 
 
 def get_version(s: Session, campaign: Campaign, number: int) -> PlaybookVersion:
@@ -176,6 +221,7 @@ def describe(version: PlaybookVersion) -> dict[str, Any]:
         "status": version.status,
         "source": version.source,
         "note": version.note,
+        "changes": list(version.changes_json or []),
         "created_by": version.created_by,
         "approved_by": version.approved_by,
         "created_at": version.created_at.isoformat() if version.created_at else None,

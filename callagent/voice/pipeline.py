@@ -63,6 +63,19 @@ SILENCE_GOODBYE = {
 }
 
 
+def _playbook_for(s, campaign: Campaign, run: CallRun) -> Playbook:
+    """The playbook this call runs: the version pinned on the call when it is part of an
+    A/B test, otherwise whatever is live now."""
+    if run.experiment_id is not None and run.playbook_version is not None:
+        from ..training import versions
+
+        try:
+            return Playbook.model_validate(versions.get_version(s, campaign, run.playbook_version).playbook_json)
+        except versions.VersionError:
+            log.warning("call %s: pinned playbook version %s is missing, using the live one", run.id, run.playbook_version)
+    return Playbook.model_validate(campaign.playbook_json)
+
+
 async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook, int, str | None, str, KnowledgeIndex]:
     def _load(s):
         run = s.get(CallRun, call_run_id)
@@ -88,7 +101,7 @@ async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook,
         run.stream_connected = True
         # Built once per call, for this organization and campaign only.
         knowledge = load_index(s, campaign_organization_id(s, campaign), campaign.id)
-        return lead_dict, Playbook.model_validate(campaign.playbook_json), campaign.id, run.twilio_call_sid, run.direction or "outbound", knowledge
+        return lead_dict, _playbook_for(s, campaign, run), campaign.id, run.twilio_call_sid, run.direction or "outbound", knowledge
 
     return await run_db(_load)
 
