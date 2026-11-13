@@ -18,6 +18,7 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from . import background, jobs
 from .apideps import get_campaign as _get_campaign
 from .apideps import require_api_token
 from .config import Settings, get_settings
@@ -54,7 +55,10 @@ async def lifespan(app: FastAPI):
         await runner.start(cid)
     # Training documents that were waiting or half-read when the process stopped.
     await resume_unfinished()
+    # Background jobs that were queued, or left running by a process that stopped.
+    background.start_worker()
     yield
+    await background.stop_worker()
     await runner.shutdown()
 
 
@@ -314,6 +318,27 @@ def _speech_problems(pb: Playbook, settings: Settings) -> list[str]:
 @app.get("/health")
 async def health(settings: Settings = Depends(get_settings)):
     return {"ok": True, "missing_for_calls": settings.missing_for_calls()}
+
+
+@app.get("/api/jobs", dependencies=[Depends(require_api_token)])
+async def list_jobs(status: str | None = None, limit: int = 50):
+    """Background work: counts by state, and the most recent jobs (``status=dead`` for failures that gave up)."""
+
+    def _q(s):
+        query = select(jobs.Job).order_by(jobs.Job.id.desc()).limit(max(1, min(limit, 200)))
+        if status:
+            query = query.where(jobs.Job.status == status)
+        return {"stats": jobs.stats(s), "jobs": [jobs.describe(j) for j in s.execute(query).scalars()]}
+
+    return await run_db(_q)
+
+
+@app.post("/api/jobs/{job_id}/retry", dependencies=[Depends(require_api_token)])
+async def retry_job(job_id: int):
+    """Run a dead job again, after its cause was fixed."""
+    if not await run_db(lambda s: jobs.retry_dead(s, job_id)):
+        raise HTTPException(409, "only a dead job can be retried")
+    return {"ok": True}
 
 
 @app.get("/api/campaigns", response_model=list[CampaignOut], dependencies=[Depends(require_api_token)])

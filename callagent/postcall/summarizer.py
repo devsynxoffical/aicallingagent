@@ -192,6 +192,13 @@ async def finalize_call(
             run.duration_seconds = int((run.ended_at - run.started_at).total_seconds())
         if run.cost_usd is None:
             run.cost_usd = call_cost(run.duration_seconds, settings)
+        if transcript or mode == "voicemail":
+            # Saved together with the transcript: if the review below does not finish (the
+            # model is unreachable, the process stops), the queue reviews this call later.
+            from .. import background, jobs
+
+            jobs.enqueue(s, background.CALL_REVIEW, background.call_review_key(call_run_id), {"call_run_id": call_run_id},
+                         delay_seconds=background.REVIEW_SAFETY_NET_DELAY_SECONDS, max_attempts=4, timeout_seconds=300, call_run_id=call_run_id)
         return run.lead_id
 
     lead_id = await run_db(_persist_transcript)
@@ -234,6 +241,9 @@ async def finalize_call(
         run.disposition = disposition
         if review:
             run.summary = {**(run.summary or {}), "review": review.model_dump()}
+            from .. import background, jobs
+
+            jobs.complete_by_key(s, background.call_review_key(call_run_id))  # reviewed now: the safety net is not needed
         lead.last_disposition = disposition
         if lead.status == "dnc":
             return

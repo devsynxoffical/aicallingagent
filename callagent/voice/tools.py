@@ -197,40 +197,52 @@ async def book_meeting(session: CallSession, params: FunctionCallParams) -> dict
     if parsed < datetime.now(timezone.utc):
         return {"ok": False, "error": "that time is in the past; confirm the date with the prospect"}
 
+    webhook = session.settings.booking_webhook_url
+
     def _save(s):
-        appt = Appointment(
-            lead_id=session.lead["id"],
-            call_run_id=session.call_run_id,
-            starts_at=parsed.isoformat(),
-            timezone=str(args.get("timezone", "")),
-            notes=str(args.get("notes", "")),
-        )
-        s.add(appt)
+        from sqlalchemy import select
+
+        from .. import background, jobs
+
+        # Saying the same time twice on one call is one meeting, and one notification.
+        appt = s.execute(
+            select(Appointment).where(Appointment.call_run_id == session.call_run_id, Appointment.starts_at == parsed.isoformat())
+        ).scalars().first()
+        if appt is None:
+            appt = Appointment(
+                lead_id=session.lead["id"],
+                call_run_id=session.call_run_id,
+                starts_at=parsed.isoformat(),
+                timezone=str(args.get("timezone", "")),
+                notes=str(args.get("notes", "")),
+            )
+            s.add(appt)
+            s.flush()
         lead = s.get(Lead, session.lead["id"])
         if lead:
             lead.last_disposition = "meeting_booked"
-        s.flush()
+        if webhook:
+            # Saved with the appointment: either both exist or neither does. Delivery happens
+            # off the call, with retries, so a slow or failing endpoint never causes dead air.
+            key = background.booking_webhook_key(appt.id)
+            body = {
+                "appointment_id": appt.id,
+                "starts_at": parsed.isoformat(),
+                "timezone": args.get("timezone"),
+                "notes": args.get("notes", ""),
+                "lead": {k: v for k, v in session.lead.items() if k != "extra"},
+                "lead_extra": session.lead.get("extra", {}),
+                "call_run_id": session.call_run_id,
+            }
+            jobs.enqueue(s, background.BOOKING_WEBHOOK, key, {"delivery_id": key, "body": body}, max_attempts=8, timeout_seconds=30, call_run_id=session.call_run_id)
         return appt.id
 
     appt_id = await run_db(_save)
     session.disposition = session.disposition or "meeting_booked"
-
-    webhook = session.settings.booking_webhook_url
     if webhook:
-        payload = {
-            "appointment_id": appt_id,
-            "starts_at": parsed.isoformat(),
-            "timezone": args.get("timezone"),
-            "notes": args.get("notes", ""),
-            "lead": {k: v for k, v in session.lead.items() if k != "extra"},
-            "lead_extra": session.lead.get("extra", {}),
-            "call_run_id": session.call_run_id,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(webhook, json=payload)
-        except Exception as e:
-            log.warning("booking webhook failed: %s", e)
+        from .. import background
+
+        background.kick(background.booking_webhook_key(appt_id))
     return {"ok": True, "appointment_id": appt_id, "confirmed_time": parsed.isoformat()}
 
 

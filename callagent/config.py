@@ -112,6 +112,8 @@ class Settings(BaseSettings):
     server_port: int = 8000
     server_url: str = "http://localhost:8000"
     booking_webhook_url: str | None = None
+    # Shared secret for signing booking notifications (X-Callagent-Signature: sha256=<HMAC of the body>).
+    booking_webhook_secret: str | None = None
     # Campaign (name or id) that answers calls to numbers with no campaign of their own.
     inbound_campaign: str | None = None
     # Bearer token for /api/*. Generated into DATA_DIR/api_token on first run if unset; the CLI reads the same file.
