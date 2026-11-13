@@ -345,6 +345,57 @@ class TrainingRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
 
 
+class Job(Base):
+    """A unit of background work that must not be lost: it survives restarts, is retried
+    with backoff, and ends either done or dead (kept, with its error, for a person to see).
+
+    ``key`` makes enqueueing idempotent: asking twice for the same work is one job. A job
+    is written in the same transaction as the change that causes it, so the change and
+    its follow-up are saved together or not at all (a transactional outbox).
+    """
+
+    __tablename__ = "jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(60), index=True)
+    key: Mapped[str] = mapped_column(String(200))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(12), default="queued")  # queued | running | done | dead
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    run_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)  # not before this moment
+    # While running: who has it and until when. A worker that dies simply stops renewing,
+    # and the job is taken over once the lease has passed.
+    locked_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    locked_until: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # For tracing: the call this work belongs to, when it belongs to one.
+    call_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+    __table_args__ = (
+        Index("uq_jobs_key", "key", unique=True),
+        Index("ix_jobs_due", "status", "run_at"),
+    )
+
+
+class JobAttempt(Base):
+    """History: one row per time a job was run, with how it ended."""
+
+    __tablename__ = "job_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
+    attempt: Mapped[int] = mapped_column(Integer)
+    worker: Mapped[str] = mapped_column(String(80), default="")
+    outcome: Mapped[str] = mapped_column(String(12), default="running")  # running | ok | error | timeout | abandoned
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
 class DoNotCall(Base):
     __tablename__ = "do_not_call"
 
