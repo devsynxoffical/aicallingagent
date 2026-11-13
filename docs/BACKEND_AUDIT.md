@@ -41,19 +41,33 @@ call; the voice loop never waits for the post-call review.
 
 ## Progress
 
-Updated as work lands. "Verified" names the test that proves it.
+Updated as work lands. "Verified" names the test that proves it. Nothing here was
+validated against a real provider.
 
 | Finding | Status | Verified by |
 | --- | --- | --- |
-| C-1 double dialing | Fixed | `tests/test_integrity.py` (12 simultaneous attempts, SQLite and PostgreSQL) |
-| C-5 provider timeout | Fixed for the request timeout; behaviour after a timeout still follows C-2 | Not verified against real Twilio |
+| C-1 double dialing | Fixed | `tests/test_integrity.py` (12 simultaneous attempts, SQLite and PostgreSQL); load test |
+| C-2 redial without asking the provider | Fixed in logic | `tests/test_lifecycle.py` reconciliation tests, with a stand-in provider |
+| C-3 stale calls on stopped campaigns | Fixed | reconciliation runs for every campaign; fixture campaign is paused |
+| C-4 state machine | Fixed | `test_every_state_and_event_pair_follows_the_lifecycle` |
+| C-5 provider timeout | Fixed | configuration; follow-up behaviour covered by C-2 |
 | C-6 restart pauses campaigns | Fixed | `test_a_restart_does_not_pause_running_campaigns` |
+| C-7 transcript and review lost on failure | Half: failed reviews are retried from the stored transcript. Open: saving the transcript during the call | `tests/test_background.py` |
+| C-9 booking webhook | Fixed | `tests/test_background.py` |
+| J-1 job system | Fixed (core). Open: document reading as a job | `tests/test_jobs.py` |
+| J-2 training stuck after restart | Fixed | `test_a_training_run_interrupted_by_a_restart...` |
+| J-3 crawl inside a write transaction | Fixed | `test_reading_a_slow_website_does_not_block_other_writes` (fails on the old code) |
 | D-1 migrations | Fixed | new, pre-migration and duplicate-holding databases, both engines |
 | D-2 uniqueness | Fixed | `test_the_database_refuses_duplicates...`, concurrent inbound webhook test |
 | D-4 indexes | Composite indexes added; CHECK constraints open | |
-| D-7 connections | Fixed | pool settings; dropped-connection behaviour not load-tested |
-| D-8 backups | Backup, verify, restore built; scheduling is the operator's | `tests/test_backup.py` restore drill, both engines |
-| Everything else | Open | |
+| D-5 money as float | Ledger amounts are exact decimals; `call_runs.cost_usd` is still a float | `test_usage_across_calls_adds_up_exactly` |
+| D-6 whole campaigns loaded into memory | Open; measured in `LOAD_TEST_RESULTS.md` | |
+| D-7 connections | Fixed | pool settings; load test ran without pool errors |
+| D-8 backups | Built and drilled; scheduling is the operator's | `tests/test_backup.py`, both engines |
+| S-3 webhook replay | Replays are harmless; disabling signature checks is still silent | lifecycle and ledger tests |
+| B-1 usage ledger | Fixed | `test_the_final_status_reported_any_number_of_times_is_one_usage_row` |
+| T-1 test coverage | Concurrency, recovery, failure-injection and load tests added. No real-provider test | |
+| C-8, C-10, C-11, J-4, D-3, S-1, S-2, S-4 to S-9, AI-1 to AI-5, O-1, O-2, A-1, A-2 | Open | |
 
 ## 2. Findings
 

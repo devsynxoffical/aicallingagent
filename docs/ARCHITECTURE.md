@@ -250,6 +250,33 @@ phase 6, because every table created from then on must be born tenant-scoped.
 - Still one organization and one shared operator token: per-user accounts and roles
   are not built. The dashboard records approvals as made by "dashboard".
 
+### Hardening release (2026-11-13)
+
+Audit, design and status are in their own documents: `BACKEND_AUDIT.md`,
+`DATABASE_DESIGN.md`, `RELIABILITY_PLAN.md`, `SECURITY_REVIEW.md`,
+`LOAD_TEST_RESULTS.md`, `DISASTER_RECOVERY.md`, `PRODUCTION_READINESS.md`.
+
+What changed in the architecture, and why nothing was replaced:
+
+- **Still one process, one database.** The audit found correctness problems, not a
+  structural one, so no service was split off and no broker was added.
+- **Migrations** (`callagent/migrate.py`, `callagent/migrations/`): Alembic, run at
+  start. The old "add missing columns" step now runs once, to adopt databases from
+  before migrations.
+- **The database enforces what code used to check**: one record per provider call, one
+  lead per number per campaign, one unfinished outbound call per lead, one live
+  playbook version, one running test per campaign.
+- **Lead reservation** (`dialer/campaign_runner.claim_lead_for_call`): one transaction
+  decides whether a person may be rung.
+- **Call lifecycle** (`dialer/lifecycle.py`): the only place a call's status changes.
+- **Reconciliation** (`dialer/reconcile.py`): a quiet call is resolved by asking the
+  provider, for every campaign, every minute.
+- **Job queue** (`callagent/jobs.py`, `callagent/background.py`): a table in the same
+  database, written in the transaction that causes the work. Booking notifications,
+  the post-call review safety net and training runs use it.
+- **Usage ledger** (`usage_records`): one exact-decimal row per call.
+- **Backups** (`callagent/backup.py`): `callagent db backup | verify-backup | restore`.
+
 Known simplification: a "training project" and an "agent" are still the campaign
 itself. The roadmap's split (training project -> agent -> campaign) is made in phase
 6a, together with the API that needs it; splitting earlier would have meant

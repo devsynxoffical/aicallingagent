@@ -429,10 +429,39 @@ tests/                   unit tests (no network)
 examples/                sample script + sample lead sheet
 ```
 
+## Operations
+
+```bash
+callagent db status            # which migration the database is at
+callagent db upgrade           # apply new migrations (the server also does this at start)
+callagent db check             # list duplicates a migration would refuse
+callagent db backup --to DIR   # database + uploaded files + manifest, verified
+callagent db verify-backup PATH
+callagent db restore PATH      # stop the server first
+```
+
+- **Database.** SQLite for one operator on one machine; PostgreSQL for anything
+  hosted (`pip install "callagent[postgres]"`, `DATABASE_URL=postgresql+psycopg://...`).
+  Measured: SQLite degrades sharply when several people use the dashboard at once.
+- **Background jobs.** Booking notifications, post-call reviews that failed and
+  training runs go through a durable queue in the database: retried with backoff,
+  taken over after a crash, parked as `dead` with their error when they give up.
+  `GET /api/jobs?status=dead` lists those; `POST /api/jobs/{id}/retry` reruns one.
+- **Booking notifications** are signed when `BOOKING_WEBHOOK_SECRET` is set
+  (`X-Callagent-Signature: sha256=<HMAC-SHA256 of the body>`) and carry the same
+  `X-Callagent-Delivery` id on every retry, so your endpoint can ignore repeats.
+- **One process per database** for now: a second process would run a second dial loop.
+  People still cannot be rung twice, but pacing and concurrency limits would double.
+- Where things stand, and what is not done: `docs/PRODUCTION_READINESS.md`. Design and
+  procedures: `docs/DATABASE_DESIGN.md`, `docs/RELIABILITY_PLAN.md`,
+  `docs/SECURITY_REVIEW.md`, `docs/DISASTER_RECOVERY.md`, `docs/LOAD_TEST_RESULTS.md`.
+
 ## Tests
 
 ```bash
 pytest
+TEST_POSTGRES_URL=postgresql+psycopg://postgres@127.0.0.1:5432/callagent_test pytest   # also runs integrity and restore tests on PostgreSQL (the database is wiped)
+python loadtests/run.py --database-url sqlite:////tmp/load.db                          # load test; see docs/LOAD_TEST_RESULTS.md
 ```
 
 `tests/seed_dashboard.py` fills an **empty** database with invented campaigns for the
