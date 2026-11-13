@@ -66,6 +66,14 @@ def stream_twiml(call_run_id: int, mode: str, settings: Settings, stream_token: 
     return str(response)
 
 
+def say_and_hangup_twiml(message: str) -> str:
+    """Used when an inbound call reaches a number no campaign answers."""
+    response = VoiceResponse()
+    response.say(message)
+    response.hangup()
+    return str(response)
+
+
 def hangup_twiml() -> str:
     response = VoiceResponse()
     response.hangup()

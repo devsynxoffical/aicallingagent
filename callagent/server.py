@@ -18,11 +18,13 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import select
 
 from .config import Settings, get_settings, resolve_api_token
-from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db
+from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
 from .dialer import twilio_client
 from .dialer.campaign_runner import TERMINAL_CALL_STATUSES, CampaignRunner, apply_twilio_status
 from .leads.importer import import_leads
+from .leads.importer import normalize_phone
 from .playbook.schema import Playbook
+from .providers import SpeechPlan, speech_plan_problems
 from .voice.pipeline import run_call
 
 log = logging.getLogger("callagent.server")
@@ -114,10 +116,91 @@ async def twilio_voice(request: Request, call_run_id: int = Query(...), settings
 
 
 @app.post("/twilio/status")
-async def twilio_status(request: Request, call_run_id: int = Query(...), settings: Settings = Depends(get_settings)):
+async def twilio_status(request: Request, call_run_id: int | None = Query(None), settings: Settings = Depends(get_settings)):
     form = await _twilio_form(request, settings)
-    await run_db(lambda s: apply_twilio_status(s, call_run_id, form, settings))
+
+    def _apply(s):
+        run_id = call_run_id
+        if run_id is None:
+            # Inbound calls: the number's status callback carries no call_run_id, so find the call by its SID.
+            sid = form.get("CallSid")
+            run = s.execute(select(CallRun).where(CallRun.twilio_call_sid == sid)).scalars().first() if sid else None
+            if run is None:
+                return
+            run_id = run.id
+        apply_twilio_status(s, run_id, form, settings)
+
+    await run_db(_apply)
     return PlainTextResponse("ok")
+
+
+NO_AGENT_MESSAGE = "Sorry, nobody is available to take your call on this number right now. Please try again later. Goodbye."
+
+
+def find_inbound_campaign(s, to_number: str | None, settings: Settings) -> Campaign | None:
+    """The campaign that answers calls to this number: the one that owns the number,
+    otherwise the INBOUND_CAMPAIGN fallback."""
+    if to_number:
+        owned = s.execute(select(Campaign).where(Campaign.inbound_number == to_number)).scalars().first()
+        if owned is not None:
+            return owned
+    fallback = (settings.inbound_campaign or "").strip()
+    if not fallback:
+        return None
+    return s.get(Campaign, int(fallback)) if fallback.isdigit() else get_campaign_by_name(s, fallback)
+
+
+def open_inbound_call(s, form: dict[str, str], settings: Settings) -> tuple[int, str] | None:
+    """Create the call record for an incoming call. Returns (call_run_id, stream_token),
+    or None when no campaign answers the dialed number."""
+    campaign = find_inbound_campaign(s, form.get("To"), settings)
+    if campaign is None or not campaign.playbook_json:
+        return None
+    call_sid = form.get("CallSid") or ""
+    existing = s.execute(select(CallRun).where(CallRun.twilio_call_sid == call_sid)).scalars().first() if call_sid else None
+    if existing is not None:
+        # Twilio retried the webhook: answer with the same stream instead of opening a second call.
+        return existing.id, existing.stream_token or ""
+    caller = normalize_phone(form.get("From") or "", settings.default_phone_region)
+    # Withheld caller ID: a per-call placeholder keeps anonymous callers from sharing one lead.
+    phone = caller or f"anon:{call_sid[-24:] or _secrets.token_hex(8)}"
+    lead = s.execute(select(Lead).where(Lead.campaign_id == campaign.id, Lead.phone_e164 == phone)).scalars().first()
+    if lead is None:
+        lead = Lead(campaign_id=campaign.id, phone_e164=phone, raw_phone=form.get("From") or "", status="completed", extra={"source": "inbound call"})
+        s.add(lead)
+        s.flush()
+    status_before = lead.status
+    if lead.status != "dnc":
+        lead.status = "calling"  # keeps the dialer from ringing them while they are on the line with us
+    token = _secrets.token_urlsafe(24)
+    run = CallRun(
+        lead_id=lead.id,
+        campaign_id=campaign.id,
+        twilio_call_sid=call_sid or None,
+        status="in-progress",
+        mode="inbound",
+        direction="inbound",
+        answered_by="human",
+        stream_token=token,
+        started_at=utcnow(),
+        summary={"lead_status_before": status_before},
+    )
+    s.add(run)
+    s.flush()
+    return run.id, token
+
+
+@app.post("/twilio/inbound")
+async def twilio_inbound(request: Request, settings: Settings = Depends(get_settings)):
+    """Point a Twilio number's "A call comes in" webhook here to have the agent answer it."""
+    form = await _twilio_form(request, settings)
+    opened = await run_db(lambda s: open_inbound_call(s, form, settings))
+    if opened is None:
+        log.warning("inbound call to %s: no campaign answers this number", form.get("To"))
+        return Response(content=twilio_client.say_and_hangup_twiml(NO_AGENT_MESSAGE), media_type="application/xml")
+    call_run_id, token = opened
+    log.info("inbound call_run %s from %s", call_run_id, form.get("From"))
+    return Response(content=twilio_client.stream_twiml(call_run_id, "inbound", settings, token), media_type="application/xml")
 
 
 @app.websocket("/ws")
@@ -181,6 +264,8 @@ class CampaignOut(BaseModel):
     id: int
     name: str
     status: str
+    languages: list[str] = []
+    inbound_number: str | None = None
     readiness_score: int
     stats: dict[str, int]
     running: bool
@@ -191,10 +276,23 @@ def _campaign_out(s, c: Campaign) -> CampaignOut:
         id=c.id,
         name=c.name,
         status=c.status,
+        languages=_languages(c),
+        inbound_number=c.inbound_number,
         readiness_score=int((c.playbook_json or {}).get("readiness_score", 0)),
         stats=campaign_stats(s, c.id),
         running=_runner().is_running(c.id),
     )
+
+
+def _languages(c: Campaign) -> list[str]:
+    try:
+        return Playbook.model_validate(c.playbook_json).languages
+    except Exception:
+        return []
+
+
+def _speech_problems(pb: Playbook, settings: Settings) -> list[str]:
+    return speech_plan_problems(settings, SpeechPlan.from_playbook(pb))
 
 
 def _get_campaign(s, name_or_id: str) -> Campaign:
@@ -267,6 +365,10 @@ async def start_campaign(name: str, concurrency: int | None = None, force: bool 
         if not pb.is_ready and not force:
             qs = "; ".join(q.question for q in pb.blocking_questions)
             raise HTTPException(400, f"playbook has blocking open questions: {qs}. Answer them (callagent onboard) or pass force=true.")
+        problems = _speech_problems(pb, settings)
+        if problems:
+            # Not overridable: dialing people in a language the agent cannot hear is never the right call.
+            raise HTTPException(400, "cannot run this campaign's languages with the configured providers: " + "; ".join(problems))
         if concurrency:
             c.max_concurrent_calls = concurrency
         return c.id
@@ -283,20 +385,46 @@ async def pause_campaign(name: str):
     return await run_db(lambda s: _campaign_out(s, _get_campaign(s, name)))
 
 
+@app.post("/api/campaigns/{name}/inbound", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
+async def set_inbound_number(name: str, number: str | None = None, settings: Settings = Depends(get_settings)):
+    """Make this campaign answer calls to ``number``. Omit ``number`` to stop answering."""
+    e164: str | None = None
+    if number:
+        e164 = normalize_phone(number, settings.default_phone_region)
+        if not e164:
+            raise HTTPException(400, f"invalid phone number: {number}")
+
+    def _set(s):
+        c = _get_campaign(s, name)
+        if e164:
+            taken = s.execute(select(Campaign).where(Campaign.inbound_number == e164, Campaign.id != c.id)).scalars().first()
+            if taken is not None:
+                raise HTTPException(409, f"{e164} is already answered by campaign '{taken.name}'")
+            problems = _speech_problems(Playbook.model_validate(c.playbook_json), settings)
+            if problems:
+                raise HTTPException(400, "cannot run this campaign's languages with the configured providers: " + "; ".join(problems))
+        c.inbound_number = e164
+        s.flush()
+        return _campaign_out(s, c)
+
+    return await run_db(_set)
+
+
 @app.post("/api/campaigns/{name}/dial", dependencies=[Depends(require_api_token)])
 async def dial_one(name: str, phone: str, first_name: str = "", settings: Settings = Depends(get_settings)):
     """Place a single test call to one number (added to the campaign as a lead)."""
     missing = settings.missing_for_calls()
     if missing:
         raise HTTPException(400, f"cannot place calls, missing settings: {', '.join(missing)}")
-    from .leads.importer import normalize_phone
-
     e164 = normalize_phone(phone, settings.default_phone_region)
     if not e164:
         raise HTTPException(400, f"invalid phone number: {phone}")
 
     def _lead(s):
         c = _get_campaign(s, name)
+        problems = _speech_problems(Playbook.model_validate(c.playbook_json), settings)
+        if problems:
+            raise HTTPException(400, "cannot run this campaign's languages with the configured providers: " + "; ".join(problems))
         if is_dnc(s, e164):
             raise HTTPException(400, f"{e164} is on the do-not-call list")
         lead = s.execute(select(Lead).where(Lead.campaign_id == c.id, Lead.phone_e164 == e164)).scalar_one_or_none()
@@ -326,6 +454,8 @@ async def list_calls(name: str, limit: int = 50):
                     "phone": lead.phone_e164 if lead else "",
                     "status": r.status,
                     "mode": r.mode,
+                    "direction": r.direction,
+                    "language": r.language,
                     "answered_by": r.answered_by,
                     "disposition": r.disposition,
                     "duration_seconds": r.duration_seconds,
@@ -348,6 +478,8 @@ async def get_call(call_run_id: int):
             "call_run_id": r.id,
             "status": r.status,
             "mode": r.mode,
+            "direction": r.direction,
+            "language": r.language,
             "answered_by": r.answered_by,
             "disposition": r.disposition,
             "duration_seconds": r.duration_seconds,

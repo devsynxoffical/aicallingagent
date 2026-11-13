@@ -33,15 +33,32 @@ class Settings(BaseSettings):
     postcall_model: str | None = None  # defaults to onboarding_model
     enable_refusal_fallbacks: bool = True
 
+    # Which provider does each job. Every provider sits behind an adapter in callagent/providers.
+    stt_provider: str = "deepgram"  # deepgram | soniox
+    tts_provider: str = "elevenlabs"
+
     # Deepgram
     deepgram_api_key: str | None = None
     deepgram_model: str = "nova-3-general"
     # How quickly Deepgram finalizes a transcript after speech pauses (ms). Lower = snappier.
     deepgram_endpointing_ms: int = 300
+    # Model used when a call follows the prospect across languages (code-switching).
+    deepgram_multilingual_model: str = "nova-3"
+    # Languages you have confirmed the multilingual model transcribes well on your own calls.
+    # A campaign that needs a language outside this list will not start on Deepgram.
+    deepgram_multilingual_languages: str = "en,es,fr,de,hi,it,ja,nl,ru,pt"
+
+    # Soniox (alternative ears; one model with built-in language identification)
+    soniox_api_key: str | None = None
+    soniox_model: str = "stt-rt-v6"
 
     # ElevenLabs
     elevenlabs_api_key: str | None = None
     elevenlabs_voice_id: str | None = None
+    # Optional voice per language for calls that switch language. Unset = one voice for all.
+    elevenlabs_voice_id_en: str | None = None
+    elevenlabs_voice_id_ar: str | None = None
+    elevenlabs_voice_id_fr: str | None = None
     elevenlabs_model: str = "eleven_flash_v2_5"
     elevenlabs_stability: float = 0.45
     elevenlabs_similarity: float = 0.8
@@ -80,6 +97,8 @@ class Settings(BaseSettings):
     server_port: int = 8000
     server_url: str = "http://localhost:8000"
     booking_webhook_url: str | None = None
+    # Campaign (name or id) that answers calls to numbers with no campaign of their own.
+    inbound_campaign: str | None = None
     # Bearer token for /api/*. Generated into DATA_DIR/api_token on first run if unset; the CLI reads the same file.
     api_token: str | None = None
 
@@ -97,6 +116,11 @@ class Settings(BaseSettings):
         return v.rstrip("/") if isinstance(v, str) and v else v
 
     @property
+    def elevenlabs_voices(self) -> dict[str, str]:
+        pairs = {"en": self.elevenlabs_voice_id_en, "ar": self.elevenlabs_voice_id_ar, "fr": self.elevenlabs_voice_id_fr}
+        return {lang: voice for lang, voice in pairs.items() if voice}
+
+    @property
     def postcall_model_id(self) -> str:
         return self.postcall_model or self.onboarding_model
 
@@ -107,13 +131,19 @@ class Settings(BaseSettings):
             raise RuntimeError("PUBLIC_BASE_URL must be set to place calls")
         return self.public_base_url.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
 
+    @field_validator("stt_provider", "tts_provider", mode="before")
+    @classmethod
+    def _lower(cls, v):
+        return v.strip().lower() if isinstance(v, str) else v
+
     def missing_for_calls(self) -> list[str]:
         """Names of settings required to place live calls that are not configured."""
+        from .providers import get_stt, get_tts
+
         required = {
             "ANTHROPIC_API_KEY": self.anthropic_api_key,
-            "DEEPGRAM_API_KEY": self.deepgram_api_key,
-            "ELEVENLABS_API_KEY": self.elevenlabs_api_key,
-            "ELEVENLABS_VOICE_ID": self.elevenlabs_voice_id,
+            **get_stt(self).required_settings(self),
+            **get_tts(self).required_settings(self),
             "TWILIO_ACCOUNT_SID": self.twilio_account_sid,
             "TWILIO_AUTH_TOKEN": self.twilio_auth_token,
             "TWILIO_FROM_NUMBER": self.twilio_from_number,

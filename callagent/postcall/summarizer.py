@@ -47,6 +47,21 @@ class CallReview(BaseModel):
     agent_quality_score: int = Field(description="0-10 for how human, relevant and effective the agent was.")
     coaching_notes: list[str] = Field(description="Specific, actionable notes to improve future calls.")
     playbook_suggestions: list[str] = Field(description="Concrete edits to the playbook this call suggests. Empty if none.")
+    customer_sentiment: Literal["positive", "neutral", "negative", "mixed", "unknown"] = Field(
+        default="unknown", description="How the prospect felt across the call, judged from their own words."
+    )
+    pain_points: list[str] = Field(default_factory=list, description="Problems the prospect said they have. Their words, not the pitch.")
+    buying_intent_score: int = Field(default=0, description="0-100. Likelihood this prospect buys, from what they said.")
+    qualification_score: int = Field(default=0, description="0-100. How well the prospect fits the playbook's target customer.")
+    objections_handled: list[str] = Field(default_factory=list, description="Objections the agent answered in a way the prospect accepted.")
+    missed_opportunities: list[str] = Field(
+        default_factory=list, description="Buying signals or openings the agent did not act on. Quote the moment."
+    )
+    incorrect_statements: list[str] = Field(
+        default_factory=list, description="Anything the agent said that the playbook does not support. Empty if none."
+    )
+    ai_disclosed: bool = Field(default=False, description="True if the agent said it is an AI assistant during the call.")
+    language_was_appropriate: bool = Field(default=True, description="False if the agent used the wrong language or mixed languages.")
 
 
 TERMINAL_DISPOSITIONS = {
@@ -63,7 +78,10 @@ REVIEW_SYSTEM = """You review transcripts of outbound sales calls made by an AI 
 You know the playbook the agent was running. Be honest and specific: the goal is to
 improve the next thousand calls. Judge the disposition from what the prospect actually
 said, not from what the agent logged. If the call was cut short (transcript ends
-abruptly, prospect never spoke), say so in the summary and recommend a retry."""
+abruptly, prospect never spoke), say so in the summary and recommend a retry.
+The transcript may be in English, Arabic or French; write your review in English.
+List under incorrect_statements any price, guarantee, result or capability the agent
+stated that the playbook summary does not support."""
 
 
 def review_call(
@@ -80,6 +98,11 @@ def review_call(
 Company: {playbook.company_name}
 Goal: {playbook.call_goal} - {playbook.call_goal_details}
 Agent persona: {playbook.persona.agent_name}, {playbook.persona.role_title}
+Target customer: {playbook.target_customer}
+Languages the agent may speak: {", ".join(playbook.languages)}
+Must disclose being an AI up front: {playbook.disclose_ai_upfront}
+Pricing the agent may state: {playbook.pricing_and_terms or "(none)"}
+Proof points the agent may cite: {"; ".join(playbook.proof_points) or "(none)"}
 Call mode: {mode}
 </playbook_summary>
 
@@ -114,6 +137,8 @@ async def finalize_call(
     agent_disposition: str | None,
     settings: Settings | None = None,
     latency: dict[str, Any] | None = None,
+    language: dict[str, Any] | None = None,
+    direction: str = "outbound",
 ) -> CallReview | None:
     """Persist transcript, run the review, update the lead's status/retry schedule."""
     settings = settings or get_settings()
@@ -127,6 +152,9 @@ async def finalize_call(
         run.tool_events = tool_events
         if latency:
             run.summary = {**(run.summary or {}), "latency": latency}
+        if language:
+            run.summary = {**(run.summary or {}), "language": language}
+            run.language = language.get("detected")
         run.ended_at = run.ended_at or now
         if run.started_at:
             run.duration_seconds = int((run.ended_at - run.started_at).total_seconds())
@@ -176,8 +204,16 @@ async def finalize_call(
             return
         if lead.status == "callback" and lead.next_attempt_at and lead.next_attempt_at > now:
             return  # callback already scheduled by the in-call tool
+        if direction == "inbound" and not transcript:
+            # Nobody spoke: leave the lead exactly as it was before they rang.
+            lead.status = (run.summary or {}).get("lead_status_before") or "completed"
+            return
         booked = s.execute(select(Appointment.id).where(Appointment.call_run_id == call_run_id).limit(1)).first() is not None
         if booked or disposition in TERMINAL_DISPOSITIONS:
+            lead.status = "completed"
+        elif direction == "inbound":
+            # They called us. Calling back uninvited is not ours to decide: only a callback
+            # they asked for (handled above) puts an inbound caller on the dial list.
             lead.status = "completed"
         elif review and review.retry_recommended and lead.attempts < settings.max_attempts:
             lead.status = "pending"

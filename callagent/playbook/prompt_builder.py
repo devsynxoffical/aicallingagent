@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from ..languages import language_name
 from .schema import Playbook
 
 HUMAN_STYLE_RULES = """# How you sound
@@ -28,7 +29,7 @@ voice the instant you write it, so:
 - No lists, no headings, no markdown, no emojis, no stage directions, no text in brackets.
 - Never say "as an AI language model". If asked directly whether you are an AI or a
   robot, be honest and brief, then continue naturally (see the persona section).
-- Match the caller's language. If they switch languages, switch with them if you can.
+- Never claim to be a human, and never invent a personal life to seem like one.
 
 # Pacing of the call
 Hello, permission, reason for calling, one relevant question, then pitch only what
@@ -45,7 +46,76 @@ fifth minute. If they are clearly busy, offer a callback instead of pushing.
 - Abuse or clear distress: stay calm, end the call gracefully.
 - Anything outside your knowledge: say you will have a colleague follow up, offer to note
   the question, and move on. Do not make things up.
+- Never invent a guarantee, discount, testimonial, result, price or capability. If it is
+  not in this briefing, you do not know it.
 """
+
+LANGUAGE_NOTES = {
+    "en": "English: relaxed, professional spoken English.",
+    "ar": (
+        "Arabic: speak the way an educated professional talks on the phone, not formal written "
+        "Arabic. Use clear Modern Standard Arabic as the base and lean toward the prospect's own "
+        "dialect as you hear it (Gulf, Saudi, Emirati, Egyptian) without imitating it badly. "
+        "Use natural courtesies. Write everything in Arabic script, including numbers as words."
+    ),
+    "fr": (
+        "French: natural professional spoken French. Use vous unless they clearly prefer tu. "
+        "Use everyday business phrasing a native rep would use, never a literal translation."
+    ),
+}
+
+
+def _language_section(p: Playbook) -> str:
+    langs = p.languages or ["en"]
+    primary = langs[0]
+    notes = "\n".join(f"- {LANGUAGE_NOTES.get(l, language_name(l))}" for l in langs)
+    if not p.follows_prospect_language:
+        return f"""# Language
+Speak {language_name(primary)} ({p.persona.language}) for the whole call.
+{notes}
+If the prospect speaks a language you were not asked to use, say politely, in
+{language_name(primary)}, that a colleague who speaks their language will follow up,
+and offer a callback.
+"""
+    names = ", ".join(language_name(l) for l in langs)
+    return f"""# Language
+You speak {names} on this call. Open in {language_name(primary)}.
+- Always answer in the language of the prospect's most recent message. If they switch
+  language, switch with them at once and stay there until they switch again. Do not
+  comment on the switch and do not ask which language they prefer.
+- One language per reply. Never mix languages in a sentence; only names, brands and
+  product terms stay as they are.
+- Say things the way a native speaker would in that language. Do not translate your
+  English phrasing word for word; the pitch, the courtesies and the close each have
+  their own natural form.
+- Tool arguments (summaries, notes, reasons) are always written in English.
+{notes}
+"""
+
+
+def _localized_section(p: Playbook) -> str:
+    blocks = []
+    for loc in p.localized:
+        if not loc.opening_line:
+            continue
+        objections = "\n".join(f'  - "{o.objection}": {o.response}' for o in loc.objections) or "  - (use your judgment)"
+        booking = "\n".join(f"  - {b}" for b in loc.booking_phrases) or "  - (use your judgment)"
+        blocks.append(
+            f"""## When speaking {language_name(loc.language)}
+- Opening: {loc.opening_line}
+- Permission: {loc.permission_line}
+- Pitch: {loc.pitch}
+- Objections:
+{objections}
+- Booking a time:
+{booking}
+- Closing: {loc.closing_script}
+- Style: {loc.style_notes}"""
+        )
+    if not blocks:
+        return ""
+    return "# Native phrasing per language\nGuidance in your own words, not lines to read out.\n" + "\n".join(blocks) + "\n"
+
 
 TOOL_RULES = """# Tools
 You have tools. Use them; do not just talk about doing things.
@@ -93,6 +163,7 @@ def build_system_prompt(
     now: datetime | None = None,
     callback_number: str = "",
     human_transfer_available: bool = False,
+    call_recorded: bool = False,
 ) -> str:
     tz_name = lead.get("timezone") or "UTC"
     try:
@@ -119,9 +190,22 @@ def build_system_prompt(
     ai_line = (
         "If asked whether you are an AI, say yes plainly (for example: \"I am, actually. I'm an AI assistant "
         f"calling on behalf of {p.company_name}\") and continue."
-        if p.disclose_ai_if_asked
+        if p.disclose_ai_if_asked or p.disclose_ai_upfront
         else "If asked whether you are an AI, do not lie; say you are a virtual assistant calling for the company."
     )
+    disclosures = []
+    if p.disclose_ai_upfront:
+        disclosures.append(
+            f"In your very first turn, say that you are an AI assistant for {p.company_name}, in a natural "
+            "way and in the language you are speaking. Say it once; do not repeat it unless asked."
+        )
+    if call_recorded:
+        disclosures.append(
+            "This call is being recorded. Say so in your first turn (for example: \"just so you know, this call "
+            "is recorded for quality\"). If they object to being recorded, apologize, do not continue the pitch, "
+            "offer a callback from a colleague, and end the call."
+        )
+    disclosure_block = ("# What you must tell them up front\n" + "\n".join(f"- {d}" for d in disclosures) + "\n") if disclosures else ""
     transfer_line = (
         "A human colleague is available via transfer_to_human."
         if human_transfer_available
@@ -131,7 +215,7 @@ def build_system_prompt(
     identity = f"""# Who you are
 You are {p.persona.agent_name}, {p.persona.role_title}. You work for {p.company_name}.
 Tone: {p.persona.tone}. {p.persona.speaking_style_notes}
-Speak {p.persona.language}. {ai_line}
+{ai_line}
 {transfer_line}
 
 # The company and the offer
@@ -184,14 +268,21 @@ day and time out loud and pass an ISO 8601 datetime with timezone to the tool.
 Callback number to leave if needed: {callback_number or "(not configured; do not promise a number)"}.
 """
 
+    language = _language_section(p)
+    localized = _localized_section(p)
+
     if mode == "voicemail":
         vm = p.voicemail_script.replace("{callback_number}", callback_number or "the number I'm calling from")
+        voicemail_disclosure = (
+            f"Say in the message that you are an AI assistant calling for {p.company_name}.\n" if p.disclose_ai_upfront else ""
+        )
         return f"""{identity}
+{language}
 # VOICEMAIL MODE
 You have reached the prospect's voicemail and the beep has already played. Leave one
 warm, natural voicemail message of at most twenty-five seconds based on this script,
 then call end_call. Do not wait for a reply, do not ask questions.
-
+{voicemail_disclosure}
 Script to adapt (not read robotically): {vm}
 
 {context}
@@ -200,4 +291,23 @@ Speak like a person leaving a friendly message. No markdown, digits or symbols; 
 numbers as words.
 """
 
-    return "\n".join([identity, goal, plan, context, HUMAN_STYLE_RULES, TOOL_RULES])
+    if mode == "inbound":
+        plan = f"""# This is an inbound call
+The prospect called {p.company_name}; you did not call them. Do not use the outbound
+opening or ask for permission to talk. Greet them, say who you are, and ask how you
+can help. Answer what they ask first, then, when it fits, find out what they need and
+move toward the goal of this call. The stages, qualification questions and objections
+below still apply once the conversation is under way.
+
+Stages:
+{stages}
+
+Qualification questions (weave in naturally, one at a time):
+{quals or "- (none)"}
+
+Objections:
+{objections or "- (use the general guidance above)"}
+"""
+
+    parts = [identity, disclosure_block, language, goal, plan, localized, context, HUMAN_STYLE_RULES, TOOL_RULES]
+    return "\n".join(part for part in parts if part)

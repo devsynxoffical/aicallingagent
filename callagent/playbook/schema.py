@@ -11,6 +11,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from ..languages import base_language
+
 CallGoal = Literal["book_meeting", "close_sale", "qualify_lead", "collect_info", "reactivate", "other"]
 CapabilityKey = Literal[
     "book_meeting",
@@ -63,6 +65,21 @@ class OpenQuestion(BaseModel):
     suggested_default: str = Field(description="Reasonable default if the business does not answer. Empty if none.")
 
 
+class LocalizedPhrasing(BaseModel):
+    """How a native speaker of one language would say the key moments of the call.
+    Written for that language and market, not translated word for word."""
+
+    language: str = Field(description="BCP-47 tag this phrasing is for, e.g. 'ar', 'fr-FR'.")
+    opening_line: str
+    permission_line: str
+    pitch: str = Field(description="The core pitch in two or three natural spoken sentences.")
+    objections: list[Objection] = Field(description="The playbook's objections, answered naturally in this language.")
+    booking_phrases: list[str] = Field(description="Natural ways to propose and confirm a meeting time.")
+    closing_script: str
+    voicemail_script: str = Field(description="Under 25 seconds spoken. Keep the {callback_number} placeholder.")
+    style_notes: str = Field(description="Register, formality and dialect guidance for this language and market.")
+
+
 class Playbook(BaseModel):
     company_name: str
     company_description: str
@@ -85,11 +102,36 @@ class Playbook(BaseModel):
     voicemail_script: str = Field(description="Under 25 seconds when spoken. Includes callback number placeholder {callback_number}.")
     callback_policy: str = Field(description="When and how to offer or schedule callbacks.")
     disclose_ai_if_asked: bool = Field(description="Whether to admit being an AI assistant when asked directly. Default true.")
+    disclose_ai_upfront: bool = Field(
+        default=True,
+        description="Say in the introduction that the caller is an AI assistant. Keep true unless counsel confirmed it is not required where you call.",
+    )
+    additional_languages: list[str] = Field(
+        default_factory=list,
+        description="Other languages the agent may switch to when the prospect speaks them (BCP-47). Empty = persona.language only.",
+    )
+    localized: list[LocalizedPhrasing] = Field(
+        default_factory=list,
+        description="Native phrasing for languages other than persona.language. Filled by `callagent playbook localize`.",
+    )
     required_capabilities: list[RequiredCapability]
     keyterms: list[str] = Field(description="Product, brand and jargon words the speech recognizer should be biased toward.")
     open_questions: list[OpenQuestion] = Field(description="Gaps in the script the business must fill. Empty when nothing is missing.")
     readiness_score: int = Field(description="0-100. How ready this playbook is to run real calls.")
     readiness_notes: str
+
+    @property
+    def languages(self) -> list[str]:
+        """Base codes of every language this playbook speaks, primary first."""
+        return list(dict.fromkeys(b for b in map(base_language, [self.persona.language, *self.additional_languages]) if b))
+
+    @property
+    def follows_prospect_language(self) -> bool:
+        return len(self.languages) > 1
+
+    def localized_for(self, language: str) -> LocalizedPhrasing | None:
+        want = base_language(language)
+        return next((l for l in self.localized if base_language(l.language) == want), None)
 
     @property
     def blocking_questions(self) -> list[OpenQuestion]:

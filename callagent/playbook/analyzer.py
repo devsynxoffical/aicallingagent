@@ -6,7 +6,8 @@ import anthropic
 
 from ..config import Settings, get_settings
 from ..llm import make_client, parse_structured
-from .schema import Playbook, QAPair
+from ..languages import language_name
+from .schema import LocalizedPhrasing, Playbook, QAPair
 
 ANALYST_SYSTEM = """You are the onboarding brain of an outbound AI calling agent.
 
@@ -35,6 +36,12 @@ How to work:
   number for voicemails). Everything else gets a suggested_default.
 - The persona must fit the brand and the audience. Pick a plausible first name unless
   one is given. Language follows the script's language unless told otherwise.
+- Languages: persona.language is the language the call opens in. If the material says
+  the business also serves callers in other languages, list them in
+  additional_languages; otherwise leave it empty. Leave `localized` empty: native
+  phrasing for other languages is written in a separate step.
+- disclose_ai_upfront stays true unless the material explicitly says counsel approved
+  otherwise. The agent introduces itself as an AI assistant.
 - keyterms: brand, product, people and jargon words, 5-25 items, no common words.
 - readiness_score reflects how confidently the agent could run calls right now.
 
@@ -42,6 +49,28 @@ Once the business has answered questions (they arrive as Q&A pairs), fold the an
 into the Playbook and drop those questions from open_questions. Keep asking only about
 what is still genuinely unknown; do not re-ask answered questions or invent new
 trivial ones to look thorough."""
+
+
+LOCALIZER_SYSTEM = """You are a native-speaking sales lead preparing a phone agent for calls in your
+language. You are given a sales playbook written in another language.
+
+Write how a skilled local rep would actually say the key moments of this call, out
+loud, on the phone, in the target language and for the target market.
+
+Rules:
+- Do not translate word for word. Keep the meaning, the offer and the facts; choose the
+  phrasing, courtesies and rhythm a native speaker would use.
+- Facts are fixed. Every price, number, proof point and promise must match the playbook
+  exactly. Never add a claim, discount or guarantee. If the playbook does not allow
+  quoting a price, the localized pitch does not quote one either.
+- Spoken style: short sentences, one question at a time, numbers written as words.
+- Keep names, brands and product terms as they are. Keep the {callback_number} and
+  {first_name} placeholders exactly as written.
+- The opening must say the caller is an AI assistant for the company when the playbook
+  requires disclosure up front.
+- Arabic: clear spoken Modern Standard Arabic that a business owner in the Gulf or Egypt
+  hears as natural, in Arabic script. French: professional spoken French with vous.
+- Answer every objection in the playbook, in the same order."""
 
 
 class PlaybookAnalyzer:
@@ -73,3 +102,33 @@ class PlaybookAnalyzer:
             effort=self.settings.onboarding_effort,
             settings=self.settings,
         )
+
+    def localize(self, playbook: Playbook, language: str) -> LocalizedPhrasing:
+        """Native phrasing of the playbook's key moments for one more language."""
+        source = playbook.model_dump(
+            include={
+                "company_name", "company_description", "offer_summary", "target_customer", "value_props", "proof_points",
+                "call_goal", "call_goal_details", "persona", "opening_line", "permission_line", "objections",
+                "pricing_and_terms", "must_say", "must_not_say", "closing_script", "voicemail_script", "disclose_ai_upfront",
+            }
+        )
+        import json
+
+        result = parse_structured(
+            self.client,
+            model=self.settings.onboarding_model,
+            system=LOCALIZER_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Target language: {language_name(language)} ({language}).\n\n<playbook>\n"
+                    + json.dumps(source, ensure_ascii=False, indent=2)
+                    + "\n</playbook>\n\nWrite the native phrasing now.",
+                }
+            ],
+            output_model=LocalizedPhrasing,
+            effort=self.settings.onboarding_effort,
+            settings=self.settings,
+        )
+        result.language = language
+        return result

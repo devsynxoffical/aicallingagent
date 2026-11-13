@@ -19,7 +19,9 @@ from sqlalchemy import (
     TypeDecorator,
     create_engine,
     func,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -70,6 +72,8 @@ class Campaign(Base):
     playbook_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="draft")  # draft|ready|running|paused|done
     max_concurrent_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # E.164 number whose incoming calls this campaign answers. None = outbound only.
+    inbound_number: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow, onupdate=utcnow)
 
@@ -115,7 +119,10 @@ class CallRun(Base):
     # created | initiated | ringing | in-progress | completed | busy | no-answer | failed | canceled
     status: Mapped[str] = mapped_column(String(20), default="created")
     answered_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    mode: Mapped[str] = mapped_column(String(20), default="live")  # live | voicemail
+    mode: Mapped[str] = mapped_column(String(20), default="live")  # live | voicemail | inbound
+    direction: Mapped[str] = mapped_column(String(10), default="outbound")  # outbound | inbound
+    # Language the prospect mostly spoke (base code), filled when the call ends.
+    language: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # True once the media stream reached our server (someone or something answered and we talked).
     stream_connected: Mapped[bool] = mapped_column(Boolean, default=False)
     # Random secret handed to Twilio in the TwiML <Parameter>; the /ws handshake must present it.
@@ -168,7 +175,36 @@ def get_engine(database_url: str | None = None):
         _engine = create_engine(url, connect_args=connect_args, future=True)
         _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
         Base.metadata.create_all(_engine)
+        add_missing_columns(_engine)
     return _engine
+
+
+def add_missing_columns(engine) -> list[str]:
+    """Bring a database created by an older version up to date.
+
+    ``create_all`` creates missing tables but never alters existing ones, so columns
+    added in later releases are added here. Additive only: nothing is dropped, renamed
+    or retyped, which keeps it safe to run on every start. Returns what was added.
+    """
+    added: list[str] = []
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            existing = {c["name"] for c in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing:
+                    continue
+                ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column.type.compile(engine.dialect)}'
+                default = getattr(column.default, "arg", None)
+                if isinstance(default, str):
+                    ddl += " DEFAULT '" + default.replace("'", "''") + "'"
+                elif isinstance(default, bool):
+                    ddl += f" DEFAULT {'TRUE' if default else 'FALSE'}" if engine.dialect.name != "sqlite" else f" DEFAULT {int(default)}"
+                elif isinstance(default, int):
+                    ddl += f" DEFAULT {default}"
+                conn.execute(text(ddl))
+                added.append(f"{table.name}.{column.name}")
+    return added
 
 
 def reset_engine_for_tests(database_url: str) -> None:

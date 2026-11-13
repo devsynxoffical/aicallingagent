@@ -1,8 +1,13 @@
-# callagent - an outbound AI calling agent that sounds human
+# callagent - the DEVSYNX AI calling agent
 
 Give it your sales script. It learns the pitch, asks you what's missing, rehearses against
-simulated prospects, then dials your lead sheet and closes: books meetings, schedules
-callbacks, texts follow-ups, respects do-not-call, and writes every outcome back.
+simulated prospects, then dials your lead sheet and answers your inbound line: books
+meetings, schedules callbacks, texts follow-ups, respects do-not-call, and writes every
+outcome back. It speaks English, Arabic and French, follows the prospect when they switch
+language mid-call, and always says it is an AI assistant.
+
+The full product plan, what is built and what is not, is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```
 business script ──▶ Playbook (Claude reads, extracts, asks what's missing)
@@ -10,7 +15,8 @@ business script ──▶ Playbook (Claude reads, extracts, asks what's missing)
                         ▼
                    rehearsal (agent vs. simulated prospects, coach fixes the playbook)
                         │
-lead sheet ──▶ dialer ──▶ Twilio call ──▶ Deepgram STT ─▶ Claude ─▶ ElevenLabs TTS ──▶ prospect
+lead sheet ──▶ dialer ──▶ Twilio call ──▶ speech-to-text ─▶ Claude ─▶ voice ──▶ prospect
+inbound number ─────────▶     (adapters: Deepgram or Soniox)      (ElevenLabs)
                                 │                             │ tools: book_meeting, schedule_callback,
                                 │                             │        send_followup_sms, mark_do_not_call,
                                 ▼                             ▼        transfer_to_human, end_call
@@ -24,7 +30,7 @@ lead sheet ──▶ dialer ──▶ Twilio call ──▶ Deepgram STT ─▶ 
 | Language | Python 3.11+ | The voice-agent ecosystem (Pipecat, Silero VAD, Deepgram, ElevenLabs, Twilio) is Python-first. |
 | Brain | **Claude Opus 5** (`claude-opus-5`) via the Anthropic SDK | Deep script understanding and structured outputs for onboarding; low-effort adaptive thinking on the live call for speed. Swap the model with two env vars. |
 | Realtime framework | [Pipecat](https://github.com/pipecat-ai/pipecat) 1.12 | Battle-tested audio pipeline: barge-in, VAD, interruption handling, function calling, Twilio media streams. |
-| Ears | Deepgram Nova-3 streaming | Fast, accurate, keyterm biasing toward your product names. |
+| Ears | Deepgram Nova-3 or Soniox, behind an adapter (`STT_PROVIDER`) | Deepgram: fast, keyterm biasing toward your product names. Soniox: one model that identifies the language per word. |
 | Voice | ElevenLabs `eleven_flash_v2_5` | Most natural low-latency voice; pick any cloned or stock voice. |
 | Phone | Twilio Programmable Voice + Media Streams | Outbound dialing, answering-machine detection, SMS, transfers, recordings. |
 | Storage | SQLite via SQLAlchemy (Postgres works with `DATABASE_URL`) | Zero setup. |
@@ -103,6 +109,49 @@ detection. Voicemail gets a short natural message; a human gets the conversation
 every call a review model writes a summary, disposition, interest level, objections,
 next action and coaching notes, and decides whether to retry.
 
+## Languages: English, Arabic, French
+
+```bash
+callagent playbook languages "BrightBooks Q4" en ar fr   # opening language first
+callagent playbook show "BrightBooks Q4"
+```
+
+With one language the agent stays in it. With more than one it opens in the first and
+then answers in whatever language the prospect last spoke, switching back and forth as
+they do, never mixing languages in one reply.
+
+- **Native phrasing, not translation.** The command above also writes how a native rep
+  would say the opening, pitch, objections, booking and close in each added language.
+  Facts, prices and promises stay exactly as in the playbook. Use `--no-localize` to skip.
+- **Detection you can trust.** Arabic is recognized from its script, so a wrong language
+  tag from the recognizer cannot hide it. The agent never moves into a language the
+  campaign did not list.
+- **No delay on a switch.** The voice model reads each sentence in the language it is
+  written in. Set `ELEVENLABS_VOICE_ID_AR` / `_FR` if you want a different voice per language.
+- **Provider gaps stop the campaign, not the call.** If the configured recognizer is not
+  confirmed for one of the campaign's languages, `campaign start` refuses with the reason.
+  Deepgram's multilingual mode is not confirmed for Arabic by default: use
+  `STT_PROVIDER=soniox`, or verify on test calls and add `ar` to
+  `DEEPGRAM_MULTILINGUAL_LANGUAGES`.
+- Every call record has a `language` block: the language detected, the final language
+  and each switch with its turn number.
+
+## Inbound calls
+
+```bash
+callagent campaign inbound "BrightBooks Q4" +14155550111   # this campaign answers that number
+callagent campaign inbound "BrightBooks Q4"                # stop answering
+```
+
+In the Twilio console, set the number's "A call comes in" webhook to
+`PUBLIC_BASE_URL/twilio/inbound` and its status callback to `PUBLIC_BASE_URL/twilio/status`.
+`INBOUND_CAMPAIGN` names a fallback campaign for numbers without one of their own; a
+number nobody answers hears a short message and is hung up.
+
+The agent greets the caller instead of pitching, a returning caller is matched to their
+lead so earlier notes carry over, and an inbound call never puts that person on the
+outbound dial list unless they ask for a callback. Inbound calls are not recorded yet.
+
 ## Latency: what to expect and how to tune it
 
 Every hop is streaming, and every knob that costs time is exposed:
@@ -139,9 +188,15 @@ callagent test-call "BrightBooks Q4" +1yournumber   # then a real call
 callagent campaign calls "BrightBooks Q4"           # each call stores stt/llm/tts p50/p95 in its summary
 ```
 
-Every call's record (`GET /api/calls/{id}`, field `summary.latency`) has p50/p95 for
-speech-to-text, model first token and voice first byte, so you can see exactly where any
-delay is coming from. Server logs also print "first token after X s" on every turn.
+Every call's record (`GET /api/calls/{id}`, field `summary.latency`) has p50/p95 for:
+
+- `response`: the prospect stops talking -> the agent's audio starts. This is the number
+  the prospect actually feels. Target: p95 under one second.
+- `interruption`: the prospect starts talking over the agent -> the agent's audio stops.
+  Target: under 200 ms.
+- `stt_ttfb`, `llm_ttfb`, `tts_ttfb`: where the time went, stage by stage.
+
+So you can see exactly where any delay is coming from. Server logs also print "first token after X s" on every turn.
 
 Model choice: Opus 5 with adaptive thinking at low effort is the default: it answers
 small talk instantly and only pauses to think on a genuinely hard objection, and fillers
@@ -162,10 +217,12 @@ speeds up output tokens; it is Claude API only.
 - **Knows when you're done talking**: Pipecat's bundled Smart Turn v3 model detects
   semantic end-of-turn, so the agent doesn't jump in on a pause mid-sentence
   (`USE_SMART_TURN=false` falls back to a plain silence timeout).
-- **No dead air**: backchannel fillers cover the rare slow first word (see Latency above).
-- **Honesty**: if asked whether it is an AI, it says so (configurable per playbook,
-  `disclose_ai_if_asked`). Check your local rules on AI disclosure and calling hours;
-  in many places both are legally required.
+- **No dead air**: backchannel fillers cover the rare slow first word (see Latency above),
+  spoken in the language of the call or not at all.
+- **Honesty**: the agent says it is an AI assistant in its first turn
+  (`disclose_ai_upfront`, on by default), never claims to be human, and tells the
+  prospect when the call is recorded (`RECORD_CALLS=true`). Check your local rules on AI
+  disclosure, recording consent and calling hours; in many places they are legally required.
 
 ## Security
 
@@ -197,7 +254,7 @@ and audio resampling).
 ## Configuration
 
 Everything is in `.env` (see `.env.example`). The required keys for live calls:
-`ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`,
+`ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY` (or `SONIOX_API_KEY` with `STT_PROVIDER=soniox`), `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`,
 `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `PUBLIC_BASE_URL`.
 
 Models: `ONBOARDING_MODEL` / `CALL_MODEL` default to `claude-opus-5`. Set
@@ -225,7 +282,10 @@ callagent/
   leads/importer.py      CSV/XLSX/Google Sheets import, phone normalization
   dialer/twilio_client.py  place calls, TwiML, SMS, transfers, signature validation
   dialer/campaign_runner.py  calling windows, concurrency, retries, status callbacks
+  languages.py           language detection and per-call language tracking
+  providers/             speech-to-text and voice adapters, provider registry
   voice/pipeline.py      Pipecat pipeline for one call
+  voice/language_follower.py  tracks the prospect's language during the call
   voice/tools.py         in-call tools (book_meeting, end_call, ...)
   voice/transcript.py    transcript capture
   postcall/summarizer.py review + lead update

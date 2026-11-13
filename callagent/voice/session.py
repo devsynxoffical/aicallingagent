@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..config import Settings
+from ..languages import LanguageTracker
 from ..playbook.schema import Playbook
 
 
@@ -18,7 +19,9 @@ class CallSession:
     playbook: Playbook
     settings: Settings
     twilio_call_sid: str
-    mode: str = "live"  # live | voicemail
+    mode: str = "live"  # live | voicemail | inbound
+    direction: str = "outbound"  # outbound | inbound
+    language: LanguageTracker | None = None
     transcript: list[dict[str, Any]] = field(default_factory=list)
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     disposition: str | None = None

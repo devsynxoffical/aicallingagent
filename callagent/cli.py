@@ -35,6 +35,8 @@ app.add_typer(playbook_app, name="playbook")
 
 console = Console()
 
+CALL_COLUMNS = ("call_run_id", "lead", "phone", "direction", "language", "status", "mode", "disposition", "duration_seconds", "summary")
+
 
 def _playbook_path(name: str) -> Path:
     settings = get_settings()
@@ -74,6 +76,9 @@ def _print_playbook_summary(pb: Playbook) -> None:
         f"[bold]{pb.company_name}[/bold]\n{pb.offer_summary}\n\n"
         f"Goal: [cyan]{pb.call_goal}[/cyan] - {pb.call_goal_details}\n"
         f"Agent: {pb.persona.agent_name}, {pb.persona.role_title} ({pb.persona.tone})\n"
+        f"Languages: {', '.join(pb.languages)}"
+        f"{' (follows the prospect)' if pb.follows_prospect_language else ''}"
+        f"{'   native phrasing: ' + ', '.join(l.language for l in pb.localized) if pb.localized else ''}\n"
         f"Stages: {', '.join(s.name for s in pb.stages)}\n"
         f"Objections covered: {len(pb.objections)}   Key terms: {len(pb.keyterms)}\n"
         f"Capabilities: {', '.join(c.key + ('*' if c.required else '') for c in pb.required_capabilities) or '-'}\n"
@@ -240,6 +245,39 @@ def playbook_prompt(name: str, voicemail: bool = False):
     console.print(build_system_prompt(pb, lead, mode="voicemail" if voicemail else "live", callback_number=get_settings().twilio_from_number or ""))
 
 
+@playbook_app.command("languages")
+def playbook_languages(
+    name: str,
+    languages: list[str] = typer.Argument(..., help="Languages the agent may speak, opening language first, e.g. en ar fr"),
+    localize: bool = typer.Option(True, help="Write native phrasing for each added language now."),
+):
+    """Set the languages a campaign speaks. With more than one, the agent follows the prospect."""
+    from .languages import LANGUAGE_NAMES, base_language
+    from .providers import SpeechPlan, speech_plan_problems
+
+    pb, script = _load_playbook(name)
+    codes = list(dict.fromkeys(base_language(l) for l in languages if base_language(l)))
+    unknown = [c for c in codes if c not in LANGUAGE_NAMES]
+    if unknown:
+        raise typer.BadParameter(f"unsupported language(s): {', '.join(unknown)}. Supported: {', '.join(LANGUAGE_NAMES)}")
+    if base_language(pb.persona.language) != codes[0]:
+        pb.persona.language = codes[0]
+    pb.additional_languages = codes[1:]
+    pb.localized = [l for l in pb.localized if base_language(l.language) in codes[1:]]
+    if localize:
+        from .playbook.analyzer import PlaybookAnalyzer
+
+        analyzer = PlaybookAnalyzer()
+        for code in codes[1:]:
+            if pb.localized_for(code) is None:
+                with console.status(f"Writing native {LANGUAGE_NAMES[code]} phrasing..."):
+                    pb.localized.append(analyzer.localize(pb, code))
+    _save_campaign(name, pb, script)
+    _print_playbook_summary(pb)
+    for problem in speech_plan_problems(get_settings(), SpeechPlan.from_playbook(pb)):
+        console.print(f"[yellow]Provider gap:[/yellow] {problem}")
+
+
 @playbook_app.command("import")
 def playbook_import(name: str, path: Path = typer.Argument(..., exists=True)):
     """Load a hand-edited playbook JSON into a campaign."""
@@ -318,6 +356,14 @@ def campaign_pause(name: str):
     _print_campaign(_api("POST", f"/api/campaigns/{name}/pause").json())
 
 
+@campaign_app.command("inbound")
+def campaign_inbound(name: str, number: str = typer.Argument(None, help="Your Twilio number in E.164. Omit to stop answering.")):
+    """Have this campaign's agent answer calls to one of your numbers.
+    Then point that number's "A call comes in" webhook at PUBLIC_BASE_URL/twilio/inbound."""
+    c = _api("POST", f"/api/campaigns/{name}/inbound", params={"number": number} if number else {}).json()
+    console.print(f"[green]{c['name']}[/green] answers: {c.get('inbound_number') or 'no inbound number'}")
+
+
 @campaign_app.command("status")
 def campaign_status(name: str = typer.Argument(None)):
     """Lead counts by status and dispositions, for one campaign or all."""
@@ -333,10 +379,10 @@ def campaign_calls(name: str, limit: int = 20):
     """Recent calls with disposition and summary."""
     rows = _api("GET", f"/api/campaigns/{name}/calls", params={"limit": limit}).json()
     t = Table(title="Recent calls")
-    for col in ("call_run_id", "lead", "phone", "status", "mode", "disposition", "duration_seconds", "summary"):
+    for col in CALL_COLUMNS:
         t.add_column(col)
     for r in rows:
-        t.add_row(*(str(r.get(col) or "") for col in ("call_run_id", "lead", "phone", "status", "mode", "disposition", "duration_seconds", "summary")))
+        t.add_row(*(str(r.get(col) or "") for col in CALL_COLUMNS))
     console.print(t)
 
 
@@ -362,8 +408,10 @@ def doctor():
     t.add_column("setting"); t.add_column("value")
     t.add_row("onboarding model", settings.onboarding_model + f" (effort {settings.onboarding_effort})")
     t.add_row("call model", settings.call_model + f" (effort {settings.call_effort})")
-    t.add_row("STT", f"Deepgram {settings.deepgram_model}")
-    t.add_row("TTS", f"ElevenLabs {settings.elevenlabs_model} voice={settings.elevenlabs_voice_id or '-'}")
+    stt_model = settings.soniox_model if settings.stt_provider == "soniox" else settings.deepgram_model
+    t.add_row("STT", f"{settings.stt_provider} {stt_model}")
+    t.add_row("TTS", f"{settings.tts_provider} {settings.elevenlabs_model} voice={settings.elevenlabs_voice_id or '-'}")
+    t.add_row("inbound fallback campaign", settings.inbound_campaign or "-")
     t.add_row("from number", settings.twilio_from_number or "-")
     t.add_row("public URL", settings.public_base_url or "-")
     t.add_row("calling window", f"{settings.calling_window_start:%H:%M}-{settings.calling_window_end:%H:%M} {settings.default_timezone}")

@@ -200,6 +200,8 @@ async def schedule_callback(session: CallSession, params: FunctionCallParams) ->
         return {"ok": False, "error": "callback_at must be ISO 8601 with timezone"}
     if when.tzinfo is None:
         return {"ok": False, "error": "callback_at needs a timezone offset"}
+    if not str(session.lead.get("phone_e164", "")).startswith("+"):
+        return {"ok": False, "error": "we have no number for this caller; ask which number to call back, note it with log_call_outcome, and say a colleague will ring them"}
 
     def _save(s):
         lead = s.get(Lead, session.lead["id"])
@@ -220,6 +222,8 @@ async def send_followup_sms(session: CallSession, params: FunctionCallParams) ->
     body = str(params.arguments.get("message", "")).strip()[:600]
     if not body:
         return {"ok": False, "error": "message is empty"}
+    if not str(session.lead.get("phone_e164", "")).startswith("+"):
+        return {"ok": False, "error": "we have no mobile number for this caller; offer email or a callback instead"}
     sid = await asyncio.to_thread(twilio_client.send_sms, session.lead["phone_e164"], body, session.settings)
     return {"ok": True, "message_sid": sid}
 

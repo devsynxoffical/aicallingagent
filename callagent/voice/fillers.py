@@ -24,16 +24,33 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from typing import Callable
+
 NEUTRAL_FILLERS = ("Mm-hm.", "Right.", "Okay.", "Got it.", "Uh-huh.", "Sure.")
+# A filler in the wrong language is worse than a short pause, so each language has its own.
+FILLERS_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
+    "en": NEUTRAL_FILLERS,
+    "fr": ("D'accord.", "Très bien.", "Bien sûr.", "Entendu.", "Oui."),
+    "ar": ("تمام.", "أكيد.", "طيب.", "نعم.", "مفهوم."),
+}
 
 
 class FillerProcessor(FrameProcessor):
     """Place between the LLM and TTS."""
 
-    def __init__(self, *, delay_secs: float = 0.7, fillers: tuple[str, ...] = NEUTRAL_FILLERS, **kwargs):
+    def __init__(
+        self,
+        *,
+        delay_secs: float = 0.7,
+        fillers: tuple[str, ...] = NEUTRAL_FILLERS,
+        language: Callable[[], str] | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._delay = delay_secs
         self._fillers = fillers
+        # Returns the language the prospect is speaking right now; None = always use ``fillers``.
+        self._language = language
         self._timer: asyncio.Task | None = None
         # Armed only after a real prospect turn: the opener and silence nudges get no filler.
         self._spoke_this_turn = True
@@ -54,7 +71,12 @@ class FillerProcessor(FrameProcessor):
         if self._spoke_this_turn:
             return
         self._spoke_this_turn = True
-        choices = [f for f in self._fillers if f != self._last_filler] or list(self._fillers)
+        pool = self._fillers
+        if self._language is not None:
+            pool = FILLERS_BY_LANGUAGE.get(self._language(), ())
+            if not pool:
+                return  # no filler written for this language: stay quiet
+        choices = [f for f in pool if f != self._last_filler] or list(pool)
         filler = random.choice(choices)
         self._last_filler = filler
         self.filler_count += 1

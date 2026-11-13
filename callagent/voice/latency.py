@@ -1,13 +1,27 @@
 """Collect per-turn latency numbers so every call ends with a measurable answer to
-"was it fast?": Deepgram time-to-final, Claude time-to-first-token, ElevenLabs
-time-to-first-audio."""
+"was it fast?".
+
+Per stage: speech-to-text time-to-final, model time-to-first-token, voice
+time-to-first-audio. End to end: ``response`` (prospect stops talking -> agent audio
+starts, measured by Pipecat's UserBotLatencyObserver) and ``interruption`` (prospect
+starts talking over the agent -> agent audio stops).
+"""
 
 from __future__ import annotations
 
 from statistics import median
 from typing import Any
 
-from pipecat.frames.frames import Frame, MetricsFrame
+import time
+
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    MetricsFrame,
+    UserStartedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+)
 from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -16,6 +30,8 @@ class LatencyMonitor(FrameProcessor):
     def __init__(self, sink: dict[str, list[float]], **kwargs):
         super().__init__(**kwargs)
         self._sink = sink
+        self._bot_speaking = False
+        self._barge_in_at: float | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -24,7 +40,24 @@ class LatencyMonitor(FrameProcessor):
                 if isinstance(d, TTFBMetricsData) and d.value > 0:
                     key = _short_name(d.processor)
                     self._sink.setdefault(key, []).append(round(d.value, 3))
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+            self._barge_in_at = None
+        elif isinstance(frame, (UserStartedSpeakingFrame, VADUserStartedSpeakingFrame)):
+            if self._bot_speaking and self._barge_in_at is None:
+                self._barge_in_at = time.monotonic()
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            if self._barge_in_at is not None:
+                self._sink.setdefault("interruption", []).append(round(time.monotonic() - self._barge_in_at, 3))
+            self._bot_speaking = False
+            self._barge_in_at = None
         await self.push_frame(frame, direction)
+
+
+def record_response_latency(sink: dict[str, list[float]], seconds: float) -> None:
+    """One end-of-turn -> first-audio measurement from UserBotLatencyObserver."""
+    if seconds and seconds > 0:
+        sink.setdefault("response", []).append(round(float(seconds), 3))
 
 
 def _short_name(processor: str) -> str:

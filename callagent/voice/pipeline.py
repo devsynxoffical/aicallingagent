@@ -1,12 +1,13 @@
 """The real-time voice pipeline for one phone call.
 
 Twilio media stream (8 kHz mu-law over WebSocket)
-  -> Deepgram streaming STT (nova-3, biased to the playbook's key terms)
+  -> streaming speech-to-text (provider adapter; one language or following the prospect)
+  -> language follower (which language is the prospect speaking right now?)
   -> Claude (Pipecat AnthropicLLMService, tools, prompt caching)
-  -> ElevenLabs streaming TTS (flash model for low latency)
+  -> streaming voice (provider adapter)
   -> back to Twilio
 
-Silero VAD gives barge-in: when the prospect starts talking the bot stops.
+Every hop streams. Silero VAD gives barge-in: when the prospect starts talking the bot stops.
 """
 
 from __future__ import annotations
@@ -27,21 +28,22 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
-from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
 from ..config import Settings, get_settings
 from datetime import timedelta
 
 from ..db import CallRun, Campaign, Lead, run_db, utcnow
+from ..languages import LanguageSwitch, LanguageTracker
 from ..playbook.prompt_builder import build_system_prompt
 from ..playbook.schema import Playbook
 from ..postcall.summarizer import finalize_call
+from ..providers import SpeechPlan, get_stt, get_tts
 from .fillers import FillerProcessor
-from .latency import LatencyMonitor, summarize
+from .language_follower import LanguageFollower
+from .latency import LatencyMonitor, record_response_latency, summarize
 from .llm_service import LowLatencyAnthropicLLMService
 from .session import CallSession
 from .speech_filter import SpeechSanitizer
@@ -52,24 +54,15 @@ log = logging.getLogger(__name__)
 
 TWILIO_SAMPLE_RATE = 8000
 
-
-def _language(tag: str) -> Language | None:
-    """Map a BCP-47 tag from the playbook to Pipecat's Language enum, best effort."""
-    candidates = [tag.replace("-", "_"), tag.split("-")[0]]
-    for c in candidates:
-        try:
-            return Language(c.replace("_", "-"))
-        except ValueError:
-            continue
-        except Exception:
-            continue
-    for name in (tag.replace("-", "_").upper(), tag.split("-")[0].upper()):
-        if hasattr(Language, name):
-            return getattr(Language, name)
-    return None
+# Last resort when the line stays silent and the model did not close the call itself.
+SILENCE_GOODBYE = {
+    "en": "Alright, I'll let you go. Have a good one.",
+    "fr": "Très bien, je vous laisse. Bonne journée.",
+    "ar": "تمام، لن أطيل عليكم. يومكم سعيد.",
+}
 
 
-async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook, int, str | None]:
+async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook, int, str | None, str]:
     def _load(s):
         run = s.get(CallRun, call_run_id)
         if run is None:
@@ -92,7 +85,7 @@ async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook,
         }
         run.status = "in-progress"
         run.stream_connected = True
-        return lead_dict, Playbook.model_validate(campaign.playbook_json), campaign.id, run.twilio_call_sid
+        return lead_dict, Playbook.model_validate(campaign.playbook_json), campaign.id, run.twilio_call_sid, run.direction or "outbound"
 
     return await run_db(_load)
 
@@ -119,16 +112,19 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
     settings = settings or get_settings()
     call_run_id = int(body.get("call_run_id", 0))
     mode = str(body.get("mode", "live"))
-    lead, playbook, campaign_id, stored_sid = await load_call_context(call_run_id)
+    lead, playbook, campaign_id, stored_sid, direction = await load_call_context(call_run_id)
+    if direction == "inbound":
+        mode = "inbound"
     try:
-        await _run_call(websocket, stream_sid, stored_sid or call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings)
+        await _run_call(websocket, stream_sid, stored_sid or call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings, direction)
     except Exception as e:
         log.exception("call %s: could not start the voice pipeline", call_run_id)
         await mark_call_setup_failed(call_run_id, f"pipeline setup failed: {e}", settings)
         raise
 
 
-async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings) -> None:
+async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings, direction="outbound") -> None:
+    plan = SpeechPlan.from_playbook(playbook)
     session = CallSession(
         call_run_id=call_run_id,
         lead=lead,
@@ -137,6 +133,8 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
         settings=settings,
         twilio_call_sid=call_sid or "",
         mode=mode,
+        direction=direction,
+        language=LanguageTracker(allowed=plan.languages),
     )
 
     human_transfer = bool(settings.human_transfer_number)
@@ -146,6 +144,8 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
         mode=mode,
         callback_number=settings.twilio_from_number or "",
         human_transfer_available=human_transfer,
+        # Outbound recording is requested when the call is placed; inbound calls are not recorded yet.
+        call_recorded=settings.record_calls and direction == "outbound",
     )
 
     # ---- transport
@@ -167,20 +167,7 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
     )
 
     # ---- ears
-    lang = _language(playbook.persona.language)
-    stt_settings: dict[str, Any] = {
-        "model": settings.deepgram_model,
-        "smart_format": True,
-        "punctuate": True,
-        "interim_results": True,
-        "endpointing": settings.deepgram_endpointing_ms,
-    }
-    if lang is not None:
-        stt_settings["language"] = lang
-    if playbook.keyterms and playbook.persona.language.lower().startswith("en"):
-        # Nova-3 keyterm prompting is English-only; Deepgram rejects it for other languages.
-        stt_settings["keyterm"] = playbook.keyterms[:50]
-    stt = DeepgramSTTService(api_key=settings.deepgram_api_key or "", settings=DeepgramSTTService.Settings(**stt_settings))
+    stt = get_stt(settings).build(settings, plan)
 
     # ---- brain (thinking off by default, prompt caching on, optional fast mode)
     llm = LowLatencyAnthropicLLMService(
@@ -191,22 +178,14 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
     register_tool_handlers(llm, session)
 
     # ---- voice
-    tts_settings: dict[str, Any] = {
-        "model": settings.elevenlabs_model,
-        "voice": settings.elevenlabs_voice_id,
-        "stability": settings.elevenlabs_stability,
-        "similarity_boost": settings.elevenlabs_similarity,
-        "style": settings.elevenlabs_style,
-        "use_speaker_boost": True,
-        "speed": settings.elevenlabs_speed,
-    }
-    if lang is not None:
-        tts_settings["language"] = lang
-    tts = ElevenLabsTTSService(
-        api_key=settings.elevenlabs_api_key or "",
-        settings=ElevenLabsTTSService.Settings(**tts_settings),
-        text_filters=[SpeechSanitizer()],
-    )
+    tts_adapter = get_tts(settings)
+    tts = tts_adapter.build(settings, plan, text_filters=[SpeechSanitizer()])
+
+    async def on_language_switch(switch: LanguageSwitch):
+        session.log_tool("language_switch", {"from": switch.from_language, "to": switch.to_language, "turn": switch.turn}, {"ok": True})
+        return tts_adapter.on_language_switch(settings, plan, switch.to_language)
+
+    follower = LanguageFollower(session.language, on_switch=on_language_switch)
 
     # ---- memory & turn-taking
     capabilities = {c.key for c in playbook.required_capabilities}
@@ -231,14 +210,22 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
     collector = TranscriptCollector(session)
     latency_monitor = LatencyMonitor(session.latency)
 
-    processors = [transport.input(), stt, aggregators.user(), llm]
-    if settings.call_fillers and mode == "live":
-        processors.append(FillerProcessor(delay_secs=settings.filler_delay_ms / 1000))
+    processors = [transport.input(), stt, follower, aggregators.user(), llm]
+    if settings.call_fillers and mode != "voicemail":
+        processors.append(FillerProcessor(delay_secs=settings.filler_delay_ms / 1000, language=lambda: session.language.current))
     processors += [tts, transport.output(), collector, latency_monitor, aggregators.assistant()]
     pipeline = Pipeline(processors)
 
+    # End of the prospect's turn -> first agent audio: the number the prospect actually feels.
+    response_latency = UserBotLatencyObserver()
+
+    @response_latency.event_handler("on_latency_measured")
+    async def on_latency_measured(_observer, seconds: float):
+        record_response_latency(session.latency, seconds)
+
     task = PipelineWorker(
         pipeline,
+        observers=[response_latency],
         params=PipelineParams(
             audio_in_sample_rate=TWILIO_SAMPLE_RATE,
             audio_out_sample_rate=TWILIO_SAMPLE_RATE,
@@ -271,6 +258,9 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
         log.info("call %s connected (mode=%s)", call_run_id, mode)
         if mode == "voicemail":
             await cue("(You have reached voicemail and the beep has just played. Leave the message now.)")
+        elif mode == "inbound":
+            # They called us and are waiting: greet straight away.
+            await cue("(An inbound caller has just connected. Greet them now.)")
         else:
             opener_timer = asyncio.create_task(speak_first_after_delay())
 
@@ -318,7 +308,8 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
             await cue("(Still silence. Say a short, warm goodbye and call end_call with reason 'no response'.)")
         else:
             session.end_reason = "silence"
-            await task.queue_frames([TTSSpeakFrame("Alright, I'll let you go. Have a good one."), EndWorkerFrame(reason="silence")])
+            goodbye = SILENCE_GOODBYE.get(session.language.current, SILENCE_GOODBYE["en"])
+            await task.queue_frames([TTSSpeakFrame(goodbye), EndWorkerFrame(reason="silence")])
 
     runner = PipelineRunner(handle_sigint=False)
     error: str | None = None
@@ -349,6 +340,8 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
             session.disposition,
             settings,
             latency=summarize(session.latency),
+            language=session.language.report(),
+            direction=direction,
         )
     except Exception:
         log.exception("call %s: post-call processing failed", call_run_id)

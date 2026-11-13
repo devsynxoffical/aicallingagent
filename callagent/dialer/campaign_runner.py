@@ -90,6 +90,14 @@ def count_active_calls(s: Session, campaign_id: int) -> int:
 TERMINAL_CALL_STATUSES = ("completed", "busy", "no-answer", "failed", "canceled")
 
 
+def release_inbound_lead(run: CallRun, lead: Lead) -> None:
+    """An inbound call ended without a conversation (caller hung up, stream never came
+    up). Put the lead back exactly where it was: an inbound call must never, by itself,
+    queue an outbound call to that person."""
+    if lead.status == "calling":
+        lead.status = (run.summary or {}).get("lead_status_before") or "completed"
+
+
 def reap_stale_calls(s: Session, campaign_id: int, settings: Settings | None = None) -> int:
     """Two kinds of leftovers: calls that never got a final status, and leads left in
     "calling" although their call already ended (process crash mid-call, lost webhook)."""
@@ -103,7 +111,10 @@ def reap_stale_calls(s: Session, campaign_id: int, settings: Settings | None = N
     for lead in stuck_leads:
         last = s.execute(select(CallRun).where(CallRun.lead_id == lead.id).order_by(CallRun.id.desc()).limit(1)).scalar_one_or_none()
         ended = last is not None and last.status in TERMINAL_CALL_STATUSES and last.ended_at is not None
-        if ended and last.ended_at < utcnow() - timedelta(minutes=5):
+        if ended and last.ended_at < utcnow() - timedelta(minutes=5) and last.direction == "inbound":
+            release_inbound_lead(last, lead)
+            recovered += 1
+        elif ended and last.ended_at < utcnow() - timedelta(minutes=5):
             lead.status = "pending" if lead.attempts < settings.max_attempts else "completed"
             lead.next_attempt_at = utcnow() + timedelta(minutes=settings.retry_delay_minutes)
             recovered += 1
@@ -123,7 +134,9 @@ def reap_stale_calls(s: Session, campaign_id: int, settings: Settings | None = N
         run.error = (run.error or "") + " stale: no status update"
         run.ended_at = utcnow()
         lead = s.get(Lead, run.lead_id)
-        if lead and lead.status == "calling":
+        if lead and run.direction == "inbound":
+            release_inbound_lead(run, lead)
+        elif lead and lead.status == "calling":
             lead.status = "pending"
             lead.next_attempt_at = utcnow() + timedelta(minutes=30)
     return len(stale) + recovered
@@ -302,7 +315,10 @@ def apply_twilio_status(s: Session, call_run_id: int, form: dict[str, Any], sett
         if dur and str(dur).isdigit():
             run.duration_seconds = int(dur)
         lead = s.get(Lead, run.lead_id)
-        if lead and lead.status == "calling" and not run.stream_connected:
+        if lead and run.direction == "inbound":
+            if not run.stream_connected:
+                release_inbound_lead(run, lead)
+        elif lead and lead.status == "calling" and not run.stream_connected:
             # The media stream never reached us: nobody (and no voicemail) picked up.
             # If it did connect, post-call finalization owns the lead's next state.
             run.disposition = run.disposition or ("busy" if status == "busy" else "no_answer")

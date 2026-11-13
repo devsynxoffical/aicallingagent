@@ -113,3 +113,39 @@ def test_saving_a_ready_playbook_marks_new_campaign_ready(tmp_path, monkeypatch,
     ready = cli._save_campaign("c2", sample_playbook, "script")
     assert ready.status == "ready"
     get_settings.cache_clear()
+
+
+def test_older_database_gains_new_columns_without_losing_rows(tmp_path):
+    """A database created before inbound calls and languages existed is upgraded in place."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE campaigns (id INTEGER PRIMARY KEY, name VARCHAR(200) UNIQUE, script_text TEXT, playbook_json JSON,
+            status VARCHAR(20), max_concurrent_calls INTEGER, created_at DATETIME, updated_at DATETIME);
+        CREATE TABLE leads (id INTEGER PRIMARY KEY, campaign_id INTEGER, phone_e164 VARCHAR(32), raw_phone VARCHAR(64),
+            first_name VARCHAR(120), last_name VARCHAR(120), company VARCHAR(200), email VARCHAR(200), timezone VARCHAR(64),
+            extra JSON, status VARCHAR(20), attempts INTEGER, next_attempt_at DATETIME, last_disposition VARCHAR(40),
+            notes TEXT, created_at DATETIME);
+        CREATE TABLE call_runs (id INTEGER PRIMARY KEY, lead_id INTEGER, campaign_id INTEGER, twilio_call_sid VARCHAR(64),
+            status VARCHAR(20), answered_by VARCHAR(40), mode VARCHAR(20), stream_connected BOOLEAN, stream_token VARCHAR(64),
+            started_at DATETIME, ended_at DATETIME, duration_seconds INTEGER, transcript JSON, tool_events JSON, summary JSON,
+            disposition VARCHAR(40), recording_url VARCHAR(400), error TEXT);
+        INSERT INTO campaigns (id, name, script_text, playbook_json, status) VALUES (1, 'legacy', '', '{}', 'ready');
+        INSERT INTO leads (id, campaign_id, phone_e164, status, attempts, extra, notes) VALUES (1, 1, '+14155550100', 'pending', 0, '{}', '');
+        INSERT INTO call_runs (id, lead_id, campaign_id, status, mode, stream_connected, transcript, tool_events, summary)
+            VALUES (1, 1, 1, 'completed', 'live', 1, '[]', '[]', '{}');
+        """
+    )
+    con.commit()
+    con.close()
+
+    db.reset_engine_for_tests(f"sqlite:///{path}")
+    with db.session_scope() as s:
+        run = s.get(db.CallRun, 1)
+        assert run.direction == "outbound" and run.language is None and run.status == "completed"  # old rows read as outbound
+        assert s.get(db.Campaign, 1).inbound_number is None
+        s.add(db.CallRun(lead_id=1, campaign_id=1, direction="inbound", language="ar"))
+    assert db.add_missing_columns(db.get_engine()) == []  # second run is a no-op
