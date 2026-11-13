@@ -6,6 +6,7 @@ import asyncio
 from functools import lru_cache
 from typing import Any
 
+from twilio.http.http_client import TwilioHttpClient
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from twilio.twiml.voice_response import Connect, Dial, VoiceResponse
@@ -14,14 +15,15 @@ from ..config import Settings, get_settings
 
 
 @lru_cache
-def twilio_client(account_sid: str, auth_token: str) -> Client:
-    return Client(account_sid, auth_token)
+def twilio_client(account_sid: str, auth_token: str, timeout: float = 15.0) -> Client:
+    # Without a timeout one unanswered request would hold a dial loop, or a live call's tool, forever.
+    return Client(account_sid, auth_token, http_client=TwilioHttpClient(timeout=timeout))
 
 
 def _client(settings: Settings) -> Client:
     if not (settings.twilio_account_sid and settings.twilio_auth_token):
         raise RuntimeError("TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN are not set")
-    return twilio_client(settings.twilio_account_sid, settings.twilio_auth_token)
+    return twilio_client(settings.twilio_account_sid, settings.twilio_auth_token, settings.provider_timeout_seconds)
 
 
 def place_call(call_run_id: int, to_number: str, settings: Settings | None = None) -> str:

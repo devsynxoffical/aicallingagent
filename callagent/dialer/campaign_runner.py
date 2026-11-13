@@ -8,18 +8,73 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, or_, select
+from sqlalchemy import case, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
-from ..db import CallRun, Campaign, Lead, is_dnc, run_db, utcnow
+from ..db import ACTIVE_CALL_STATUSES, TERMINAL_CALL_STATUSES, CallRun, Campaign, Lead, is_dnc, run_db, utcnow
 from . import rules as campaign_rules
 from . import twilio_client
 from .rules import DEFAULT_CALLING_DAYS, campaign_settings
 
 log = logging.getLogger(__name__)
 
-ACTIVE_CALL_STATUSES = ("created", "queued", "initiated", "ringing", "in-progress")
+# Lead states the dialer may call from on its own, and states nobody may call from.
+AUTO_DIALABLE = ("pending", "callback")
+NEVER_DIALABLE = ("calling", "queued", "dnc")
+
+
+class LeadNotDialable(Exception):
+    """This lead must not be called right now. The message says why, in words for the operator."""
+
+
+def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: bool = False) -> tuple[int, str]:
+    """Reserve a lead and open its call record, or raise :class:`LeadNotDialable`.
+
+    Everything that decides "may this person be rung now" happens here, in one
+    transaction, so two attempts for the same lead cannot both pass:
+
+    - the lead's status moves to ``calling`` with a conditional UPDATE, and only one
+      UPDATE can win;
+    - a lead with a call that has not finished is refused, whichever direction the call
+      has (never ring someone who is on the line with us);
+    - the do-not-call list is read again here, not only when the lead was picked;
+    - the database itself allows one unfinished outbound call per lead.
+
+    ``manual`` is an operator dialing one number on purpose: allowed from any state except
+    a call in progress or a suppressed number. Returns (call_run_id, phone number).
+    """
+    lead = s.get(Lead, lead_id)
+    if lead is None or lead.campaign_id != campaign_id:
+        raise LeadNotDialable("lead not found in this campaign")
+    if is_dnc(s, lead.phone_e164) or lead.status == "dnc":
+        if lead.status != "dnc":
+            lead.status = "dnc"
+            s.commit()  # the suppression is kept even though the dial is refused
+        raise LeadNotDialable(f"{lead.phone_e164} is on the do-not-call list")
+    allowed = Lead.status.not_in(NEVER_DIALABLE) if manual else Lead.status.in_(AUTO_DIALABLE)
+    claimed = s.execute(
+        update(Lead).where(Lead.id == lead_id, Lead.campaign_id == campaign_id, allowed).values(status="calling", attempts=Lead.attempts + 1)
+    ).rowcount
+    if claimed != 1:
+        raise LeadNotDialable("this lead is already being called or is not due for a call")
+    unfinished = s.execute(select(CallRun.id).where(CallRun.lead_id == lead_id, CallRun.status.in_(ACTIVE_CALL_STATUSES)).limit(1)).first()
+    if unfinished is not None:
+        raise LeadNotDialable(f"call {unfinished[0]} to this lead has not finished yet")
+    from ..intelligence import experiments
+
+    s.refresh(lead)
+    campaign = s.get(Campaign, campaign_id)
+    # In an A/B test the lead's side, and so the playbook version, is fixed for every attempt.
+    experiment_id, arm, version = experiments.assign(s, campaign, lead) if campaign else (None, None, None)
+    run = CallRun(lead_id=lead.id, campaign_id=campaign_id, status="created", playbook_version=version, experiment_id=experiment_id, experiment_arm=arm)
+    s.add(run)
+    try:
+        s.flush()
+    except IntegrityError:
+        raise LeadNotDialable("another call to this lead was started at the same moment") from None
+    return run.id, lead.phone_e164
 
 
 def in_calling_window(
@@ -94,9 +149,6 @@ def count_active_calls(s: Session, campaign_id: int) -> int:
             select(CallRun.id).where(CallRun.campaign_id == campaign_id, CallRun.status.in_(ACTIVE_CALL_STATUSES))
         ).all()
     )
-
-
-TERMINAL_CALL_STATUSES = ("completed", "busy", "no-answer", "failed", "canceled")
 
 
 def release_inbound_lead(run: CallRun, lead: Lead) -> None:
@@ -204,37 +256,23 @@ class CampaignRunner:
 
         await run_db(_mark)
 
-    async def stop_all(self) -> None:
-        for cid in list(self._tasks):
-            await self.stop(cid)
+    async def shutdown(self) -> None:
+        """The process is stopping: end the dial loops and leave every campaign's status
+        alone, so campaigns that were running resume when the process starts again."""
+        tasks = list(self._tasks.values())
+        self._tasks.clear()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
-    async def dial_lead(self, campaign_id: int, lead_id: int) -> int:
-        """Create a CallRun and place the call. Returns the CallRun id."""
-
-        def _prepare(s):
-            lead = s.get(Lead, lead_id)
-            if lead is None:
-                raise ValueError("lead not found")
-            lead.status = "calling"
-            lead.attempts += 1
-            from ..intelligence import experiments
-
-            campaign = s.get(Campaign, campaign_id)
-            # In an A/B test the lead's side, and so the playbook version, is fixed for every attempt.
-            experiment_id, arm, version = experiments.assign(s, campaign, lead) if campaign else (None, None, None)
-            run = CallRun(
-                lead_id=lead.id,
-                campaign_id=campaign_id,
-                status="created",
-                playbook_version=version,
-                experiment_id=experiment_id,
-                experiment_arm=arm,
-            )
-            s.add(run)
-            s.flush()
-            return run.id, lead.phone_e164
-
-        run_id, phone = await run_db(_prepare)
+    async def dial_lead(self, campaign_id: int, lead_id: int, *, manual: bool = False) -> int:
+        """Reserve the lead, then place the call. Returns the CallRun id.
+        Raises :class:`LeadNotDialable` when the lead must not be rung now."""
+        run_id, phone = await run_db(lambda s: claim_lead_for_call(s, campaign_id, lead_id, manual=manual))
         try:
             sid = await twilio_client.place_call_async(run_id, phone, self.settings)
         except Exception as e:
@@ -259,8 +297,9 @@ class CampaignRunner:
         def _sid(s):
             run = s.get(CallRun, run_id)
             if run:
-                run.twilio_call_sid = sid
-                run.status = "initiated"
+                run.twilio_call_sid = run.twilio_call_sid or sid
+                if run.status == "created":  # a status webhook may already have moved it further
+                    run.status = "initiated"
 
         await run_db(_sid)
         return run_id
@@ -292,6 +331,11 @@ class CampaignRunner:
                 idle_ticks = 0
                 try:
                     await self.dial_lead(campaign_id, lead["id"])
+                except LeadNotDialable as e:
+                    # Someone else has this lead (a manual dial, an inbound call): take the next one.
+                    log.info("campaign %s: lead %s skipped, %s", campaign_id, lead["id"], e)
+                    await asyncio.sleep(1)
+                    continue
                 except Exception:
                     await asyncio.sleep(10)
                     continue

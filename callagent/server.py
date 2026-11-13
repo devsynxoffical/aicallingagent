@@ -16,6 +16,7 @@ from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from .apideps import get_campaign as _get_campaign
 from .apideps import require_api_token
@@ -23,7 +24,7 @@ from .config import Settings, get_settings
 from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
 from .dialer import twilio_client
 from .dialer import rules as campaign_rules
-from .dialer.campaign_runner import TERMINAL_CALL_STATUSES, CampaignRunner, apply_twilio_status
+from .dialer.campaign_runner import TERMINAL_CALL_STATUSES, CampaignRunner, LeadNotDialable, apply_twilio_status
 from .leads.importer import import_leads
 from .leads.importer import normalize_phone
 from .playbook.schema import Playbook
@@ -54,7 +55,7 @@ async def lifespan(app: FastAPI):
     # Training documents that were waiting or half-read when the process stopped.
     await resume_unfinished()
     yield
-    await runner.stop_all()
+    await runner.shutdown()
 
 
 app = FastAPI(title="callagent", lifespan=lifespan)
@@ -198,7 +199,12 @@ def open_inbound_call(s, form: dict[str, str], settings: Settings) -> tuple[int,
 async def twilio_inbound(request: Request, settings: Settings = Depends(get_settings)):
     """Point a Twilio number's "A call comes in" webhook here to have the agent answer it."""
     form = await _twilio_form(request, settings)
-    opened = await run_db(lambda s: open_inbound_call(s, form, settings))
+    try:
+        opened = await run_db(lambda s: open_inbound_call(s, form, settings))
+    except IntegrityError:
+        # The same webhook arrived twice at once and the other delivery opened the call
+        # (one record per provider call is enforced by the database): answer with that one.
+        opened = await run_db(lambda s: open_inbound_call(s, form, settings))
     if opened is None:
         log.warning("inbound call to %s: no campaign answers this number", form.get("To"))
         return Response(content=twilio_client.say_and_hangup_twiml(NO_AGENT_MESSAGE), media_type="application/xml")
@@ -470,7 +476,10 @@ async def dial_one(name: str, phone: str, first_name: str = "", settings: Settin
         return c.id, lead.id
 
     cid, lid = await run_db(_lead)
-    run_id = await _runner().dial_lead(cid, lid)
+    try:
+        run_id = await _runner().dial_lead(cid, lid, manual=True)
+    except LeadNotDialable as e:
+        raise HTTPException(409, str(e)) from None
     return {"call_run_id": run_id}
 
 
