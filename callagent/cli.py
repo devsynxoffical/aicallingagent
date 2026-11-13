@@ -494,7 +494,7 @@ def db_status():
 
 @db_app.command("upgrade")
 def db_upgrade():
-    """Apply every migration the database has not seen. Back the database up first."""
+    """Apply every migration the database has not seen. Back up first: `callagent db backup`."""
     from .db import get_engine
 
     try:
@@ -521,6 +521,50 @@ def db_check():
     for problem in problems:
         console.print(f"[red]- {problem}[/red]")
     raise typer.Exit(1)
+
+
+@db_app.command("backup")
+def db_backup(to: Path = typer.Option(None, help="Directory to write the backup into. Default: DATA_DIR/backups")):
+    """Copy the database and uploaded files into a new backup directory. Safe while the server runs."""
+    from . import backup
+
+    settings = get_settings()
+    try:
+        path = backup.create_backup(to or settings.data_dir / "backups", settings)
+        manifest = backup.verify_backup(path)
+    except backup.BackupError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Backup written and verified:[/green] {path}")
+    console.print(f"schema {manifest['schema_revision']}, rows: {manifest['rows']}")
+    console.print("Copy this directory off this machine: a backup on the same disk does not survive losing the disk.")
+
+
+@db_app.command("verify-backup")
+def db_verify_backup(path: Path):
+    """Check a backup's files against its checksums."""
+    from . import backup
+
+    try:
+        manifest = backup.verify_backup(path)
+    except backup.BackupError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Intact.[/green] Taken {manifest['created_at']}, schema {manifest['schema_revision']}, rows: {manifest['rows']}")
+
+
+@db_app.command("restore")
+def db_restore(path: Path, replace_existing: bool = typer.Option(False, "--replace-existing", help="Overwrite a database that already holds campaigns.")):
+    """Replace the database and uploads with a backup. Stop the server first."""
+    from . import backup
+
+    try:
+        result = backup.restore_backup(path, get_settings(), replace_existing=replace_existing)
+    except backup.BackupError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Restored.[/green] Rows now in the database: {result['restored_rows']}")
+    console.print("Start the server; it applies any migration newer than the backup.")
 
 
 @app.command()

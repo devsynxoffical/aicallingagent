@@ -39,6 +39,22 @@ names that never contain user input; playbook versions with approval; budget che
 against the worst case before every dial; a late "ringing" cannot reopen a finished
 call; the voice loop never waits for the post-call review.
 
+## Progress
+
+Updated as work lands. "Verified" names the test that proves it.
+
+| Finding | Status | Verified by |
+| --- | --- | --- |
+| C-1 double dialing | Fixed | `tests/test_integrity.py` (12 simultaneous attempts, SQLite and PostgreSQL) |
+| C-5 provider timeout | Fixed for the request timeout; behaviour after a timeout still follows C-2 | Not verified against real Twilio |
+| C-6 restart pauses campaigns | Fixed | `test_a_restart_does_not_pause_running_campaigns` |
+| D-1 migrations | Fixed | new, pre-migration and duplicate-holding databases, both engines |
+| D-2 uniqueness | Fixed | `test_the_database_refuses_duplicates...`, concurrent inbound webhook test |
+| D-4 indexes | Composite indexes added; CHECK constraints open | |
+| D-7 connections | Fixed | pool settings; dropped-connection behaviour not load-tested |
+| D-8 backups | Backup, verify, restore built; scheduling is the operator's | `tests/test_backup.py` restore drill, both engines |
+| Everything else | Open | |
+
 ## 2. Findings
 
 ### Calling engine
