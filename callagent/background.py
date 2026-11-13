@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from . import jobs
 from .config import get_settings
-from .db import CallRun, Campaign, Lead, run_db
+from .db import CallRun, Campaign, Job, Lead, TrainingRun, run_db, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,59 @@ def kick(key: str) -> None:
         return
     _kicks.add(task)
     task.add_done_callback(_kicks.discard)
+
+
+async def run_now(key: str) -> None:
+    """Run a committed job in this task and wait for it (for FastAPI background tasks)."""
+    await (worker or jobs.Worker()).run_job_now(key)
+
+
+# ----------------------------------------------------------------------------- training runs
+
+TRAINING_RUN = "training_run"
+TRAINING_INTERRUPTED = "the training run was interrupted and could not be completed; start it again"
+
+
+def training_run_key(run_id: int) -> str:
+    return f"{TRAINING_RUN}:{run_id}"
+
+
+async def _training_gave_up(payload: dict[str, Any], error: str) -> None:
+    def _mark(s):
+        run = s.get(TrainingRun, int(payload["run_id"]))
+        if run is not None and run.status == "running":
+            run.status, run.error, run.finished_at = "failed", TRAINING_INTERRUPTED, utcnow()
+
+    await run_db(_mark)
+
+
+@jobs.handler(TRAINING_RUN, on_dead=_training_gave_up)
+async def run_training_job(payload: dict[str, Any]) -> None:
+    """Build a draft playbook from the campaign's material. If the process stops halfway,
+    the run is still marked running and this job is taken over and run again."""
+    from .training import api as training_api
+
+    run_id = int(payload["run_id"])
+    if not await run_db(lambda s: getattr(s.get(TrainingRun, run_id), "status", None) == "running"):
+        return  # already finished by an earlier attempt
+    await training_api.run_training(run_id)
+
+
+async def recover_training_runs() -> int:
+    """A run marked running that no job stands behind can never finish (it was started
+    by a release before the job queue, and that process is gone). Close it, so the
+    campaign can be trained again."""
+
+    def _close(s):
+        closed = 0
+        for run in s.execute(select(TrainingRun).where(TrainingRun.status == "running")).scalars():
+            job = s.execute(select(Job).where(Job.key == training_run_key(run.id))).scalars().first()
+            if job is None or job.status in ("done", "dead"):
+                run.status, run.error, run.finished_at = "failed", TRAINING_INTERRUPTED, utcnow()
+                closed += 1
+        return closed
+
+    return await run_db(_close)
 
 
 # ----------------------------------------------------------------------------- booking notifications

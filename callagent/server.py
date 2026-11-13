@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI):
     # Training documents that were waiting or half-read when the process stopped.
     await resume_unfinished()
     # Background jobs that were queued, or left running by a process that stopped.
+    await background.recover_training_runs()
     background.start_worker()
     yield
     await background.stop_worker()

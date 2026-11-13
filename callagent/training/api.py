@@ -5,6 +5,8 @@ from __future__ import annotations
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from .. import background as work
+from .. import jobs
 from ..apideps import get_campaign, require_api_token
 from ..config import Settings, get_settings
 from ..db import TrainingRun, campaign_organization_id, run_db
@@ -124,10 +126,13 @@ async def start_training(name: str, background: BackgroundTasks, settings: Setti
         run = TrainingRun(organization_id=campaign_organization_id(s, campaign), campaign_id=campaign.id)
         s.add(run)
         s.flush()
+        # Saved with the run: a restart in the middle of training no longer leaves the
+        # run "in progress" forever, the queue runs it again.
+        jobs.enqueue(s, work.TRAINING_RUN, work.training_run_key(run.id), {"run_id": run.id}, max_attempts=2, timeout_seconds=900)
         return _describe_run(run)
 
     run = await run_db(_start)
-    background.add_task(run_training, run["id"])
+    background.add_task(work.run_now, work.training_run_key(run["id"]))
     return run
 
 

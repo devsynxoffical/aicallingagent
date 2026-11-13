@@ -249,3 +249,78 @@ def test_dead_jobs_are_visible_and_can_be_retried_through_the_api(tmp_path, monk
         assert client.post(f"/api/jobs/{dead_id}/retry", headers=headers).status_code == 200
         assert client.post(f"/api/jobs/{dead_id}/retry", headers=headers).status_code == 409
     get_settings.cache_clear()
+
+
+# ----------------------------------------------------------------------------- training and documents
+
+
+def test_a_training_run_interrupted_by_a_restart_is_run_again_and_one_that_cannot_finish_is_closed(call, monkeypatch):
+    from callagent.training import api as training_api
+
+    with db.session_scope() as s:
+        run = db.TrainingRun(organization_id=1, campaign_id=call.campaign)
+        s.add(run)
+        s.flush()
+        run_id = run.id
+        jobs.enqueue(s, background.TRAINING_RUN, background.training_run_key(run_id), {"run_id": run_id}, max_attempts=2, timeout_seconds=900)
+    with db.session_scope() as s:
+        jobs.claim(s, "process-that-was-killed")  # training started, then the process died
+        s.query(Job).one().locked_until = utcnow() - timedelta(seconds=1)
+
+    ran = []
+
+    async def finish(run_id):
+        ran.append(run_id)
+        with db.session_scope() as s:
+            s.get(db.TrainingRun, run_id).status = "done"
+
+    monkeypatch.setattr(training_api, "run_training", finish)
+    asyncio.run(jobs.Worker(name="after-restart").run_once())
+    assert ran == [run_id]
+    asyncio.run(background.run_training_job({"run_id": run_id}))  # delivered again: a finished run is not trained twice
+    assert ran == [run_id]
+
+    with db.session_scope() as s:  # a run from before the queue existed: nothing will ever finish it
+        orphan = db.TrainingRun(organization_id=1, campaign_id=call.campaign)
+        s.add(orphan)
+        s.flush()
+        orphan_id = orphan.id
+    assert asyncio.run(background.recover_training_runs()) == 1
+    with db.session_scope() as s:
+        assert s.get(db.TrainingRun, orphan_id).status == "failed" and "interrupted" in s.get(db.TrainingRun, orphan_id).error
+        assert s.get(db.TrainingRun, run_id).status == "done"
+
+
+def test_reading_a_slow_website_does_not_block_other_writes(call):
+    """On SQLite an open write transaction blocks every other writer. Call status updates
+    and dialing must keep working while a training website is being fetched."""
+    import threading
+    import time
+
+    from callagent.training import service
+
+    started, release, outcome = threading.Event(), threading.Event(), {}
+
+    def slow_fetch(url):
+        started.set()
+        release.wait(timeout=30)
+        return 200, {"content-type": "text/html"}, b"<html><body><h1>Pricing</h1><p>The Pro plan costs 49 dollars per client per month.</p></body></html>"
+
+    with db.session_scope() as s:
+        document_id = service.add_website(s, s.get(db.Campaign, call.campaign), "https://example.com/pricing", max_pages=1, resolver=lambda host: ["93.184.216.34"]).id
+
+    def crawl():
+        with db.session_scope() as s:
+            outcome["status"] = service.process_document_sync(s, document_id, fetcher=slow_fetch, resolver=lambda host: ["93.184.216.34"]).status
+
+    thread = threading.Thread(target=crawl)
+    thread.start()
+    assert started.wait(timeout=10)
+    began = time.monotonic()
+    with db.session_scope() as s:  # what a status webhook does while the crawl is in flight
+        s.get(db.CallRun, call.run).status = "completed"
+    waited = time.monotonic() - began
+    release.set()
+    thread.join(timeout=30)
+    assert waited < 2, f"a write waited {waited:.1f}s behind the crawl"
+    assert outcome["status"] == "ready"

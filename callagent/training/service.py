@@ -122,7 +122,10 @@ def process_document_sync(s: Session, document_id: int, *, fetcher=None, resolve
         return None
     document.status = "processing"
     document.error = None
-    s.flush()
+    # Committed before any reading starts. Fetching a website can take minutes; holding a
+    # write transaction open that long would block every other writer on SQLite (call
+    # status updates, dialing) and hold a row lock on a server database.
+    s.commit()
     info = {k: getattr(document, k) for k in ("kind", "source_url", "max_pages", "storage_path", "file_type")}
     try:
         sections, size = _read(info, fetcher, resolver)
