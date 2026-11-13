@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 from ..config import Settings, get_settings
 from sqlalchemy import select
 
-from ..db import Appointment, CallRun, Lead, run_db
+from ..db import Appointment, CallRun, Campaign, Lead, run_db
+from ..dialer.rules import call_cost, campaign_settings
 from ..llm import make_client, parse_structured
 from ..playbook.schema import Playbook
 from ..voice.tools import DISPOSITIONS
@@ -32,6 +33,30 @@ Disposition = Literal[
     "busy",
     "other",
 ]
+
+
+ObjectionCategory = Literal["price", "not_interested", "timing", "competitor", "authority", "trust", "send_info", "no_need", "other"]
+LostReason = Literal["none", "price", "no_need", "competitor", "timing", "no_authority", "trust", "bad_fit", "unreachable", "other"]
+Answer = Literal["yes", "no", "unknown"]
+
+
+class ObjectionEvent(BaseModel):
+    category: ObjectionCategory
+    quote: str = Field(description="The prospect's own words, as short as possible.")
+    handled: bool = Field(description="True only if the prospect accepted the answer or the conversation moved forward after it.")
+
+
+class QualificationEvidence(BaseModel):
+    """What the prospect actually said about fit. 'unknown' whenever the call gives no evidence;
+    never infer a yes."""
+
+    fits_target_customer: Answer = "unknown"
+    has_need: Answer = "unknown"
+    decision_maker: Answer = "unknown"
+    timeline: Literal["now", "this_quarter", "later", "none", "unknown"] = "unknown"
+    budget_fit: Answer = "unknown"
+    expressed_interest: Answer = "unknown"
+    quotes: list[str] = Field(default_factory=list, description="Short prospect quotes that support the answers above.")
 
 
 class CallReview(BaseModel):
@@ -62,6 +87,10 @@ class CallReview(BaseModel):
     )
     ai_disclosed: bool = Field(default=False, description="True if the agent said it is an AI assistant during the call.")
     language_was_appropriate: bool = Field(default=True, description="False if the agent used the wrong language or mixed languages.")
+    objection_events: list[ObjectionEvent] = Field(default_factory=list, description="Every objection the prospect raised, categorized.")
+    lost_reason: LostReason = Field(default="none", description="Main reason the call did not convert. 'none' if it converted or is still open.")
+    competitors_mentioned: list[str] = Field(default_factory=list, description="Competitor or current-provider names the prospect said. Names only.")
+    evidence: QualificationEvidence = Field(default_factory=QualificationEvidence)
 
 
 TERMINAL_DISPOSITIONS = {
@@ -81,7 +110,10 @@ said, not from what the agent logged. If the call was cut short (transcript ends
 abruptly, prospect never spoke), say so in the summary and recommend a retry.
 The transcript may be in English, Arabic or French; write your review in English.
 List under incorrect_statements any price, guarantee, result or capability the agent
-stated that the playbook summary does not support."""
+stated that the playbook summary does not support.
+Scores and evidence must come from the prospect's own words. In `evidence`, answer
+'unknown' unless the transcript shows it; an agent's assumption is not evidence.
+Categorize each objection; mark it handled only if the prospect accepted the answer."""
 
 
 def review_call(
@@ -141,7 +173,7 @@ async def finalize_call(
     direction: str = "outbound",
 ) -> CallReview | None:
     """Persist transcript, run the review, update the lead's status/retry schedule."""
-    settings = settings or get_settings()
+    settings = base_settings = settings or get_settings()
     now = datetime.now(timezone.utc)
 
     def _persist_transcript(s):
@@ -156,8 +188,10 @@ async def finalize_call(
             run.summary = {**(run.summary or {}), "language": language}
             run.language = language.get("detected")
         run.ended_at = run.ended_at or now
-        if run.started_at:
+        if run.started_at and run.duration_seconds is None:
             run.duration_seconds = int((run.ended_at - run.started_at).total_seconds())
+        if run.cost_usd is None:
+            run.cost_usd = call_cost(run.duration_seconds, settings)
         return run.lead_id
 
     lead_id = await run_db(_persist_transcript)
@@ -196,6 +230,7 @@ async def finalize_call(
         lead = s.get(Lead, lead_id)
         if run is None or lead is None:
             return
+        settings = campaign_settings(s, run.campaign_id, base_settings)
         run.disposition = disposition
         if review:
             run.summary = {**(run.summary or {}), "review": review.model_dump()}
@@ -223,6 +258,12 @@ async def finalize_call(
             lead.next_attempt_at = now + timedelta(minutes=settings.retry_delay_minutes)
         else:
             lead.status = "completed"
+        if review:
+            from ..dialer.rules import rules_of
+            from ..intelligence.scoring import apply_evidence
+
+            campaign = s.get(Campaign, run.campaign_id)
+            apply_evidence(lead, review.evidence.model_dump(), rules_of(campaign).scoring_weights if campaign else None)
         if review and review.prospect_facts:
             facts = "; ".join(review.prospect_facts)
             lead.notes = (lead.notes + "\n" if lead.notes else "") + f"[{now:%Y-%m-%d}] {facts}"

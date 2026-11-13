@@ -33,6 +33,13 @@ def _active(s: Session, campaign: Campaign) -> PlaybookVersion | None:
     ).scalars().first()
 
 
+def active_number(s: Session, campaign: Campaign) -> int | None:
+    """Number of the version calls are running right now."""
+    ensure_baseline(s, campaign)
+    current = _active(s, campaign)
+    return current.version if current is not None else None
+
+
 def ensure_baseline(s: Session, campaign: Campaign) -> None:
     """A campaign that predates versioning gets its current playbook recorded as version 1."""
     if not campaign.playbook_json:

@@ -490,7 +490,7 @@ def _api(method: str, path: str, **kwargs):
     settings = get_settings()
     headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {resolve_api_token(settings)}"}
     try:
-        r = httpx.request(method, settings.server_url + path, timeout=60, headers=headers, **kwargs)
+        r = httpx.request(method, settings.server_url + path, timeout=kwargs.pop("timeout", 60), headers=headers, **kwargs)
     except httpx.ConnectError:
         raise typer.Exit(console.print(f"[red]Cannot reach the server at {settings.server_url}. Start it with `callagent serve`.[/red]") or 1)
     if r.status_code >= 400:
@@ -501,7 +501,12 @@ def _api(method: str, path: str, **kwargs):
 
 
 def _print_campaign(c: dict) -> None:
-    t = Table(title=f"{c['name']}  (status: {c['status']}, dialer {'running' if c['running'] else 'stopped'}, readiness {c['readiness_score']})")
+    title = f"{c['name']}  (status: {c['status']}, dialer {'running' if c['running'] else 'stopped'}, readiness {c['readiness_score']})"
+    if c.get("budget_usd"):
+        title += f"  spent ${c.get('spend_usd', 0):.2f} of ${c['budget_usd']:.2f}"
+    if c.get("stop_reason"):
+        title += f"\nStopped: {c['stop_reason']}"
+    t = Table(title=title)
     t.add_column("metric"); t.add_column("count", justify="right")
     for k, v in sorted(c["stats"].items()):
         t.add_row(k, str(v))
@@ -521,6 +526,101 @@ def campaign_start(name: str, concurrency: int = typer.Option(None), force: bool
 def campaign_pause(name: str):
     """Stop dialing (calls in progress finish normally)."""
     _print_campaign(_api("POST", f"/api/campaigns/{name}/pause").json())
+
+
+@campaign_app.command("report")
+def campaign_report_cmd(name: str):
+    """What the calls say: outcomes, objections, lost reasons, results per playbook version."""
+    r = _api("GET", f"/api/campaigns/{name}/report").json()
+    calls, cost = r["calls"], r["cost"]
+    pct = lambda v: "-" if v is None else f"{v:.1%}"  # noqa: E731
+    console.print(Panel.fit(
+        f"Calls {calls['total']}   answered {calls['answered']}   conversions {calls['conversions']} ({pct(calls['conversion_rate'])})\n"
+        f"Spend ${cost['spend_usd']:.2f}   per conversion {'-' if cost['cost_per_conversion'] is None else '$' + format(cost['cost_per_conversion'], '.2f')}\n"
+        f"Leads: hot {r['leads']['hot']}   warm {r['leads']['warm']}   cold {r['leads']['cold']}   unscored {r['leads']['unscored']}",
+        title=r["campaign"]))
+    if r["objections"]:
+        t = Table(title="Objections")
+        for col in ("objection", "raised", "handled", "still converted", "example"):
+            t.add_column(col)
+        for o in r["objections"]:
+            t.add_row(o["category"], str(o["raised"]), pct(o["handled_rate"]), pct(o["conversion_rate_when_raised"]), (o["examples"] or [""])[0][:70])
+        console.print(t)
+    if r["lost_reasons"]:
+        console.print("Lost because: " + ", ".join(f"{k} {v}" for k, v in r["lost_reasons"].items()))
+    if r["competitors"]:
+        console.print("Competitors named: " + ", ".join(f"{k} ({v})" for k, v in r["competitors"].items()))
+    t = Table(title="By playbook version" + (f"  (best so far: v{r['best_version']})" if r["best_version"] else ""))
+    for col in ("version", "calls", "answered", "conversion rate", "quality", "enough data"):
+        t.add_column(col)
+    for key, v in r["by_playbook_version"].items():
+        t.add_row(key, str(v["calls"]), str(v["answered"]), pct(v["conversion_rate"]), "-" if v["average_quality"] is None else str(v["average_quality"]), "yes" if v["enough_data"] else "no")
+    console.print(t)
+    if r["unsupported_statements"]:
+        console.print(f"[red]{len(r['unsupported_statements'])} statement(s) the playbook does not support[/red]; first: {r['unsupported_statements'][0]['statement'][:100]}")
+
+
+@campaign_app.command("coach")
+def campaign_coach_cmd(name: str):
+    """Ask the coach to draft an improved playbook from patterns across the calls."""
+    with console.status("Reviewing the campaign's calls..."):
+        result = _api("POST", f"/api/campaigns/{name}/coach", timeout=300).json()
+    if not result["version"]:
+        console.print(f"The coach found no change worth proposing from {result['reviewed_calls']} reviewed calls.")
+        return
+    for change in result["changes"]:
+        console.print(f" - {change['change']}\n   [dim]{change['evidence']}[/dim]")
+    console.print(f"\nDraft saved as [bold]version {result['version']}[/bold]. Go live: callagent playbook approve \"{name}\" {result['version']}")
+
+
+@campaign_app.command("rules")
+def campaign_rules_cmd(
+    name: str,
+    days: str = typer.Option(None, help="Calling days, e.g. mon-fri or mon,wed,fri."),
+    hours: str = typer.Option(None, help="Local calling hours, e.g. 09:00-17:30."),
+    max_attempts: int = typer.Option(None, help="Dial attempts per lead."),
+    retry_minutes: int = typer.Option(None, help="Minutes between attempts."),
+    max_per_day: int = typer.Option(None, help="Calls per day."),
+    max_per_month: int = typer.Option(None, help="Calls per month."),
+    budget: float = typer.Option(None, help="Stop when estimated spend reaches this many dollars."),
+    starts: str = typer.Option(None, help="Start date/time with offset, e.g. 2026-12-01T09:00:00-05:00."),
+    ends: str = typer.Option(None, help="End date/time with offset."),
+    stop_after_meetings: int = typer.Option(None, help="Stop once this many meetings are booked."),
+    max_opt_out_rate: float = typer.Option(None, help="Stop above this share of do-not-call requests, e.g. 0.05."),
+    clear: bool = typer.Option(False, help="Remove all campaign rules and use the global defaults."),
+):
+    """Show or change when, how often and how much a campaign may call. Options you give
+    are changed; the rest keep their current value."""
+    from .dialer.rules import parse_days
+
+    current = _api("GET", f"/api/campaigns/{name}/rules").json()
+    changes = {
+        "calling_days": parse_days(days) if days else None,
+        "window_start": hours.split("-")[0] if hours else None,
+        "window_end": hours.split("-")[1] if hours and "-" in hours else None,
+        "max_attempts": max_attempts,
+        "retry_delay_minutes": retry_minutes,
+        "max_calls_per_day": max_per_day,
+        "max_calls_per_month": max_per_month,
+        "budget_usd": budget,
+        "starts_at": starts,
+        "ends_at": ends,
+        "stop_after_meetings": stop_after_meetings,
+        "max_opt_out_rate": max_opt_out_rate,
+    }
+    changes = {k: v for k, v in changes.items() if v is not None}
+    if changes or clear:
+        stored = {} if clear else current["stored"]
+        current = _api("PUT", f"/api/campaigns/{name}/rules", json={**stored, **changes}).json()
+    t = Table(title=f"Calling rules for {name}")
+    t.add_column("rule"); t.add_column("value")
+    for key, value in current["rules"].items():
+        if key != "scoring_weights":
+            t.add_row(key.replace("_", " "), "-" if value is None else (", ".join(value) if isinstance(value, list) else str(value)))
+    t.add_row("spent so far", f"${current['spend_usd']:.2f}")
+    if current.get("stop_reason"):
+        t.add_row("stopped because", current["stop_reason"])
+    console.print(t)
 
 
 @campaign_app.command("inbound")

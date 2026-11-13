@@ -93,13 +93,16 @@ async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook,
     return await run_db(_load)
 
 
-async def mark_call_setup_failed(call_run_id: int, error: str, settings: Settings) -> None:
+async def mark_call_setup_failed(call_run_id: int, error: str, base_settings: Settings) -> None:
     """The stream connected but we could not build the pipeline: close the run and give the lead a retry."""
 
     def _fail(s):
+        from ..dialer.rules import campaign_settings
+
         run = s.get(CallRun, call_run_id)
         if run is None:
             return
+        settings = campaign_settings(s, run.campaign_id, base_settings)
         run.status = "failed"
         run.error = error[:2000]
         run.ended_at = utcnow()

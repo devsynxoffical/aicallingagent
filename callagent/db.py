@@ -12,6 +12,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -88,6 +89,10 @@ class Campaign(Base):
     playbook_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="draft")  # draft|ready|running|paused|done
     max_concurrent_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Per-campaign calling rules (see dialer/rules.py). Empty = the global defaults.
+    rules_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Why the dialer stopped this campaign on its own (budget reached, schedule ended, ...).
+    stop_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
     # E.164 number whose incoming calls this campaign answers. None = outbound only.
     inbound_number: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
@@ -114,6 +119,11 @@ class Lead(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
     last_disposition: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Higher is dialed first. 0 = normal.
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    # Qualification score 0-100 from evidence in the lead's calls; None until a call gave evidence.
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    score_details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     notes: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
@@ -137,6 +147,10 @@ class CallRun(Base):
     answered_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
     mode: Mapped[str] = mapped_column(String(20), default="live")  # live | voicemail | inbound
     direction: Mapped[str] = mapped_column(String(10), default="outbound")  # outbound | inbound
+    # Playbook version this call ran, so results can be compared between versions.
+    playbook_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Estimated cost of this call from the configured rates. None until the call ends.
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Language the prospect mostly spoke (base code), filled when the call ends.
     language: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # True once the media stream reached our server (someone or something answered and we talked).

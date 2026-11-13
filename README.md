@@ -140,6 +140,61 @@ The same is available over HTTP for the dashboard: `POST /api/campaigns/{name}/d
 `POST .../sources`, `GET .../documents`, `GET .../knowledge/search?q=`, `POST .../train`,
 `GET .../versions`, `POST .../versions/{n}/approve`.
 
+## Campaign rules, limits and budgets
+
+```bash
+callagent campaign rules "BrightBooks Q4"                                   # show what is in force
+callagent campaign rules "BrightBooks Q4" --days mon-fri --hours 09:00-17:30 \
+    --max-attempts 2 --max-per-day 300 --budget 250 --stop-after-meetings 40 --max-opt-out-rate 0.05
+callagent campaign rules "BrightBooks Q4" --clear                           # back to the global defaults
+```
+
+Each campaign can set its own calling days and hours, attempts and retry delay, daily
+and monthly call caps, a start and end date, and conditions that stop it. Anything not
+set uses the global default, so existing campaigns behave as before. Rules are checked
+before every single dial and take effect without a restart.
+
+- **Budget.** Every call gets an estimated cost from `COST_PER_CONNECTED_MINUTE_USD` and
+  `COST_PER_CALL_ATTEMPT_USD` (connected time is billed by the started minute). A
+  campaign with a budget stops when spend reaches it, and before that it will not place
+  a call it could not afford in the worst case: calls in progress and the next one are
+  counted at the full call time limit, so the budget cannot be overshot. A campaign with
+  a budget will not start until the call cost is configured.
+- **Stops by itself.** When the budget is reached, the end date passes, the meeting
+  target is hit, or too many answered calls ask not to be called again, the campaign
+  pauses and records why (`campaign status` shows it). Daily and monthly caps do not
+  stop a campaign; it resumes the next day or month.
+- **Priority.** Leads with a higher `priority` are dialed first; a callback the prospect
+  asked for still goes ahead of everything.
+
+The cost is an estimate from your configured rates, not a provider invoice.
+
+## Sales intelligence
+
+```bash
+callagent campaign report "BrightBooks Q4"   # outcomes, objections, lost reasons, results per playbook version
+callagent campaign coach "BrightBooks Q4"    # draft an improved playbook from patterns across the calls
+```
+
+- **Structured call evidence.** Each call review now records every objection with its
+  category (price, timing, competitor, authority, ...) and whether it was handled, the
+  main reason a call was lost, competitors the prospect named, and what the prospect
+  actually said about fit.
+- **Lead score from evidence.** Need, decision-making authority, timing, budget, fit and
+  interest are each yes, no or unknown, taken from the prospect's own words. The score is
+  a weighted sum (weights configurable per campaign); "unknown" earns nothing, and a
+  lead with no evidence has no score instead of an invented one. Evidence accumulates
+  across a lead's calls. `GET /api/campaigns/{name}/leads?category=hot` lists them.
+- **Report.** Counted from stored reviews, never estimated: conversion rate, objections
+  by frequency with how often each was handled and how often a call with that objection
+  still converted, lost reasons, competitors named, statements the playbook does not
+  support, cost per conversion, and results per playbook version and per language. A
+  best version is named only when at least two versions each have 30 answered calls.
+- **Coach.** Needs 20 reviewed calls, then proposes an improved playbook with the
+  evidence for each change. The result is a draft version that waits for approval.
+  Prices, terms, proof points, compliance lines, the call goal and language settings
+  are copied back from the current playbook whatever the model wrote.
+
 ## Languages: English, Arabic, French
 
 ```bash
@@ -321,6 +376,11 @@ callagent/
   training/versions.py   playbook history: draft, approve, rollback
   training/builder.py    script + documents -> draft playbook
   training/api.py        training HTTP API
+  dialer/rules.py        per-campaign rules, limits, cost and budget checks
+  intelligence/scoring.py  lead score from call evidence
+  intelligence/report.py   campaign report counted from call reviews
+  intelligence/coach.py    drafts playbook improvements for approval
+  intelligence/api.py      report, scored leads and coach over HTTP
   voice/pipeline.py      Pipecat pipeline for one call
   voice/language_follower.py  tracks the prospect's language during the call
   voice/tools.py         in-call tools (book_meeting, end_call, ...)

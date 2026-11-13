@@ -10,7 +10,7 @@ Last updated: 2026-11-13.
 
 `callagent` is a working single-company calling agent, driven from a command line
 and a small authenticated HTTP API. Everything below is implemented and covered by
-the test suite (140 tests, no network needed).
+the test suite (164 tests, no network needed).
 
 | Area | What it does today |
 |---|---|
@@ -43,9 +43,9 @@ Status: **Done** = implemented and tested. **Partial** = works in a limited form
 | 5. Sales training from uploads | Done in code (backend) | PDF, Word, PowerPoint, HTML, CSV, text and websites are read, indexed and searchable on calls; training produces a draft that needs approval; versions and rollback. Missing: OCR for scanned PDFs, call recordings as training input, the dashboard screens. The model-written parts (playbook draft, native phrasing) are untested without an Anthropic key. |
 | 6. Sales conversation engine | Done | Qualification, objections, closing live in the Playbook and prompt. |
 | 7. Appointment booking | Partial | Books into the local database and posts to a webhook. **Does not check real calendar availability.** No Google/Outlook, no rescheduling, reminders or no-show tracking. |
-| 8. Post-call analysis | Partial | Per-call report is complete. The improvement loop (patterns across calls, A/B tests, approval, deployment) is missing. |
+| 8. Post-call analysis | Mostly done in code | Per-call report with categorized objections, lost reason and qualification evidence; campaign report; coach that drafts improvements for approval; results compared per playbook version. Missing: splitting leads between two versions on purpose (A/B assignment). The coach's model call is untested without an Anthropic key. |
 | 9. CRM and lead management | Partial | Leads, history, statuses exist. No CRM sync, fewer statuses than the brief lists. |
-| 10. Campaigns | Partial | One playbook per campaign. Calling rules are global settings, not per campaign. |
+| 10. Campaigns | Mostly done in code | Per-campaign days, hours, attempts, retry, daily/monthly caps, schedule, budget with spend tracking, stop conditions, lead priority. Missing: several agents per campaign, lead distribution between agents, the dashboard wizard. |
 | 11. Agent personality | Partial | Persona is part of the playbook. Voice and speed are global settings. |
 | 12. Human handoff | Partial | Transfer works. The human does not yet receive the conversation summary. |
 | 13-14. Dashboard, live monitoring | Missing | No web interface at all. |
@@ -53,7 +53,7 @@ Status: **Done** = implemented and tested. **Partial** = works in a limited form
 | 16. Provider independence | Partial | Speech-to-text and voice are adapters. Telephony is still Twilio-specific; the model is Claude-specific. |
 | 17. Compliance | Partial | Do-not-call, opt-out, calling hours, AI disclosure, recording notice. No per-country rule sets, consent records, audit log or retention settings. |
 | 18. Benchmark suite | Missing | Timing is recorded per call; there is no repeatable cross-provider benchmark. |
-| 19. Sales intelligence | Missing | |
+| 19. Sales intelligence | Started | Evidence-based lead score, campaign report, coach drafts. Missing: follow-up recommendations, conversion probability, cross-campaign patterns. |
 | 21. Acceptance tests on real calls | Blocked | Needs telephony and speech credentials. |
 
 ## 3. Target architecture
@@ -210,6 +210,25 @@ phase 6, because every table created from then on must be born tenant-scoped.
 - **Organizations.** One default organization for now. Knowledge search takes the
   organization and the campaign and applies both, so a campaign id from another
   organization returns nothing.
+
+### Rules and intelligence release (2026-11-13)
+
+- **Campaign rules** (`dialer/rules.py`): stored per campaign, validated, checked
+  before every dial. Budgets are enforced against the worst case (calls in progress
+  and the next call counted at the full time limit), so spend cannot pass the budget.
+  Cost per call is an estimate from two configured rates; a campaign with a budget
+  refuses to start until they are set. Automatic stops record their reason.
+- **Call evidence** (`postcall/summarizer.py`): reviews now carry categorized
+  objections with a handled flag, a lost reason, competitors named, and
+  yes/no/unknown answers on fit taken from the prospect's words.
+- **Lead score** (`intelligence/scoring.py`): deterministic weighted sum of that
+  evidence; no evidence means no score. Weights per campaign.
+- **Report** (`intelligence/report.py`): counted from stored reviews. Each call records
+  the playbook version it ran, so versions can be compared; a winner is only named
+  with 30+ answered calls on at least two versions.
+- **Coach** (`intelligence/coach.py`): waits for 20 reviewed calls, proposes a draft
+  version with evidence per change, and cannot alter prices, proof points, compliance
+  lines, the call goal or language settings (they are copied back in code).
 
 Known simplification: a "training project" and an "agent" are still the campaign
 itself. The roadmap's split (training project -> agent -> campaign) is made in phase

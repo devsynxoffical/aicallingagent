@@ -22,11 +22,13 @@ from .apideps import require_api_token
 from .config import Settings, get_settings
 from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
 from .dialer import twilio_client
+from .dialer import rules as campaign_rules
 from .dialer.campaign_runner import TERMINAL_CALL_STATUSES, CampaignRunner, apply_twilio_status
 from .leads.importer import import_leads
 from .leads.importer import normalize_phone
 from .playbook.schema import Playbook
 from .providers import SpeechPlan, speech_plan_problems
+from .intelligence.api import router as intelligence_router
 from .training import versions
 from .training.api import router as training_router
 from .training.service import resume_unfinished
@@ -57,6 +59,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="callagent", lifespan=lifespan)
 app.include_router(training_router)
+app.include_router(intelligence_router)
 
 
 def _runner() -> CampaignRunner:
@@ -180,6 +183,7 @@ def open_inbound_call(s, form: dict[str, str], settings: Settings) -> tuple[int,
         status="in-progress",
         mode="inbound",
         direction="inbound",
+        playbook_version=versions.active_number(s, campaign),
         answered_by="human",
         stream_token=token,
         started_at=utcnow(),
@@ -266,6 +270,9 @@ class CampaignOut(BaseModel):
     status: str
     languages: list[str] = []
     inbound_number: str | None = None
+    stop_reason: str | None = None
+    spend_usd: float = 0.0
+    budget_usd: float | None = None
     readiness_score: int
     stats: dict[str, int]
     running: bool
@@ -278,6 +285,9 @@ def _campaign_out(s, c: Campaign) -> CampaignOut:
         status=c.status,
         languages=_languages(c),
         inbound_number=c.inbound_number,
+        stop_reason=c.stop_reason,
+        spend_usd=campaign_rules.campaign_spend(s, c.id),
+        budget_usd=campaign_rules.rules_of(c).budget_usd,
         readiness_score=int((c.playbook_json or {}).get("readiness_score", 0)),
         stats=campaign_stats(s, c.id),
         running=_runner().is_running(c.id),
@@ -356,6 +366,9 @@ async def start_campaign(name: str, concurrency: int | None = None, force: bool 
         if problems:
             # Not overridable: dialing people in a language the agent cannot hear is never the right call.
             raise HTTPException(400, "cannot run this campaign's languages with the configured providers: " + "; ".join(problems))
+        rule_problems = campaign_rules.start_problems(c, settings)
+        if rule_problems:
+            raise HTTPException(400, "; ".join(rule_problems))
         if concurrency:
             c.max_concurrent_calls = concurrency
         return c.id
@@ -370,6 +383,41 @@ async def pause_campaign(name: str):
     cid = await run_db(lambda s: _get_campaign(s, name).id)
     await _runner().stop(cid, status="paused")
     return await run_db(lambda s: _campaign_out(s, _get_campaign(s, name)))
+
+
+@app.get("/api/campaigns/{name}/rules", dependencies=[Depends(require_api_token)])
+async def get_rules(name: str, settings: Settings = Depends(get_settings)):
+    """The calling rules in force for this campaign, with spend so far."""
+
+    def _get(s):
+        c = _get_campaign(s, name)
+        return {
+            "rules": campaign_rules.describe(c, settings),
+            "stored": dict(c.rules_json or {}),
+            "spend_usd": campaign_rules.campaign_spend(s, c.id),
+            "stop_reason": c.stop_reason,
+        }
+
+    return await run_db(_get)
+
+
+@app.put("/api/campaigns/{name}/rules", dependencies=[Depends(require_api_token)])
+async def set_rules(name: str, body: campaign_rules.CampaignRules, settings: Settings = Depends(get_settings)):
+    """Replace this campaign's calling rules. Fields left out go back to the global default.
+    Takes effect on the next dial; a running campaign does not need a restart."""
+
+    def _set(s):
+        c = _get_campaign(s, name)
+        c.rules_json = body.model_dump(mode="json", exclude_none=True, exclude_unset=True)
+        s.flush()
+        return {
+            "rules": campaign_rules.describe(c, settings),
+            "stored": dict(c.rules_json or {}),
+            "spend_usd": campaign_rules.campaign_spend(s, c.id),
+            "stop_reason": c.stop_reason,
+        }
+
+    return await run_db(_set)
 
 
 @app.post("/api/campaigns/{name}/inbound", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
@@ -446,6 +494,8 @@ async def list_calls(name: str, limit: int = 50):
                     "answered_by": r.answered_by,
                     "disposition": r.disposition,
                     "duration_seconds": r.duration_seconds,
+                    "cost_usd": r.cost_usd,
+                    "playbook_version": r.playbook_version,
                     "summary": (r.summary or {}).get("review", {}).get("summary") or (r.summary or {}).get("agent_outcome", {}).get("summary"),
                     "started_at": r.started_at.isoformat() if r.started_at else None,
                 }
