@@ -109,3 +109,37 @@ def validate_signature(settings: Settings, url: str, form: dict[str, Any], signa
     if not (settings.twilio_auth_token and signature):
         return False
     return RequestValidator(settings.twilio_auth_token).validate(url, form, signature)
+
+
+# ----------------------------------------------------------------------------- asking what happened
+
+
+def definitely_not_placed(error: Exception) -> bool:
+    """True when the provider refused the request outright (a 4xx answer: bad number, no
+    permission, no funds), so no call exists. A timeout, a dropped connection or a 5xx is
+    not a refusal: the call may have been placed."""
+    status = getattr(error, "status", None)
+    return isinstance(status, int) and 400 <= status < 500
+
+
+def fetch_call(call_sid: str, settings: Settings | None = None) -> dict[str, Any] | None:
+    """The provider's own record of a call: {"sid", "status", "duration"}. None if it has no such call."""
+    settings = settings or get_settings()
+    try:
+        call = _client(settings).calls(call_sid).fetch()
+    except Exception as e:
+        if getattr(e, "status", None) == 404:
+            return None
+        raise
+    return {"sid": call.sid, "status": str(call.status), "duration": call.duration}
+
+
+def find_call(to_number: str, started_after, settings: Settings | None = None) -> dict[str, Any] | None:
+    """A call we may have placed but hold no id for: the newest call from our number to
+    this number since the given moment, or None."""
+    settings = settings or get_settings()
+    calls = _client(settings).calls.list(to=to_number, from_=settings.twilio_from_number, start_time_after=started_after, limit=5)
+    if not calls:
+        return None
+    call = calls[0]
+    return {"sid": call.sid, "status": str(call.status), "duration": call.duration}

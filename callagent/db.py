@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     TypeDecorator,
@@ -163,6 +164,8 @@ class CallRun(Base):
     twilio_call_sid: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # created | initiated | ringing | in-progress | completed | busy | no-answer | failed | canceled
     status: Mapped[str] = mapped_column(String(20), default="created")
+    # Who said so: "provider" (the telephony provider reported it) or "system" (we concluded it).
+    status_source: Mapped[str | None] = mapped_column(String(12), nullable=True)
     answered_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
     mode: Mapped[str] = mapped_column(String(20), default="live")  # live | voicemail | inbound
     direction: Mapped[str] = mapped_column(String(10), default="outbound")  # outbound | inbound
@@ -343,6 +346,25 @@ class TrainingRun(Base):
     version: Mapped[int | None] = mapped_column(Integer, nullable=True)  # the draft it produced
     started_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
+class UsageRecord(Base):
+    """What a call used, written once when the call's final duration is known. This is
+    the ledger a bill would be drawn from: one row per call and kind, enforced by the
+    database, so reprocessing an event can never charge twice."""
+
+    __tablename__ = "usage_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), nullable=True, index=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
+    call_run_id: Mapped[int] = mapped_column(ForeignKey("call_runs.id"))
+    kind: Mapped[str] = mapped_column(String(20), default="call")
+    quantity_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    amount_usd: Mapped[Any] = mapped_column(Numeric(12, 4), default=0)  # exact decimal, not floating point
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+    __table_args__ = (Index("uq_usage_records_call_kind", "call_run_id", "kind", unique=True),)
 
 
 class Job(Base):

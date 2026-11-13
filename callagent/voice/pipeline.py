@@ -36,6 +36,7 @@ from ..config import Settings, get_settings
 from datetime import timedelta
 
 from ..db import CallRun, Campaign, Lead, campaign_organization_id, run_db, utcnow
+from ..dialer import lifecycle
 from ..languages import LanguageSwitch, LanguageTracker
 from ..playbook.prompt_builder import build_system_prompt
 from ..playbook.schema import Playbook
@@ -97,7 +98,7 @@ async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook,
             "notes": lead.notes,
             "attempts": lead.attempts,
         }
-        run.status = "in-progress"
+        lifecycle.advance(run, "in-progress")
         run.stream_connected = True
         # Built once per call, for this organization and campaign only.
         knowledge = load_index(s, campaign_organization_id(s, campaign), campaign.id)
@@ -116,9 +117,8 @@ async def mark_call_setup_failed(call_run_id: int, error: str, base_settings: Se
         if run is None:
             return
         settings = campaign_settings(s, run.campaign_id, base_settings)
-        run.status = "failed"
+        lifecycle.advance(run, "failed")
         run.error = error[:2000]
-        run.ended_at = utcnow()
         lead = s.get(Lead, run.lead_id)
         if lead and lead.status == "calling":
             lead.status = "pending" if lead.attempts < settings.max_attempts else "completed"

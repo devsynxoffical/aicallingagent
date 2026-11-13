@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -25,6 +26,7 @@ from .config import Settings, get_settings
 from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
 from .dialer import twilio_client
 from .dialer import rules as campaign_rules
+from .dialer.reconcile import reconcile_forever
 from .dialer.campaign_runner import TERMINAL_CALL_STATUSES, CampaignRunner, LeadNotDialable, apply_twilio_status
 from .leads.importer import import_leads
 from .leads.importer import normalize_phone
@@ -58,7 +60,14 @@ async def lifespan(app: FastAPI):
     # Background jobs that were queued, or left running by a process that stopped.
     await background.recover_training_runs()
     background.start_worker()
+    # Calls that went quiet are resolved by asking the provider, for every campaign.
+    reconciler = asyncio.create_task(reconcile_forever(), name="call-reconciler")
     yield
+    reconciler.cancel()
+    try:
+        await reconciler
+    except (asyncio.CancelledError, Exception):
+        pass
     await background.stop_worker()
     await runner.shutdown()
 

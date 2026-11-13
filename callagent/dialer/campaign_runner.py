@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
 from ..db import ACTIVE_CALL_STATUSES, TERMINAL_CALL_STATUSES, CallRun, Campaign, Lead, is_dnc, run_db, utcnow
+from . import lifecycle
 from . import rules as campaign_rules
 from . import twilio_client
 from .rules import DEFAULT_CALLING_DAYS, campaign_settings
@@ -190,10 +191,12 @@ def reap_stale_calls(s: Session, campaign_id: int, settings: Settings | None = N
         .scalars()
         .all()
     )
+    if settings.twilio_account_sid and settings.twilio_auth_token:
+        # A provider is configured: only its answer may end a call (see dialer/reconcile.py).
+        return recovered
     for run in stale:
-        run.status = "failed"
+        lifecycle.advance(run, "failed")
         run.error = (run.error or "") + " stale: no status update"
-        run.ended_at = utcnow()
         lead = s.get(Lead, run.lead_id)
         if lead and run.direction == "inbound":
             release_inbound_lead(run, lead)
@@ -283,10 +286,14 @@ class CampaignRunner:
                 run = s.get(CallRun, run_id)
                 lead = s.get(Lead, lead_id)
                 effective = campaign_settings(s, campaign_id, self.settings)
+                if run and not twilio_client.definitely_not_placed(e):
+                    # No answer is not a "no": the provider may have placed the call. The lead
+                    # stays reserved and reconciliation asks the provider before anyone redials.
+                    run.error = f"the provider did not confirm the call ({err}); awaiting reconciliation"
+                    return
                 if run:
-                    run.status = "failed"
+                    lifecycle.advance(run, "failed")
                     run.error = err
-                    run.ended_at = utcnow()
                 if lead:
                     lead.status = "failed" if lead.attempts >= effective.max_attempts else "pending"
                     lead.next_attempt_at = utcnow() + timedelta(minutes=effective.retry_delay_minutes)
@@ -298,8 +305,7 @@ class CampaignRunner:
             run = s.get(CallRun, run_id)
             if run:
                 run.twilio_call_sid = run.twilio_call_sid or sid
-                if run.status == "created":  # a status webhook may already have moved it further
-                    run.status = "initiated"
+                lifecycle.advance(run, "initiated")  # no effect if a status webhook already moved it further
 
         await run_db(_sid)
         return run_id
@@ -387,17 +393,19 @@ def apply_twilio_status(s: Session, call_run_id: int, form: dict[str, Any], sett
     run.twilio_call_sid = run.twilio_call_sid or form.get("CallSid")
     if form.get("AnsweredBy"):
         run.answered_by = form.get("AnsweredBy")
-    if status and not (run.status in TERMINAL_CALL_STATUSES and status not in TERMINAL_CALL_STATUSES):
-        run.status = status  # a late "ringing" must not resurrect a finished call
+    if status:
+        lifecycle.advance(run, status, source=lifecycle.PROVIDER)  # repeated, late and out-of-order reports change nothing
     if form.get("RecordingUrl"):
         run.recording_url = form.get("RecordingUrl")
-    if status in ("completed", "busy", "no-answer", "failed", "canceled"):
-        run.ended_at = run.ended_at or utcnow()
+    if status in TERMINAL_CALL_STATUSES and run.status == status:
         dur = form.get("CallDuration")
-        if dur and str(dur).isdigit():
-            run.duration_seconds = int(dur)
-        # The carrier's duration is the billed one, so the cost is (re)computed from it.
-        run.cost_usd = campaign_rules.call_cost(run.duration_seconds, settings)
+        seconds = int(dur) if dur and str(dur).isdigit() else run.duration_seconds
+        # The carrier's duration is the billed one. It is written to the ledger exactly
+        # once; a repeated report, even with different numbers, changes neither the
+        # ledger nor the call.
+        usage = lifecycle.record_usage(s, run, seconds, campaign_rules.call_cost(seconds, settings))
+        run.duration_seconds = usage.quantity_seconds if (seconds is not None or run.duration_seconds is not None) else None
+        run.cost_usd = float(usage.amount_usd)
         lead = s.get(Lead, run.lead_id)
         if lead and run.direction == "inbound":
             if not run.stream_connected:
