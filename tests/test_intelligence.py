@@ -272,3 +272,30 @@ def test_report_leads_and_coach_over_http(client):
 
     too_early = client.post("/api/campaigns/q4/coach")
     assert too_early.status_code == 409 and "only 0 reviewed calls" in too_early.json()["detail"]
+
+
+def test_timeline_counts_calls_per_day_with_no_gaps_and_nothing_invented(client):
+    from datetime import timedelta
+
+    from callagent.db import utcnow
+
+    http, headers = client, None  # the fixture's client already carries the token
+    now = utcnow()
+    with db.session_scope() as s:
+        c = s.query(db.Campaign).first()
+        for i, (days_ago, answered, disposition) in enumerate([(0, True, "meeting_booked"), (0, True, "not_interested"), (0, False, "no_answer"),
+                                                               (3, True, "sale_closed"), (40, True, "meeting_booked")]):
+            lead = db.Lead(campaign_id=c.id, phone_e164=f"+1415777{i:04d}", status="completed")
+            s.add(lead)
+            s.flush()
+            s.add(db.CallRun(lead_id=lead.id, campaign_id=c.id, status="completed", disposition=disposition, stream_connected=answered,
+                             transcript=[{"role": "user", "text": "hi"}] if answered else [], started_at=now - timedelta(days=days_ago, minutes=5)))
+
+    assert http.get("/api/timeline", headers={"Authorization": "Bearer not-the-token"}).status_code == 401
+    body = http.get("/api/timeline?days=7", headers=headers).json()
+    days = body["days"]
+    assert len(days) == 7 and [d["date"] for d in days] == sorted(d["date"] for d in days)  # one row per day, oldest first
+    assert sum(d["calls"] for d in days) == 4  # the call from 40 days ago is outside the window
+    assert sum(d["answered"] for d in days) == 3 and sum(d["conversions"] for d in days) == 2
+    assert sum(1 for d in days if d["calls"] == 0) >= 5  # quiet days are zeros, not missing and not filled in
+    assert len(http.get("/api/timeline?days=500", headers=headers).json()["days"]) == 90  # capped

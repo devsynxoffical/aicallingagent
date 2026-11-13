@@ -32,7 +32,8 @@ from callagent.postcall.summarizer import CallReview, ObjectionEvent, Qualificat
 from callagent.training import versions  # noqa: E402
 from fixtures import make_sample_playbook  # noqa: E402
 
-START = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
+# Calls are spread over the eleven days before the seed runs, so "the last two weeks" has something in it.
+START = (datetime.now(timezone.utc) - timedelta(days=11)).replace(hour=9, minute=0, second=0, microsecond=0)
 FIRST = ["Alex", "Sam", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Jamie", "Avery", "Quinn"]
 LAST = ["Abara", "Bianchi", "Costa", "Dubois", "Eze", "Fischer", "Haddad", "Ito", "Jansen", "Kowalski", "Lindqvist", "Moreau"]
 
@@ -59,7 +60,7 @@ class _Seeder:
 
     def call(self, lead: db.Lead, *, version: int | None, review: CallReview | None, answered: bool = True, language: str = "en", cost: float = 0.5,
              transcript: list[dict] | None = None, experiment: tuple[int | None, str | None] = (None, None)) -> db.CallRun:
-        started = START + timedelta(minutes=17 * lead.id + 240 * lead.attempts)
+        started = START + timedelta(minutes=85 * lead.id + 240 * lead.attempts)
         lead.attempts += 1
         disposition = review.disposition if review else "no_answer"
         run = db.CallRun(

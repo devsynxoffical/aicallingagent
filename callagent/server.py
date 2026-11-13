@@ -351,6 +351,40 @@ async def retry_job(job_id: int):
     return {"ok": True}
 
 
+@app.get("/api/timeline", dependencies=[Depends(require_api_token)])
+async def timeline(days: int = 14, settings: Settings = Depends(get_settings)):
+    """Calls per day over the last ``days`` days, across campaigns, counted from the call
+    records: placed, answered and converted. Days are calendar days in DEFAULT_TIMEZONE;
+    a day with no calls is listed with zeros, so the series has no gaps."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from .intelligence.report import CONVERSIONS
+
+    span = max(1, min(days, 90))
+    try:
+        tz = ZoneInfo(settings.default_timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    today = utcnow().astimezone(tz).date()
+    first = today - timedelta(days=span - 1)
+
+    def _q(s):
+        buckets = {first + timedelta(days=i): {"calls": 0, "answered": 0, "conversions": 0} for i in range(span)}
+        since = utcnow() - timedelta(days=span + 1)
+        rows = s.execute(select(CallRun.started_at, CallRun.stream_connected, CallRun.transcript, CallRun.disposition).where(CallRun.started_at >= since))
+        for started_at, connected, transcript, disposition in rows:
+            bucket = buckets.get(started_at.astimezone(tz).date())
+            if bucket is None:
+                continue
+            bucket["calls"] += 1
+            bucket["answered"] += bool(connected and transcript)
+            bucket["conversions"] += disposition in CONVERSIONS
+        return {"timezone": str(tz), "days": [{"date": day.isoformat(), **counts} for day, counts in buckets.items()]}
+
+    return await run_db(_q)
+
+
 @app.get("/api/campaigns", response_model=list[CampaignOut], dependencies=[Depends(require_api_token)])
 async def list_campaigns():
     return await run_db(lambda s: [_campaign_out(s, c) for c in s.execute(select(Campaign)).scalars()])

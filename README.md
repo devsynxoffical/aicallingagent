@@ -227,6 +227,10 @@ POST /api/campaigns/{name}/experiments/{id}/promote  end it, make the variant li
 - Promotion is a person's decision and is refused unless the verdict is
   `variant_ahead` (`force` overrides, on record). Nothing is published automatically.
 
+- **Activity over time.** `GET /api/timeline?days=14` returns calls placed, answered and
+  converted per calendar day (in `DEFAULT_TIMEZONE`) across campaigns, with quiet days
+  as zeros. The dashboard's activity chart reads it.
+
 ### Dashboard
 
 The web dashboard lives in the `devytalk` repository (`apps/web`, under `/dashboard`).
