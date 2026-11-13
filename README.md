@@ -109,6 +109,37 @@ detection. Voicemail gets a short natural message; a human gets the conversation
 every call a review model writes a summary, disposition, interest level, objections,
 next action and coaching notes, and decides whether to retry.
 
+## Training from documents and websites
+
+```bash
+callagent train add "BrightBooks Q4" pricing.pdf services.docx deck.pptx https://brightbooks.example
+callagent train list "BrightBooks Q4"                        # status of each source, and why any failed
+callagent train search "BrightBooks Q4" "do you support Xero?"   # what the agent would find on a call
+callagent train build "BrightBooks Q4"                       # draft a new playbook version from script + documents
+callagent playbook versions "BrightBooks Q4"
+callagent playbook approve "BrightBooks Q4" 2                # make version 2 live; an older number is a rollback
+```
+
+- **What it reads:** PDF, Word, PowerPoint (with speaker notes), HTML, CSV, text, Markdown,
+  and websites (the page you give plus same-site pages it links to, robots.txt respected).
+  Scanned PDFs are refused with a clear message; OCR is not supported yet.
+- **On calls:** once a campaign has documents, the agent can look facts up mid-call. It
+  is told to look up anything its briefing does not cover, to answer only from what it
+  finds, and to offer a follow-up instead of guessing when it finds nothing. Every
+  passage carries its source ("pricing.pdf, page 3").
+- **Drafts need approval.** `train build` never changes live calls. It saves a draft
+  version with its knowledge gaps listed (missing pricing, documents that contradict
+  each other, claims with no evidence). A draft with unanswered blocking questions
+  cannot be approved without `--force`.
+- **Nothing is lost.** Every playbook change is a version; replaced documents stay on
+  record. `playbook approve` with an older number restores it exactly.
+- **Isolation.** Documents and knowledge belong to one organization and one campaign,
+  and search applies both.
+
+The same is available over HTTP for the dashboard: `POST /api/campaigns/{name}/documents`,
+`POST .../sources`, `GET .../documents`, `GET .../knowledge/search?q=`, `POST .../train`,
+`GET .../versions`, `POST .../versions/{n}/approve`.
+
 ## Languages: English, Arabic, French
 
 ```bash
@@ -284,6 +315,12 @@ callagent/
   dialer/campaign_runner.py  calling windows, concurrency, retries, status callbacks
   languages.py           language detection and per-call language tracking
   providers/             speech-to-text and voice adapters, provider registry
+  training/ingest.py     read PDF/Word/PowerPoint/HTML/CSV/text and cut into passages
+  training/web.py        read websites safely (public addresses only, robots.txt)
+  training/search.py     per-campaign knowledge search
+  training/versions.py   playbook history: draft, approve, rollback
+  training/builder.py    script + documents -> draft playbook
+  training/api.py        training HTTP API
   voice/pipeline.py      Pipecat pipeline for one call
   voice/language_follower.py  tracks the prospect's language during the call
   voice/tools.py         in-call tools (book_meeting, end_call, ...)

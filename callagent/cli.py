@@ -29,9 +29,11 @@ app = typer.Typer(help="Outbound AI calling agent that learns your pitch, dials 
 leads_app = typer.Typer(help="Lead sheets.")
 campaign_app = typer.Typer(help="Run and monitor campaigns (needs `callagent serve` running).")
 playbook_app = typer.Typer(help="Inspect and edit playbooks.")
+train_app = typer.Typer(help="Teach the agent from documents and websites.")
 app.add_typer(leads_app, name="leads")
 app.add_typer(campaign_app, name="campaign")
 app.add_typer(playbook_app, name="playbook")
+app.add_typer(train_app, name="train")
 
 console = Console()
 
@@ -44,7 +46,7 @@ def _playbook_path(name: str) -> Path:
     return settings.data_dir / "playbooks" / f"{safe}.json"
 
 
-def _save_campaign(name: str, playbook: Playbook, script_text: str) -> Campaign:
+def _save_campaign(name: str, playbook: Playbook, script_text: str, source: str = "onboard") -> Campaign:
     path = _playbook_path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(playbook.model_dump_json(indent=2))
@@ -53,11 +55,13 @@ def _save_campaign(name: str, playbook: Playbook, script_text: str) -> Campaign:
         if c is None:
             c = Campaign(name=name, status="draft")
             s.add(c)
-        c.playbook_json = playbook.model_dump()
         c.script_text = script_text or c.script_text
+        s.flush()
+        from .training import versions
+
+        # Recorded as a new version and made active (the owner is changing it directly).
         # Running/paused/done campaigns keep their state; drafts become ready once nothing blocks.
-        if c.status in ("draft", "ready"):
-            c.status = "ready" if playbook.is_ready else "draft"
+        versions.record_active(s, c, playbook.model_dump(), source=source)
         s.flush()
         s.refresh(c)
         return c
@@ -181,7 +185,7 @@ def rehearse(
     if report.playbook_edits and (apply or Confirm.ask("Apply these edits to the playbook?", default=False)):
         with console.status("Applying edits..."):
             pb = apply_coach_edits(client, pb, report, settings)
-        _save_campaign(name, pb, script_text)
+        _save_campaign(name, pb, script_text, source="rehearsal")
         console.print("[green]Playbook updated.[/green] Run rehearse again to verify.")
 
 
@@ -272,7 +276,7 @@ def playbook_languages(
             if pb.localized_for(code) is None:
                 with console.status(f"Writing native {LANGUAGE_NAMES[code]} phrasing..."):
                     pb.localized.append(analyzer.localize(pb, code))
-    _save_campaign(name, pb, script)
+    _save_campaign(name, pb, script, source="languages")
     _print_playbook_summary(pb)
     for problem in speech_plan_problems(get_settings(), SpeechPlan.from_playbook(pb)):
         console.print(f"[yellow]Provider gap:[/yellow] {problem}")
@@ -282,8 +286,171 @@ def playbook_languages(
 def playbook_import(name: str, path: Path = typer.Argument(..., exists=True)):
     """Load a hand-edited playbook JSON into a campaign."""
     pb = Playbook.model_validate_json(path.read_text())
-    _save_campaign(name, pb, "")
+    _save_campaign(name, pb, "", source="import")
     console.print(f"[green]Imported[/green] playbook for {name}.")
+
+
+def _campaign_or_exit(s, name: str) -> Campaign:
+    c = get_campaign_by_name(s, name)
+    if c is None:
+        raise typer.BadParameter(f"campaign '{name}' not found. Run `callagent onboard` first.")
+    return c
+
+
+def _print_versions(rows: list[dict]) -> None:
+    t = Table(title="Playbook versions (calls run the active one)")
+    for col in ("version", "status", "source", "readiness", "blocking questions", "note"):
+        t.add_column(col)
+    for v in rows:
+        style = {"active": "green", "draft": "yellow", "rejected": "red"}.get(v["status"], "dim")
+        t.add_row(str(v["version"]), f"[{style}]{v['status']}[/{style}]", v["source"], str(v["readiness_score"]),
+                  str(len(v["blocking_questions"])), v["note"][:90])
+    console.print(t)
+
+
+@playbook_app.command("versions")
+def playbook_versions(name: str):
+    """History of a campaign's playbook."""
+    from .training import versions
+
+    with session_scope() as s:
+        rows = [versions.describe(v) for v in versions.list_versions(s, _campaign_or_exit(s, name))]
+    _print_versions(rows)
+
+
+@playbook_app.command("approve")
+def playbook_approve(
+    name: str,
+    version: int = typer.Argument(..., help="Version to make live. An older version here is a rollback."),
+    force: bool = typer.Option(False, help="Approve even with blocking open questions."),
+    by: str = typer.Option("", help="Who is approving."),
+):
+    """Make a version the one calls run."""
+    from .training import versions
+
+    with session_scope() as s:
+        try:
+            v = versions.describe(versions.approve(s, _campaign_or_exit(s, name), version, by=by, force=force))
+        except versions.VersionError as e:
+            raise typer.BadParameter(str(e)) from None
+    console.print(f"[green]Version {v['version']} is now live[/green] for {name}.")
+
+
+@playbook_app.command("reject")
+def playbook_reject(name: str, version: int, reason: str = typer.Option("", help="Why.")):
+    """Turn down a draft. It stays in the history."""
+    from .training import versions
+
+    with session_scope() as s:
+        try:
+            versions.reject(s, _campaign_or_exit(s, name), version, reason=reason)
+        except versions.VersionError as e:
+            raise typer.BadParameter(str(e)) from None
+    console.print(f"Version {version} rejected.")
+
+
+def _print_documents(rows: list[dict]) -> None:
+    t = Table(title="Training documents")
+    for col in ("id", "name", "type", "v", "status", "language", "passages", "problem"):
+        t.add_column(col)
+    for d in rows:
+        style = {"ready": "green", "failed": "red"}.get(d["status"], "yellow")
+        t.add_row(str(d["id"]), d["name"][:60], d["file_type"], str(d["version"]), f"[{style}]{d['status']}[/{style}]",
+                  d["language"] or "", str(d["passages"]), (d["error"] or "")[:80])
+    console.print(t)
+
+
+@train_app.command("add")
+def train_add(
+    name: str,
+    sources: list[str] = typer.Argument(..., help="Files (PDF, DOCX, PPTX, HTML, CSV, TXT, MD) and/or website addresses."),
+    max_pages: int = typer.Option(8, help="Pages to read per website."),
+):
+    """Give the agent documents or a website to learn from. They become searchable on calls
+    right away; run `callagent train build` to fold them into the playbook."""
+    from .training import service
+    from .training.ingest import IngestError
+
+    added: list[int] = []
+    for source in sources:
+        try:
+            with session_scope() as s:
+                c = _campaign_or_exit(s, name)
+                if source.lower().startswith(("http://", "https://")):
+                    doc = service.add_website(s, c, source, max_pages)
+                else:
+                    path = Path(source)
+                    if not path.is_file():
+                        raise IngestError("file not found")
+                    doc = service.add_file(s, c, path.name, path.read_bytes())
+                doc_id = doc.id
+            with console.status(f"Reading {source}..."), session_scope() as s:
+                service.process_document_sync(s, doc_id)
+            added.append(doc_id)
+        except IngestError as e:
+            console.print(f"[red]{source}:[/red] {e}")
+    with session_scope() as s:
+        rows = [service.describe(d) for d in service.list_documents(s, _campaign_or_exit(s, name)) if d.id in added]
+    if rows:
+        _print_documents(rows)
+
+
+@train_app.command("list")
+def train_list(name: str, all_versions: bool = typer.Option(False, "--all", help="Include replaced versions.")):
+    """Documents the agent has learned from, and any that could not be read."""
+    from .training import service
+
+    with session_scope() as s:
+        rows = [service.describe(d) for d in service.list_documents(s, _campaign_or_exit(s, name), all_versions)]
+    _print_documents(rows)
+
+
+@train_app.command("remove")
+def train_remove(name: str, document_id: int):
+    """Delete a document and everything learned from it."""
+    from .training import service
+
+    with session_scope() as s:
+        removed = service.remove_document(s, _campaign_or_exit(s, name), document_id)
+    console.print("Removed." if removed else "[red]No such document in this campaign.[/red]")
+
+
+@train_app.command("search")
+def train_search(name: str, question: str):
+    """What the agent would find for a question during a call."""
+    from .db import campaign_organization_id
+    from .training.search import load_index
+
+    with session_scope() as s:
+        c = _campaign_or_exit(s, name)
+        index = load_index(s, campaign_organization_id(s, c), c.id)
+        hits = index.search(question)
+    if not hits:
+        console.print(f"[yellow]Nothing found[/yellow] in {len(index)} passages. On a call the agent would offer a follow-up instead of guessing.")
+    for h in hits:
+        console.print(Panel(h.text, title=f"{h.source}  (score {h.score})", border_style="cyan"))
+
+
+@train_app.command("build")
+def train_build(name: str):
+    """Read the script and every document, and draft a new playbook version for review."""
+    from .playbook.analyzer import PlaybookAnalyzer
+    from .training import builder, versions
+
+    with console.status("Learning from the script and documents..."), session_scope() as s:
+        try:
+            v = builder.build_draft(s, _campaign_or_exit(s, name), PlaybookAnalyzer())
+        except builder.TrainingError as e:
+            raise typer.BadParameter(str(e)) from None
+        info, pb = versions.describe(v), Playbook.model_validate(v.playbook_json)
+    _print_playbook_summary(pb)
+    console.print(f"\n{info['note']}")
+    if pb.open_questions:
+        console.print("\n[bold]Knowledge gaps[/bold]")
+        for q in pb.open_questions:
+            console.print(f" - {'[red]*[/red] ' if q.blocking else ''}{q.question}")
+    console.print(f"\nDraft saved as [bold]version {info['version']}[/bold]. Calls still run the current version.")
+    console.print(f"Review: callagent playbook versions \"{name}\"    Go live: callagent playbook approve \"{name}\" {info['version']}")
 
 
 @leads_app.command("import")

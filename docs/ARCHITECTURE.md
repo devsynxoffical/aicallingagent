@@ -10,7 +10,7 @@ Last updated: 2026-11-13.
 
 `callagent` is a working single-company calling agent, driven from a command line
 and a small authenticated HTTP API. Everything below is implemented and covered by
-the test suite (77 tests, no network needed).
+the test suite (140 tests, no network needed).
 
 | Area | What it does today |
 |---|---|
@@ -23,7 +23,9 @@ the test suite (77 tests, no network needed).
 | After the call | A review model writes summary, disposition, interest, objections, next action, coaching notes; lead status and retry are updated. |
 | Safety | Twilio webhook signatures, per-call token on the media socket, bearer token on the control API. |
 
-Added in this release (see section 6): English/Arabic/French with automatic
+Added since (see section 6): training from uploaded documents and websites,
+knowledge lookup during calls, playbook version history with approval and rollback,
+and the first organization-scoped tables. Before that: English/Arabic/French with automatic
 detection and mid-call switching, speech providers behind adapters, AI disclosure
 and recording notice in the opening, inbound calls, real end-to-end response and
 interruption timing, a richer call report, and in-place database upgrades.
@@ -38,7 +40,7 @@ Status: **Done** = implemented and tested. **Partial** = works in a limited form
 | 2. Human-like conversation | Done | Needs real-call tuning per language (see section 7). |
 | 3. Low-latency streaming pipeline | Done | Per-stage and end-to-end timing recorded on every call. Speech-to-speech (Architecture A) not yet benchmarked against the modular pipeline. |
 | 4. Multilingual (EN/AR/FR) | Done in code | Detection, switching, native phrasing, language-aware fillers. **Not yet verified on real calls**: needs provider keys. |
-| 5. Sales training from uploads | Partial | Scripts as text/markdown only. No PDF/Word/URL ingestion, no retrieval over large document sets, no training dashboard, no approval step. |
+| 5. Sales training from uploads | Done in code (backend) | PDF, Word, PowerPoint, HTML, CSV, text and websites are read, indexed and searchable on calls; training produces a draft that needs approval; versions and rollback. Missing: OCR for scanned PDFs, call recordings as training input, the dashboard screens. The model-written parts (playbook draft, native phrasing) are untested without an Anthropic key. |
 | 6. Sales conversation engine | Done | Qualification, objections, closing live in the Playbook and prompt. |
 | 7. Appointment booking | Partial | Books into the local database and posts to a webhook. **Does not check real calendar availability.** No Google/Outlook, no rescheduling, reminders or no-show tracking. |
 | 8. Post-call analysis | Partial | Per-call report is complete. The improvement loop (patterns across calls, A/B tests, approval, deployment) is missing. |
@@ -47,7 +49,7 @@ Status: **Done** = implemented and tested. **Partial** = works in a limited form
 | 11. Agent personality | Partial | Persona is part of the playbook. Voice and speed are global settings. |
 | 12. Human handoff | Partial | Transfer works. The human does not yet receive the conversation summary. |
 | 13-14. Dashboard, live monitoring | Missing | No web interface at all. |
-| 15. Multi-tenant SaaS, roles | Missing | Single organization, single API token. |
+| 15. Multi-tenant SaaS, roles | Started | `organizations` table exists; campaigns, documents, knowledge and versions carry `organization_id`, and knowledge search requires it. Still one organization and one API token: no users, logins or roles yet. |
 | 16. Provider independence | Partial | Speech-to-text and voice are adapters. Telephony is still Twilio-specific; the model is Claude-specific. |
 | 17. Compliance | Partial | Do-not-call, opt-out, calling hours, AI disclosure, recording notice. No per-country rule sets, consent records, audit log or retention settings. |
 | 18. Benchmark suite | Missing | Timing is recorded per call; there is no repeatable cross-provider benchmark. |
@@ -127,7 +129,8 @@ Status: **Done** = implemented and tested. **Partial** = works in a limited form
 |---|---|---|
 | 1. Core voice engine | Outbound, inbound, streaming, barge-in, memory, call log, timing | **Done in code.** Real-call verification pending credentials. |
 | 2. Multilingual | Arabic, French, detection, switching, voices per language | **Done in code.** Real-call verification pending credentials. |
-| 3. AI training | PDF/Word/URL ingestion, retrieval, playbook versions, approval, training API | Next |
+| 3. AI training | PDF/Word/URL ingestion, retrieval, playbook versions, approval, training API | **Backend done in code.** Dashboard screens come with phase 6a. |
+| 6a. Accounts and dashboard | Users, login, roles, organization-scoped API, web dashboard (agents, training, leads, campaigns, calls) | **Next** |
 | 4. Sales automation | Real calendar availability (Google, Outlook), reminders, handoff summary, CRM sync, per-campaign rules, agent profiles | Planned |
 | 5. Post-call intelligence | Pattern mining, experiments, approval and rollout, comparison reports | Planned |
 | 6. SaaS and scale | Organizations, roles, row-level security, web dashboard, live monitoring, billing, worker split | Planned |
@@ -174,6 +177,58 @@ phase 6, because every table created from then on must be born tenant-scoped.
   objections handled, missed opportunities, unsupported statements, whether AI was
   disclosed, whether the language was right.
 - **Database.** New columns are added in place on start; existing data is untouched.
+
+### Training release (2026-11-13)
+
+- **Documents.** `callagent train add NAME file-or-url ...` or `POST /api/campaigns/{name}/documents`.
+  Files are checked before they are stored (type, size, and that the bytes match the
+  name), kept under a server-chosen name, read in the background, and given a status:
+  `pending`, `processing`, `ready`, `failed` (with a reason the uploader can act on).
+  A re-upload of the same filename is a new version; the old one leaves search but
+  stays on record.
+- **Websites.** The given page and same-site pages it links to, within a page limit,
+  honouring robots.txt. Every request and every redirect is checked so the server can
+  never be pointed at a private or internal address.
+- **Knowledge on calls.** When a campaign has documents, the agent gets a
+  `lookup_knowledge` tool and is told to use it before answering anything its
+  briefing does not cover, to answer only from what comes back, and to offer a
+  follow-up when nothing does. Each result carries its source (file and page, slide
+  or heading).
+- **How search works, and its limit.** Ranking is BM25 over normalized words (plurals,
+  accents, Arabic letter variants). It needs no extra service or key and takes
+  milliseconds. It matches words, not meaning: the agent is told to search in the
+  language the documents are written in, which covers a prospect asking in Arabic
+  about an English price sheet, but a question phrased with none of the document's
+  words can miss. If that shows up in real calls, the planned upgrade is embeddings in
+  pgvector behind the same `KnowledgeIndex` interface, judged on a fixed set of
+  question/answer pairs.
+- **Versions and approval.** Every playbook change is a version. A change the owner
+  makes directly goes live at once. A change the system proposes (training from
+  documents) is a draft: calls keep running the current version until someone
+  approves it, and a draft with unanswered blocking questions cannot be approved
+  without an explicit override. Approving an older version is a rollback.
+- **Organizations.** One default organization for now. Knowledge search takes the
+  organization and the campaign and applies both, so a campaign id from another
+  organization returns nothing.
+
+Known simplification: a "training project" and an "agent" are still the campaign
+itself. The roadmap's split (training project -> agent -> campaign) is made in phase
+6a, together with the API that needs it; splitting earlier would have meant
+rewriting the working dialer for no visible gain.
+
+## 6b. Decisions taken by default (change any of them)
+
+The roadmap lists six decisions. Work is proceeding on these defaults, none of which
+locks anything in yet:
+
+| Decision | Default in use | Why |
+|---|---|---|
+| Where the engine runs | Containerized; cloud or own server both work | The Dockerfile is the only assumption. Matters at phase 6 (scaling). |
+| Call direction | Outbound and inbound | Both are built. |
+| AI architecture | Claude plus specialized speech models; compare with speech-to-speech before changing | The brief asks for a benchmark, not an assumption. |
+| First market | Not chosen | Needed before the compliance rule sets and before any real campaign. |
+| Concurrent calls | Design target 50; one process handles a few today | Decides when voice workers are split from the API. |
+| First calendar | Google Calendar | The roadmap's own priority; Outlook second. |
 
 ## 7. Open items that need a decision or access
 

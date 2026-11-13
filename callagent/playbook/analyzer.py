@@ -20,6 +20,17 @@ How to work:
 - Extract, don't invent. Every value prop, proof point and price must be supported by
   the material. If the script implies something but does not say it, put it in
   open_questions instead of guessing.
+- The material may be several documents (each starts with "## Document: name", and
+  passages carry their source in square brackets). Check them against each other:
+  - Two documents disagree (two prices, two guarantees, two service lists): do not
+    pick one. Ask a blocking open question that names both sources.
+  - No pricing anywhere: pricing_and_terms stays empty and the agent will not quote.
+    Ask whether prices may be quoted, as an open question.
+  - A guarantee, a result or a customer claim with no evidence in the material
+    ("we double your revenue", "trusted by Fortune 500"): leave it out of value_props
+    and proof_points, add it to must_not_say, and ask the business to confirm it.
+  - Unclear target customer, missing contact details for follow-ups, or a service
+    that is named but never described: ask.
 - Translate script prose into conversational guidance. Phone calls are short turns:
   the talk tracks you write should sound like a relaxed human, never like reading.
 - Think about what will actually happen on the call: gatekeepers, voicemail, "how did

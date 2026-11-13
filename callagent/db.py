@@ -63,10 +63,26 @@ class Base(DeclarativeBase):
     pass
 
 
+DEFAULT_ORGANIZATION = "default"
+
+
+class Organization(Base):
+    """A customer company. Every piece of business data belongs to exactly one."""
+
+    __tablename__ = "organizations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+
 class Campaign(Base):
     __tablename__ = "campaigns"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Filled for every row at startup (see bootstrap_organizations); nullable only so
+    # databases created before organizations existed can be upgraded in place.
+    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(200), unique=True)
     script_text: Mapped[str] = mapped_column(Text, default="")
     playbook_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -152,6 +168,82 @@ class Appointment(Base):
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
 
+class TrainingDocument(Base):
+    """One uploaded file or website source a campaign's agent learns from."""
+
+    __tablename__ = "training_documents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(10), default="file")  # file | url
+    filename: Mapped[str] = mapped_column(String(300), default="")
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    file_type: Mapped[str] = mapped_column(String(16), default="")  # pdf, docx, pptx, html, csv, txt, md, url
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    storage_path: Mapped[str | None] = mapped_column(String(600), nullable=True)
+    # A re-upload of the same filename is a new version; older versions stay for audit.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # pending | processing | ready | failed | superseded
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    language: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    char_count: Mapped[int] = mapped_column(Integer, default=0)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_pages: Mapped[int] = mapped_column(Integer, default=1)  # website sources: pages to read
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    processed_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
+class KnowledgeChunk(Base):
+    """A passage of a training document the agent can look up during a call."""
+
+    __tablename__ = "knowledge_chunks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("training_documents.id"), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, default=0)
+    source_label: Mapped[str] = mapped_column(String(400), default="")  # "pricing.pdf, page 3"
+    text: Mapped[str] = mapped_column(Text, default="")
+
+
+class PlaybookVersion(Base):
+    """History of a campaign's playbook. Calls only ever run the active version."""
+
+    __tablename__ = "playbook_versions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    playbook_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="draft")  # draft | active | archived | rejected
+    source: Mapped[str] = mapped_column(String(30), default="")  # onboard | import | training | api | rollback ...
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(200), default="")
+    approved_by: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
+class TrainingRun(Base):
+    """One "learn from the script and documents" job and what it produced."""
+
+    __tablename__ = "training_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="running")  # running | done | failed
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[int | None] = mapped_column(Integer, nullable=True)  # the draft it produced
+    started_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
 class DoNotCall(Base):
     __tablename__ = "do_not_call"
 
@@ -176,7 +268,40 @@ def get_engine(database_url: str | None = None):
         _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
         Base.metadata.create_all(_engine)
         add_missing_columns(_engine)
+        bootstrap_organizations(_engine)
     return _engine
+
+
+def bootstrap_organizations(engine) -> int:
+    """Make sure the default organization exists and that every campaign belongs to one.
+    Until user accounts exist there is a single organization; data created before
+    organizations were introduced is assigned to it. Returns the default organization's id."""
+    with Session(engine) as s:
+        org = s.execute(select(Organization).where(Organization.name == DEFAULT_ORGANIZATION)).scalar_one_or_none()
+        if org is None:
+            org = Organization(name=DEFAULT_ORGANIZATION)
+            s.add(org)
+            s.flush()
+        s.execute(text("UPDATE campaigns SET organization_id = :org WHERE organization_id IS NULL"), {"org": org.id})
+        s.commit()
+        return org.id
+
+
+def default_organization_id(s: Session) -> int:
+    org = s.execute(select(Organization).where(Organization.name == DEFAULT_ORGANIZATION)).scalar_one_or_none()
+    if org is None:
+        org = Organization(name=DEFAULT_ORGANIZATION)
+        s.add(org)
+        s.flush()
+    return org.id
+
+
+def campaign_organization_id(s: Session, campaign: "Campaign") -> int:
+    """The organization a campaign belongs to (assigning the default one to a campaign created without)."""
+    if campaign.organization_id is None:
+        campaign.organization_id = default_organization_id(s)
+        s.flush()
+    return campaign.organization_id
 
 
 def add_missing_columns(engine) -> list[str]:

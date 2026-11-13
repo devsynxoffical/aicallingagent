@@ -17,7 +17,9 @@ from pydantic import BaseModel
 from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import select
 
-from .config import Settings, get_settings, resolve_api_token
+from .apideps import get_campaign as _get_campaign
+from .apideps import require_api_token
+from .config import Settings, get_settings
 from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
 from .dialer import twilio_client
 from .dialer.campaign_runner import TERMINAL_CALL_STATUSES, CampaignRunner, apply_twilio_status
@@ -25,6 +27,9 @@ from .leads.importer import import_leads
 from .leads.importer import normalize_phone
 from .playbook.schema import Playbook
 from .providers import SpeechPlan, speech_plan_problems
+from .training import versions
+from .training.api import router as training_router
+from .training.service import resume_unfinished
 from .voice.pipeline import run_call
 
 log = logging.getLogger("callagent.server")
@@ -44,24 +49,19 @@ async def lifespan(app: FastAPI):
     ids = await run_db(lambda s: [c.id for c in s.execute(select(Campaign).where(Campaign.status == "running")).scalars()])
     for cid in ids:
         await runner.start(cid)
+    # Training documents that were waiting or half-read when the process stopped.
+    await resume_unfinished()
     yield
     await runner.stop_all()
 
 
 app = FastAPI(title="callagent", lifespan=lifespan)
+app.include_router(training_router)
 
 
 def _runner() -> CampaignRunner:
     assert runner is not None
     return runner
-
-
-async def require_api_token(authorization: str | None = Header(default=None), settings: Settings = Depends(get_settings)):
-    """Every /api route needs `Authorization: Bearer <token>`. Twilio routes use signature validation instead."""
-    expected = resolve_api_token(settings)
-    given = authorization.split(" ", 1)[1].strip() if authorization and authorization.lower().startswith("bearer ") else ""
-    if not given or not _secrets.compare_digest(given, expected):
-        raise HTTPException(status_code=401, detail="missing or invalid API token (see DATA_DIR/api_token or API_TOKEN)")
 
 
 # ----------------------------------------------------------------------------- Twilio
@@ -295,13 +295,6 @@ def _speech_problems(pb: Playbook, settings: Settings) -> list[str]:
     return speech_plan_problems(settings, SpeechPlan.from_playbook(pb))
 
 
-def _get_campaign(s, name_or_id: str) -> Campaign:
-    c = s.get(Campaign, int(name_or_id)) if name_or_id.isdigit() else get_campaign_by_name(s, name_or_id)
-    if c is None:
-        raise HTTPException(404, f"campaign '{name_or_id}' not found")
-    return c
-
-
 @app.get("/health")
 async def health(settings: Settings = Depends(get_settings)):
     return {"ok": True, "missing_for_calls": settings.missing_for_calls()}
@@ -315,20 +308,14 @@ async def list_campaigns():
 @app.post("/api/campaigns", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def create_campaign(body: CampaignIn):
     def _create(s):
-        existing = get_campaign_by_name(s, body.name)
-        if existing:
-            existing.playbook_json = body.playbook.model_dump()
-            existing.script_text = body.script_text or existing.script_text
-            existing.status = "ready" if body.playbook.is_ready else "draft"
-            c = existing
-        else:
-            c = Campaign(
-                name=body.name,
-                playbook_json=body.playbook.model_dump(),
-                script_text=body.script_text,
-                status="ready" if body.playbook.is_ready else "draft",
-            )
+        c = get_campaign_by_name(s, body.name)
+        if c is None:
+            c = Campaign(name=body.name, status="draft")
             s.add(c)
+        c.script_text = body.script_text or c.script_text or ""
+        s.flush()
+        # A playbook sent to the API is the owner's own: it becomes the active version at once.
+        versions.record_active(s, c, body.playbook.model_dump(), source="api")
         s.flush()
         return _campaign_out(s, c)
 

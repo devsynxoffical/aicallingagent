@@ -22,6 +22,8 @@ class CallSession:
     mode: str = "live"  # live | voicemail | inbound
     direction: str = "outbound"  # outbound | inbound
     language: LanguageTracker | None = None
+    # Searchable passages of this campaign's training documents (None = nothing uploaded).
+    knowledge: Any = None
     transcript: list[dict[str, Any]] = field(default_factory=list)
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     disposition: str | None = None

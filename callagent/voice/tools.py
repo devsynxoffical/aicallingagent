@@ -37,7 +37,10 @@ DISPOSITIONS = [
 ]
 
 
-def build_tools_schema(playbook_capabilities: set[str], human_transfer_available: bool) -> ToolsSchema:
+KNOWLEDGE_RESULT_CHARS = 800
+
+
+def build_tools_schema(playbook_capabilities: set[str], human_transfer_available: bool, knowledge_available: bool = False) -> ToolsSchema:
     tools: list[FunctionSchema] = [
         FunctionSchema(
             name="log_call_outcome",
@@ -89,6 +92,23 @@ def build_tools_schema(playbook_capabilities: set[str], human_transfer_available
             required=["reason"],
         ),
     ]
+    if knowledge_available:
+        tools.append(
+            FunctionSchema(
+                name="lookup_knowledge",
+                description=(
+                    "Search the company's own documents (services, pricing, FAQs, policies) for a fact you were not "
+                    "briefed on. Use it before answering any specific question your briefing does not cover."
+                ),
+                properties={
+                    "query": {
+                        "type": "string",
+                        "description": "A few keywords, with a synonym or two, in the language the documents are written in. Example: 'payment posting turnaround time'.",
+                    }
+                },
+                required=["query"],
+            )
+        )
     if human_transfer_available:
         tools.append(
             FunctionSchema(
@@ -108,6 +128,7 @@ def register_tool_handlers(llm, session: CallSession) -> None:
     llm.register_function("send_followup_sms", _make(session, send_followup_sms))
     llm.register_function("mark_do_not_call", _make(session, mark_do_not_call))
     llm.register_function("end_call", _make(session, end_call))
+    llm.register_function("lookup_knowledge", _make(session, lookup_knowledge))
     llm.register_function("transfer_to_human", _make(session, transfer_to_human))
 
 
@@ -141,6 +162,27 @@ async def log_call_outcome(session: CallSession, params: FunctionCallParams) -> 
 
     await run_db(_save)
     return {"ok": True}
+
+
+async def lookup_knowledge(session: CallSession, params: FunctionCallParams) -> dict[str, Any]:
+    """Search this campaign's documents. The index was built for this organization and
+    campaign when the call started, so nothing else can be reached from here."""
+    query = str(params.arguments.get("query", "")).strip()
+    index = session.knowledge
+    if not query or index is None or len(index) == 0:
+        return {"ok": True, "results": [], "note": "Nothing on file. Do not guess: say a colleague will follow up with the details."}
+    hits = index.search(query, limit=3)
+    if not hits:
+        return {
+            "ok": True,
+            "results": [],
+            "note": "No matching passage. You may try once more with different keywords; otherwise do not guess, say a colleague will follow up.",
+        }
+    return {
+        "ok": True,
+        "results": [{"source": h.source, "text": h.text[:KNOWLEDGE_RESULT_CHARS]} for h in hits],
+        "note": "Answer only from these passages, briefly and in the prospect's language. If they do not answer the question, say so.",
+    }
 
 
 async def book_meeting(session: CallSession, params: FunctionCallParams) -> dict[str, Any]:

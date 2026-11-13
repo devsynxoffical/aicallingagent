@@ -164,6 +164,7 @@ def build_system_prompt(
     callback_number: str = "",
     human_transfer_available: bool = False,
     call_recorded: bool = False,
+    knowledge_languages: tuple[str, ...] | None = None,
 ) -> str:
     tz_name = lead.get("timezone") or "UTC"
     try:
@@ -309,5 +310,21 @@ Objections:
 {objections or "- (use the general guidance above)"}
 """
 
-    parts = [identity, disclosure_block, language, goal, plan, localized, context, HUMAN_STYLE_RULES, TOOL_RULES]
+    knowledge = ""
+    if knowledge_languages is not None:
+        written_in = ", ".join(language_name(l) for l in knowledge_languages) or "English"
+        knowledge = f"""# Looking things up
+The company's documents are on file and searchable with lookup_knowledge.
+- When the prospect asks something specific this briefing does not answer (a service
+  detail, a price, a policy, a number), look it up before you answer. Say a short
+  natural bridge first ("Let me check that for you") so there is no silence.
+- The documents are written in {written_in}. Write your search query in that language,
+  whatever language the prospect is speaking, then answer in the prospect's language.
+- Answer only from what the search returns. If it returns nothing useful, say you will
+  have a colleague follow up, and note the question with log_call_outcome. Never fill
+  the gap from general knowledge.
+- Do not look things up for small talk or for anything already in this briefing.
+"""
+
+    parts = [identity, disclosure_block, language, goal, plan, localized, context, knowledge, HUMAN_STYLE_RULES, TOOL_RULES]
     return "\n".join(part for part in parts if part)

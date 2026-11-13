@@ -35,12 +35,13 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPI
 from ..config import Settings, get_settings
 from datetime import timedelta
 
-from ..db import CallRun, Campaign, Lead, run_db, utcnow
+from ..db import CallRun, Campaign, Lead, campaign_organization_id, run_db, utcnow
 from ..languages import LanguageSwitch, LanguageTracker
 from ..playbook.prompt_builder import build_system_prompt
 from ..playbook.schema import Playbook
 from ..postcall.summarizer import finalize_call
 from ..providers import SpeechPlan, get_stt, get_tts
+from ..training.search import KnowledgeIndex, load_index
 from .fillers import FillerProcessor
 from .language_follower import LanguageFollower
 from .latency import LatencyMonitor, record_response_latency, summarize
@@ -62,7 +63,7 @@ SILENCE_GOODBYE = {
 }
 
 
-async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook, int, str | None, str]:
+async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook, int, str | None, str, KnowledgeIndex]:
     def _load(s):
         run = s.get(CallRun, call_run_id)
         if run is None:
@@ -85,7 +86,9 @@ async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook,
         }
         run.status = "in-progress"
         run.stream_connected = True
-        return lead_dict, Playbook.model_validate(campaign.playbook_json), campaign.id, run.twilio_call_sid, run.direction or "outbound"
+        # Built once per call, for this organization and campaign only.
+        knowledge = load_index(s, campaign_organization_id(s, campaign), campaign.id)
+        return lead_dict, Playbook.model_validate(campaign.playbook_json), campaign.id, run.twilio_call_sid, run.direction or "outbound", knowledge
 
     return await run_db(_load)
 
@@ -112,18 +115,18 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
     settings = settings or get_settings()
     call_run_id = int(body.get("call_run_id", 0))
     mode = str(body.get("mode", "live"))
-    lead, playbook, campaign_id, stored_sid, direction = await load_call_context(call_run_id)
+    lead, playbook, campaign_id, stored_sid, direction, knowledge = await load_call_context(call_run_id)
     if direction == "inbound":
         mode = "inbound"
     try:
-        await _run_call(websocket, stream_sid, stored_sid or call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings, direction)
+        await _run_call(websocket, stream_sid, stored_sid or call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings, direction, knowledge)
     except Exception as e:
         log.exception("call %s: could not start the voice pipeline", call_run_id)
         await mark_call_setup_failed(call_run_id, f"pipeline setup failed: {e}", settings)
         raise
 
 
-async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings, direction="outbound") -> None:
+async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings, direction="outbound", knowledge=None) -> None:
     plan = SpeechPlan.from_playbook(playbook)
     session = CallSession(
         call_run_id=call_run_id,
@@ -135,7 +138,9 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
         mode=mode,
         direction=direction,
         language=LanguageTracker(allowed=plan.languages),
+        knowledge=knowledge,
     )
+    has_knowledge = knowledge is not None and len(knowledge) > 0 and mode != "voicemail"
 
     human_transfer = bool(settings.human_transfer_number)
     system_prompt = build_system_prompt(
@@ -146,6 +151,7 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
         human_transfer_available=human_transfer,
         # Outbound recording is requested when the call is placed; inbound calls are not recorded yet.
         call_recorded=settings.record_calls and direction == "outbound",
+        knowledge_languages=knowledge.languages if has_knowledge else None,
     )
 
     # ---- transport
@@ -189,7 +195,7 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
 
     # ---- memory & turn-taking
     capabilities = {c.key for c in playbook.required_capabilities}
-    context = LLMContext(tools=build_tools_schema(capabilities, human_transfer))
+    context = LLMContext(tools=build_tools_schema(capabilities, human_transfer, knowledge_available=has_knowledge))
     user_params = LLMUserAggregatorParams(
         vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.7, start_secs=0.2, stop_secs=0.25, min_volume=0.5)),
         user_idle_timeout=settings.user_idle_seconds,
