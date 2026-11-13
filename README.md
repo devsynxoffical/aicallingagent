@@ -195,6 +195,45 @@ callagent campaign coach "BrightBooks Q4"    # draft an improved playbook from p
   Prices, terms, proof points, compliance lines, the call goal and language settings
   are copied back from the current playbook whatever the model wrote.
 
+- **Lead intelligence API.** `GET /api/campaigns/{name}/leads` filters by `category`
+  (hot, warm, cold, unscored), `status`, `intent` (high, medium, low buying intent from
+  the latest reviewed call), `min_score`/`max_score` and `q`, with `limit`/`offset`.
+  Each lead carries its score, the points each factor contributed, the evidence and
+  quotes, objections with how many were handled, the lost reason and the recommended
+  next action. `GET /api/campaigns/{name}/leads/{id}` adds every call with its review
+  and transcript.
+- **Version comparison.** `GET /api/campaigns/{name}/versions/{n}/diff` lists, field by
+  field, what a version removes and adds compared with the live playbook. A coach draft
+  also stores each recommendation with its evidence (`changes` on the version).
+
+### A/B tests of playbook versions
+
+```
+POST /api/campaigns/{name}/experiments            {"variant_version": 3, "variant_share": 0.5, "min_answered_per_arm": 50}
+GET  /api/campaigns/{name}/experiments            every test with current results
+POST /api/campaigns/{name}/experiments/{id}/stop     end it, keep the live version
+POST /api/campaigns/{name}/experiments/{id}/promote  end it, make the variant live
+```
+
+- One running test per campaign, so two tests can never share leads (a second start
+  is refused with 409).
+- A lead's side comes from a hash of the test and the lead: random across leads, and
+  the same on every retry and callback. Only leads never dialed before the test take
+  part. Each call records the test, the side and the playbook version it ran, and the
+  voice pipeline loads that pinned version.
+- Results are counted per lead. No side is called ahead until both have the required
+  number of answered leads (minimum 30) and a two-proportion test puts the difference
+  below 5% chance. Until then the verdict is `collecting` or `no_clear_difference`.
+- Promotion is a person's decision and is refused unless the verdict is
+  `variant_ahead` (`force` overrides, on record). Nothing is published automatically.
+
+### Dashboard
+
+The web dashboard lives in the `devytalk` repository (`apps/web`, under `/dashboard`).
+It signs in with this engine's API token, keeps it in an httpOnly cookie, and reaches
+the engine only through its own server-side proxy, so no key ever reaches the browser.
+Point it here with `DEVYTALK_API_URL`.
+
 ## Languages: English, Arabic, French
 
 ```bash
@@ -395,6 +434,10 @@ examples/                sample script + sample lead sheet
 ```bash
 pytest
 ```
+
+`tests/seed_dashboard.py` fills an **empty** database with invented campaigns for the
+dashboard's browser tests. It is test-only: nothing in the product runs it, and it
+refuses a database that already has a campaign.
 
 ## Notes on compliance
 

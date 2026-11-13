@@ -230,6 +230,26 @@ phase 6, because every table created from then on must be born tenant-scoped.
   version with evidence per change, and cannot alter prices, proof points, compliance
   lines, the call goal or language settings (they are copied back in code).
 
+### Dashboard and optimization release (2026-11-13)
+
+- **A/B tests** (`intelligence/experiments.py`, table `experiments`): one running test
+  per campaign; deterministic per-lead allocation (sha256 of test id and lead id);
+  only never-dialed leads take part; both sides pinned to a version number; results per
+  lead; a leader is named only with the required answered leads on both sides and
+  p < 0.05; promotion is manual and refused without that evidence.
+- **Calls record their test** (`call_runs.experiment_id`, `experiment_arm`) and the
+  voice pipeline loads the pinned version for such calls (`voice/pipeline.py`).
+- **Lead API**: filters, pagination, per-lead intelligence and a detail endpoint with
+  call history (`intelligence/api.py`).
+- **Version diff** and structured coach recommendations (`training/versions.py`,
+  `playbook_versions.changes_json`).
+- **Dashboard** (repository `devytalk`, `apps/web/src/app/dashboard`): performance,
+  leads, coach and playbook approval, A/B tests. Authenticates with the engine's API
+  token held in an httpOnly cookie; all requests go through a server-side proxy limited
+  to `/api/*`; every response is schema-checked before it is rendered.
+- Still one organization and one shared operator token: per-user accounts and roles
+  are not built. The dashboard records approvals as made by "dashboard".
+
 Known simplification: a "training project" and an "agent" are still the campaign
 itself. The roadmap's split (training project -> agent -> campaign) is made in phase
 6a, together with the API that needs it; splitting earlier would have meant
