@@ -36,6 +36,8 @@ app.add_typer(playbook_app, name="playbook")
 app.add_typer(train_app, name="train")
 db_app = typer.Typer(help="Database schema: status, upgrade, integrity check.")
 app.add_typer(db_app, name="db")
+users_app = typer.Typer(help="People who sign in to the console, and their roles.")
+app.add_typer(users_app, name="users")
 
 console = Console()
 
@@ -783,3 +785,92 @@ def doctor():
 
 if __name__ == "__main__":
     app()
+
+
+# ----------------------------------------------------------------------------- users
+
+
+def _user_or_exit(s, email: str):
+    from . import accounts
+
+    user = accounts.get_user_by_email(s, email)
+    if user is None:
+        raise typer.BadParameter(f"no account for {email}")
+    return user
+
+
+@users_app.command("add")
+def users_add(
+    email: str,
+    name: str = typer.Option("", help="The person's name."),
+    role: str = typer.Option("viewer", help="viewer (reads), operator (runs campaigns) or admin (also approves, sets rules, manages users)."),
+    password: str = typer.Option(..., prompt=True, hide_input=True, confirmation_prompt=True, help="At least 10 characters. Asked for when not given."),
+):
+    """Create an account. The first admin is usually created this way."""
+    from . import accounts
+
+    with session_scope() as s:
+        try:
+            user = accounts.describe(accounts.create_user(s, email, password, name=name, role=role))
+        except accounts.AccountError as e:
+            raise typer.BadParameter(str(e)) from None
+    console.print(f"[green]Created[/green] {user['email']} with the {user['role']} role.")
+
+
+@users_app.command("list")
+def users_list():
+    """Everyone who has an account."""
+    from . import accounts
+
+    with session_scope() as s:
+        rows = [accounts.describe(u) for u in accounts.list_users(s)]
+    table = Table("Email", "Name", "Role", "State", "Last sign-in")
+    for u in rows:
+        table.add_row(u["email"], u["name"], u["role"], "active" if u["active"] else "deactivated", (u["last_login_at"] or "never")[:16])
+    console.print(table)
+
+
+@users_app.command("role")
+def users_role(email: str, role: str):
+    """Change a person's role."""
+    from . import accounts
+
+    with session_scope() as s:
+        try:
+            accounts.update_user(s, _user_or_exit(s, email), actor=accounts.API_TOKEN_PRINCIPAL, role=role)
+        except accounts.AccountError as e:
+            raise typer.BadParameter(str(e)) from None
+    console.print(f"{email} now has the {role} role.")
+
+
+@users_app.command("deactivate")
+def users_deactivate(email: str):
+    """Stop a person signing in and end their sessions. Their history is kept."""
+    from . import accounts
+
+    with session_scope() as s:
+        accounts.update_user(s, _user_or_exit(s, email), actor=accounts.API_TOKEN_PRINCIPAL, active=False)
+    console.print(f"{email} can no longer sign in.")
+
+
+@users_app.command("activate")
+def users_activate(email: str):
+    """Let a deactivated person sign in again."""
+    from . import accounts
+
+    with session_scope() as s:
+        accounts.update_user(s, _user_or_exit(s, email), actor=accounts.API_TOKEN_PRINCIPAL, active=True)
+    console.print(f"{email} can sign in again.")
+
+
+@users_app.command("password")
+def users_password(email: str, password: str = typer.Option(..., prompt=True, hide_input=True, confirmation_prompt=True)):
+    """Set a new password for a person and end their sessions."""
+    from . import accounts
+
+    with session_scope() as s:
+        try:
+            accounts.set_password(s, _user_or_exit(s, email), password)
+        except accounts.AccountError as e:
+            raise typer.BadParameter(str(e)) from None
+    console.print(f"New password set for {email}.")

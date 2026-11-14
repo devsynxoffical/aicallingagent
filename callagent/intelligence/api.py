@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 
-from ..apideps import get_campaign, require_api_token
+from ..apideps import acting_as, get_campaign, require_api_token
 from ..config import Settings, get_settings
 from pydantic import BaseModel, Field
 
@@ -193,14 +193,14 @@ async def list_experiments(name: str):
 
 
 @router.post("/experiments", status_code=201)
-async def start_experiment(name: str, body: ExperimentIn):
+async def start_experiment(name: str, body: ExperimentIn, request: Request):
     """Test a playbook version against the live one on leads that have not been dialed yet."""
 
     def _start(s):
         try:
             experiment = experiments.start(
                 s, get_campaign(s, name), body.variant_version, name=body.name, variant_share=body.variant_share,
-                min_answered_per_arm=body.min_answered_per_arm, by=body.started_by,
+                min_answered_per_arm=body.min_answered_per_arm, by=acting_as(request, body.started_by),
             )
         except experiments.ExperimentError as e:
             raise HTTPException(409 if "already has a test" in str(e) else 400, str(e)) from None
@@ -221,13 +221,13 @@ async def get_experiment(name: str, experiment_id: int):
 
 
 @router.post("/experiments/{experiment_id}/stop")
-async def stop_experiment(name: str, experiment_id: int, body: ExperimentEndIn | None = None):
+async def stop_experiment(name: str, experiment_id: int, request: Request, body: ExperimentEndIn | None = None):
     """End the test and keep the live version."""
     body = body or ExperimentEndIn()
 
     def _stop(s):
         try:
-            return experiments.results(s, experiments.stop(s, get_campaign(s, name), experiment_id, by=body.by))
+            return experiments.results(s, experiments.stop(s, get_campaign(s, name), experiment_id, by=acting_as(request, body.by)))
         except experiments.ExperimentError as e:
             raise HTTPException(400, str(e)) from None
 
@@ -235,14 +235,14 @@ async def stop_experiment(name: str, experiment_id: int, body: ExperimentEndIn |
 
 
 @router.post("/experiments/{experiment_id}/promote")
-async def promote_experiment(name: str, experiment_id: int, body: ExperimentEndIn | None = None):
+async def promote_experiment(name: str, experiment_id: int, request: Request, body: ExperimentEndIn | None = None):
     """End the test and make the variant the live version. Refused unless the results favour
     the variant, or ``force`` is set."""
     body = body or ExperimentEndIn()
 
     def _promote(s):
         try:
-            return experiments.results(s, experiments.promote(s, get_campaign(s, name), experiment_id, by=body.by, force=body.force))
+            return experiments.results(s, experiments.promote(s, get_campaign(s, name), experiment_id, by=acting_as(request, body.by), force=body.force))
         except experiments.ExperimentError as e:
             raise HTTPException(400, str(e)) from None
 

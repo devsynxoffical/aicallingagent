@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from .. import background as work
 from .. import jobs
-from ..apideps import get_campaign, require_api_token
+from ..apideps import acting_as, get_campaign, require_api_token
 from ..config import Settings, get_settings
 from ..db import TrainingRun, campaign_organization_id, run_db
 from . import service, versions
@@ -187,13 +187,13 @@ async def diff_version(name: str, number: int):
 
 
 @router.post("/versions/{number}/approve")
-async def approve_version(name: str, number: int, body: ApprovalIn | None = None):
+async def approve_version(name: str, number: int, request: Request, body: ApprovalIn | None = None):
     """Make this version the one calls run. Approving an older version is a rollback."""
     body = body or ApprovalIn()
 
     def _approve(s):
         try:
-            return versions.describe(versions.approve(s, get_campaign(s, name), number, by=body.approved_by, force=body.force))
+            return versions.describe(versions.approve(s, get_campaign(s, name), number, by=acting_as(request, body.approved_by), force=body.force))
         except versions.VersionError as e:
             raise _bad_request(e) from None
 
@@ -201,12 +201,12 @@ async def approve_version(name: str, number: int, body: ApprovalIn | None = None
 
 
 @router.post("/versions/{number}/reject")
-async def reject_version(name: str, number: int, body: ApprovalIn | None = None):
+async def reject_version(name: str, number: int, request: Request, body: ApprovalIn | None = None):
     body = body or ApprovalIn()
 
     def _reject(s):
         try:
-            return versions.describe(versions.reject(s, get_campaign(s, name), number, by=body.approved_by, reason=body.reason))
+            return versions.describe(versions.reject(s, get_campaign(s, name), number, by=acting_as(request, body.approved_by), reason=body.reason))
         except versions.VersionError as e:
             raise _bad_request(e) from None
 

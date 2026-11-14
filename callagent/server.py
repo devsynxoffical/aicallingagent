@@ -21,6 +21,8 @@ from sqlalchemy.exc import IntegrityError
 
 from . import background, jobs
 from .apideps import get_campaign as _get_campaign
+from .accounts.api import public as accounts_public_router
+from .accounts.api import router as accounts_router
 from .apideps import require_api_token
 from .config import Settings, get_settings
 from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
@@ -75,6 +77,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="callagent", lifespan=lifespan)
 app.include_router(training_router)
 app.include_router(intelligence_router)
+app.include_router(accounts_public_router)
+app.include_router(accounts_router)
 
 
 def _runner() -> CampaignRunner:

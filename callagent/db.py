@@ -367,6 +367,37 @@ class UsageRecord(Base):
     __table_args__ = (Index("uq_usage_records_call_kind", "call_run_id", "kind", unique=True),)
 
 
+class User(Base):
+    """A person who signs in to the console. What they may do is decided by their role."""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True)  # stored lower-case
+    name: Mapped[str] = mapped_column(String(200), default="")
+    role: Mapped[str] = mapped_column(String(12), default="viewer")  # admin | operator | viewer
+    password_hash: Mapped[str] = mapped_column(String(300))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    failed_logins: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
+class UserSession(Base):
+    """One sign-in. Only a hash of the session token is stored, so the table cannot be used to sign in."""
+
+    __tablename__ = "user_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(TZDateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
 class Job(Base):
     """A unit of background work that must not be lost: it survives restarts, is retried
     with backoff, and ends either done or dead (kept, with its error, for a person to see).

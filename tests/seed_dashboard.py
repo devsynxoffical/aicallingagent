@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select  # noqa: E402
 
-from callagent import db  # noqa: E402
+from callagent import accounts, db  # noqa: E402
 from callagent.config import get_settings  # noqa: E402
 from callagent.dialer import rules  # noqa: E402
 from callagent.intelligence import experiments  # noqa: E402
@@ -31,6 +31,8 @@ from callagent.playbook.schema import Objection  # noqa: E402
 from callagent.postcall.summarizer import CallReview, ObjectionEvent, QualificationEvidence  # noqa: E402
 from callagent.training import versions  # noqa: E402
 from fixtures import make_sample_playbook  # noqa: E402
+
+TEST_PASSWORD = "e2e-test-password"
 
 # Calls are spread over the eleven days before the seed runs, so "the last two weeks" has something in it.
 START = (datetime.now(timezone.utc) - timedelta(days=11)).replace(hour=9, minute=0, second=0, microsecond=0)
@@ -206,7 +208,10 @@ def main() -> None:
         _accounting(s)
         _dental(s)
         _empty(s)
-    print("Seeded 3 test campaigns.")
+        # One test account per role. The password is a fixture value, used by the browser tests only.
+        for role in accounts.ROLES:
+            accounts.create_user(s, f"{role}@example.test", TEST_PASSWORD, name=f"Test {role.title()}", role=role)
+    print("Seeded 3 test campaigns and 3 test accounts.")
 
 
 if __name__ == "__main__":
