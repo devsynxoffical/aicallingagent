@@ -7,6 +7,7 @@ Everything here is counted from stored call reviews. Nothing is estimated by a m
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -14,10 +15,12 @@ from sqlalchemy.orm import Session
 
 from ..db import CallRun, Campaign, Lead
 from ..dialer.rules import campaign_spend
+from .economics import CONVERSIONS, spend_by_call, week_of  # noqa: F401  (CONVERSIONS is read from here by other modules)
 
-CONVERSIONS = {"meeting_booked", "sale_closed"}
 # Below this many answered calls a rate is noise, not a result.
 MIN_CALLS_TO_COMPARE = 30
+# A week's figures for one playbook version are shown from the first call, and marked thin below this many answered.
+MIN_CALLS_PER_WEEK = 10
 
 
 def _rate(part: int, whole: int) -> float | None:
@@ -25,7 +28,7 @@ def _rate(part: int, whole: int) -> float | None:
 
 
 def _group() -> dict[str, Any]:
-    return {"calls": 0, "answered": 0, "conversions": 0, "quality_sum": 0, "quality_n": 0}
+    return {"calls": 0, "answered": 0, "conversions": 0, "quality_sum": 0, "quality_n": 0, "spend": Decimal("0")}
 
 
 def _close(group: dict[str, Any]) -> dict[str, Any]:
@@ -35,6 +38,10 @@ def _close(group: dict[str, Any]) -> dict[str, Any]:
         "conversions": group["conversions"],
         "conversion_rate": _rate(group["conversions"], group["answered"]),
         "average_quality": round(group["quality_sum"] / group["quality_n"], 2) if group["quality_n"] else None,
+        # How many calls the average is over: the calls that were reviewed.
+        "reviewed": group["quality_n"],
+        "spend_usd": round(float(group["spend"]), 4),
+        "cost_per_conversion": round(float(group["spend"]) / group["conversions"], 2) if group["conversions"] and group["spend"] else None,
         "enough_data": group["answered"] >= MIN_CALLS_TO_COMPARE,
     }
 
@@ -49,6 +56,9 @@ def campaign_report(s: Session, campaign: Campaign) -> dict[str, Any]:
     by_version: dict[str, dict[str, Any]] = defaultdict(_group)
     by_language: dict[str, dict[str, Any]] = defaultdict(_group)
     by_direction: dict[str, dict[str, Any]] = defaultdict(_group)
+    # Week by week, per playbook version: whether quality and results moved when the playbook did.
+    by_week: dict[tuple[str, str], dict[str, Any]] = defaultdict(_group)
+    cost_of = spend_by_call(s, campaign.id)
     missed: Counter[str] = Counter()
     unsupported: list[dict[str, Any]] = []
     answered = conversions = reviewed = 0
@@ -61,11 +71,14 @@ def campaign_report(s: Session, campaign: Campaign) -> dict[str, Any]:
             dispositions[run.disposition] += 1
         answered += was_answered
         conversions += converted
-        for key, bucket in ((str(run.playbook_version or "unknown"), by_version), (run.language or "unknown", by_language), (run.direction or "outbound", by_direction)):
+        version = str(run.playbook_version or "unknown")
+        for key, bucket in ((version, by_version), (run.language or "unknown", by_language), (run.direction or "outbound", by_direction),
+                            ((week_of(run.started_at), version), by_week)):
             group = bucket[key]
             group["calls"] += 1
             group["answered"] += was_answered
             group["conversions"] += converted
+            group["spend"] += cost_of.get(run.id, Decimal("0"))
             if review.get("agent_quality_score") is not None:
                 group["quality_sum"] += review["agent_quality_score"]
                 group["quality_n"] += 1
@@ -139,6 +152,9 @@ def campaign_report(s: Session, campaign: Campaign) -> dict[str, Any]:
         "missed_opportunities": [{"text": text, "calls": n} for text, n in missed.most_common(10)],
         "unsupported_statements": unsupported[:50],
         "by_playbook_version": versions,
+        # Oldest week first. A week with few answered calls is there, marked as not enough to compare.
+        "quality_by_week": [{"week": week, "playbook_version": version, **_close(group), "enough_data": group["answered"] >= MIN_CALLS_PER_WEEK}
+                            for (week, version), group in sorted(by_week.items())],
         # Named only when at least two versions each have enough answered calls to compare.
         "best_version": best,
         "by_language": {key: _close(group) for key, group in sorted(by_language.items())},

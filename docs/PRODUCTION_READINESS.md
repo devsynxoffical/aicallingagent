@@ -179,15 +179,20 @@ the environment's settings, not in a conversation.
 In order of what they block. Details in the audit's "Still open" table.
 
 1. **Sign-up without the operator**: an organization is created by the operator,
-   who also assigns its caller numbers.
+   who also assigns its caller numbers. Its people now join by invitation link and
+   choose their own passwords (section 15); the organization itself is still made
+   by the operator.
 2. **A phone provider account per organization**: every organization's numbers
    are numbers of the deployment's one account.
 3. **Invoices, payments, plans, taxes, balances.** The ledger is what they would be
-   drawn from.
-4. **Data retention and erasure.**
+   drawn from. Monthly statements of usage exist (section 15); they are not
+   invoices.
+4. **Data retention and erasure**: built since (section 15). Recordings at the phone
+   provider and old backups are not reached.
 5. **Copying backups off the machine**; point-in-time recovery.
-6. **Password reset by email, a second factor** (A-13); a sign-in limit per address
-   on the engine (A-12).
+6. **A second factor, and a password reset a person can start themselves by
+   email** (A-13): an admin makes a reset link instead (section 15). A sign-in limit
+   per address on the engine (A-12).
 7. **Automatic provider fallback** (deliberately), and a written manual procedure.
 8. **A limit on concurrent calls across all campaigns of a deployment** (B-16).
 9. **The campaign report, timeline and export computed in the database** (D-4).
@@ -289,8 +294,31 @@ In this order:
 
 1. **Provider validation** (the pilot list above). Everything else rests on it, and
    it will change what else is worth doing.
-2. **Sign-up, plans and statements**: what selling to many customers needs.
-3. **Retention and erasure**, with the customer's requirements.
+2. **Plans, invoices and payments**, which need a payment provider. Invitations and
+   statements exist.
+3. **The legal questions in `COMPLIANCE.md`, section 4**, answered for the first
+   market. The mechanisms exist; whether a configuration is lawful is not known.
 4. **The report in SQL and pruning of old rows** (D-4, D-9), once real campaign
    sizes are known.
 5. **An outside security review.**
+
+## 15. Built after this report was first written
+
+Everything below is at the evidence level "tested with stand-ins": automated tests
+on SQLite and PostgreSQL, the console in a real browser against a real engine
+process, and **no provider, no real receiver and no real customer**.
+
+| What | Where | Not covered |
+| --- | --- | --- |
+| Each organization's own caller numbers, transfer number, booking webhook and rates; API keys per organization | `orgsettings.py`, `tests/test_organization_settings.py` | One phone provider account still serves every organization |
+| Consent on record per lead and a rule to call only with it; do-not-call import, listing and removal; erasing a person; a retention period | `privacy.py`, `COMPLIANCE.md`, `tests/test_privacy.py` | Whether any setting satisfies the law of a market; recordings at the provider; backups |
+| Signed webhooks per organization for call, booking, campaign and playbook events, with retries, switching off, a test delivery and redelivery | `webhooks.py`, `outbound.py`, `WEBHOOKS.md`, `tests/test_webhooks.py` | A delivery to a real receiver; a connector for a named CRM |
+| Joining by a one-time link; password reset by link; a new organization handed to its admin by link | `accounts/invitations.py`, `tests/test_invitations.py` | Email delivery: the admin passes the link on. A second factor |
+| Monthly statements from the ledger, with every line as CSV | `billing.py`, `BILLING_ARCHITECTURE.md` | Invoices, tax, payment; any amount against a provider's invoice |
+| Unit economics: cost per call, per connected call, per minute and per booked meeting, by campaign and by week; quality and cost per playbook version week by week | `intelligence/economics.py`, `intelligence/report.py`, `tests/test_economics.py` | Any figure from a real campaign: the tests use made-up calls |
+| A handover brief when the agent transfers a call: who it is, the agent's note, the last things they said | `voice/tools.py`, `tests/test_call_safety.py` | The colleague hears nothing on the line: it is a cold transfer with the brief in the console and the webhook. Speaking it to them before connecting needs a real call to get right |
+
+Migrations 0014 to 0017. Still not built: a semantic knowledge index (it needs an
+embeddings model and real documents to judge whether it beats the present search),
+connectors for named CRMs, payments.
+

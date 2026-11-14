@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from callagent import db
+from callagent import db, events, webhooks
 from callagent.config import Settings
 from callagent.db import session_scope
 from callagent.dialer import twilio_client
@@ -136,6 +136,33 @@ def test_a_transfer_the_provider_refuses_is_not_recorded_as_done(call, monkeypat
     monkeypatch.setattr(twilio_client, "transfer_call", lambda *args: None)
     assert use(call, "transfer_to_human")["ok"] is True
     assert (call.disposition, call.ended_by_agent) == ("transferred_to_human", True)
+
+
+def test_the_colleague_who_takes_over_a_call_is_told_who_it_is_and_what_they_want(call, monkeypatch):
+    monkeypatch.setattr(twilio_client, "transfer_call", lambda *args: None)
+    call.lead.update(first_name="Maria", last_name="Lopez", company="Lopez Dental")
+    for role, text in (("assistant", "Hi Maria."), ("user", "We have three clinics."), ("user", "  "), ("user", "What does it cost for all three?"),
+                       ("assistant", "Let me get a colleague."), ("user", "Yes please."), ("user", "I only have five minutes.")):
+        call.transcript.append({"role": role, "text": text})
+    call.booked_times.add("2026-12-01T15:00:00+00:00")
+
+    note = "Wants a quote for three clinics.\n  Has five minutes. " + "x" * 2000
+    assert use(call, "transfer_to_human", context_for_colleague=note)["ok"] is True
+
+    with session_scope() as s:
+        run = s.get(db.CallRun, call.call_run_id)
+        brief = run.summary["handover"]
+        event = next(e for e in events.for_call(s, run.id) if e.type == "CallTransferred")
+        sent = webhooks.body_for(s, event)
+    assert (brief["name"], brief["company"], brief["phone"]) == ("Maria Lopez", "Lopez Dental", "+14155550100")
+    assert brief["agent_note"].startswith("Wants a quote for three clinics. Has five minutes. x") and len(brief["agent_note"]) == tools.HANDOVER_CONTEXT_CHARS
+    assert brief["prospect_last_said"] == ["What does it cost for all three?", "Yes please.", "I only have five minutes."]  # their words, not the agent's
+    assert brief["meetings_booked"] == ["2026-12-01T15:00:00+00:00"] and brief["seconds_into_call"] >= 0
+    # The organization's own systems are told the same, with the event.
+    assert sent["type"] == "call.transferred" and sent["call"]["handover"] == brief and sent["data"]["agent_note"] == brief["agent_note"]
+
+    # Without a note from the agent, the brief still says who it is and what they said last.
+    assert tools.handover_brief(call)["agent_note"] == "" and tools.handover_brief(call)["prospect_last_said"][-1] == "I only have five minutes."
 
 
 def test_a_tool_that_fails_tells_the_model_what_to_say_not_what_broke(call, monkeypatch):

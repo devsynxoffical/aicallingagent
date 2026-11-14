@@ -583,6 +583,19 @@ async def usage_ledger(days: int = 30, campaign: str | None = None, limit: int =
     return await run_db(_q)
 
 
+@app.get("/api/economics", dependencies=[Depends(require_api_token)])
+async def unit_economics(days: int = 30, campaign: str | None = None):
+    """What a result costs the caller's organization over the last ``days`` days: per
+    call, per connected call, per minute and per booked meeting, in total, by campaign
+    and week by week. Amounts are sums over the usage ledger."""
+    from datetime import timedelta
+
+    from .intelligence.economics import economics
+
+    since = utcnow() - timedelta(days=max(1, min(days, 366)))
+    return await run_db(lambda s: economics(s, organization_id(), since, _get_campaign(s, campaign).id if campaign else None))
+
+
 @app.get("/api/usage/statements", dependencies=[Depends(require_api_token)])
 async def usage_statements():
     """The months the caller's organization has usage in, newest first, with each month's total."""

@@ -553,6 +553,13 @@ calls, AI and corrections added up from the ledger, with a CSV of every line. A
 month that is over never changes. It is a statement of usage, not a tax invoice;
 nothing here takes a payment.
 
+What a result costs is read from `GET /api/economics?days=30`: cost per call, per
+connected call, per minute and per booked meeting, in total, by campaign and week
+by week, summed from the ledger. A ratio with nothing under it is absent, not zero,
+and a cost per meeting from fewer than five meetings is marked as too thin. The
+campaign report also follows each playbook version week by week (calls, quality,
+conversion, cost per conversion).
+
 People join by invitation: an admin makes a one-time link (`POST /api/invitations`,
 or the Team screen), hands it over, and the person chooses their own password. The
 same kind of link resets a forgotten password (`POST /api/users/{id}/reset-link`).

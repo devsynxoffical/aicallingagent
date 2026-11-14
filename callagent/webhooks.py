@@ -252,6 +252,8 @@ def _call(run: CallRun) -> dict[str, Any]:
         "duration_seconds": run.duration_seconds, "language": run.language, "cost_usd": run.cost_usd,
         # From the review of the call, when there is one. What was said is read from the API, not sent here.
         "summary": review.get("summary"), "next_action": review.get("next_action"), "interest_level": review.get("interest_level"),
+        # When the call was handed to a person: what that person should know (see voice.tools.handover_brief).
+        "handover": (run.summary or {}).get("handover"),
     }
 
 

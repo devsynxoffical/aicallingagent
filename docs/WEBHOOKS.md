@@ -16,7 +16,7 @@ receiving end; no delivery has been made over a network from this code.
 | `call.completed` | The phone provider reported the end of a connected call | `status`, `seconds`, `direction` |
 | `call.failed` | The call ended without connecting: busy, no answer, failed | `status`, `seconds`, `direction` |
 | `call.finalized` | The call is over and its outcome is known | `disposition`, `reviewed`, `direction` |
-| `call.transferred` | The provider accepted a transfer to a person | |
+| `call.transferred` | The provider accepted a transfer to a person | `agent_note`: what the agent wrote for the colleague |
 | `appointment.booked` | The agent booked a meeting | `starts_at`, `lead_id` |
 | `campaign.started`, `campaign.paused` | Someone started or paused a campaign | `by` |
 | `campaign.stopped` | The dialer stopped it: budget, schedule, a rule | `status`, `reason` |
@@ -48,6 +48,11 @@ A `POST` with a JSON body:
 ```
 
 `appointment.booked` adds `"appointment": {"id", "starts_at", "timezone", "notes"}`.
+
+After a transfer, `call.handover` holds what the person taking over should know:
+`name`, `company`, `phone`, `language`, `agent_note`, `prospect_last_said` (their
+last three lines), `meetings_booked`, `seconds_into_call`. Use it to open the right
+record on the colleague's screen. It is `null` on calls that were not transferred.
 
 - `data` is the fact as it was recorded. `call`, `lead` and `appointment` are those
   things **as they are when the delivery is sent**, which for a retry may be later

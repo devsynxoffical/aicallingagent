@@ -153,7 +153,7 @@ def build_tools_schema(playbook_capabilities: set[str], human_transfer_available
             FunctionSchema(
                 name="transfer_to_human",
                 description="Connect the prospect to a human colleague right now. Tell them first.",
-                properties={"context_for_colleague": {"type": "string"}},
+                properties={"context_for_colleague": {"type": "string", "description": "Two sentences for the colleague who picks up: what the prospect wants and what was already agreed."}},
                 required=[],
             )
         )
@@ -377,6 +377,26 @@ async def mark_do_not_call(session: CallSession, params: FunctionCallParams) -> 
     return {"ok": True}
 
 
+HANDOVER_CONTEXT_CHARS = 600
+HANDOVER_LAST_LINES = 3
+
+
+def handover_brief(session: CallSession, context: str = "") -> dict[str, Any]:
+    """What the colleague who takes over a call should know: who it is, what the agent
+    says they want, the last things they said, and anything booked. Put together from
+    the call itself; the agent's own note is the only part a model wrote."""
+    lead = session.lead or {}
+    said = [str(line.get("text", "")).strip() for line in session.transcript if line.get("role") == "user" and str(line.get("text", "")).strip()]
+    return {
+        "name": " ".join(part for part in (lead.get("first_name"), lead.get("last_name")) if part), "company": lead.get("company") or "", "phone": lead.get("phone_e164") or "",
+        "language": session.language.current if session.language is not None else None,
+        "agent_note": " ".join((context or "").split())[:HANDOVER_CONTEXT_CHARS],
+        "prospect_last_said": [line[:300] for line in said[-HANDOVER_LAST_LINES:]],
+        "meetings_booked": sorted(session.booked_times),
+        "seconds_into_call": int((datetime.now(timezone.utc) - session.started_at).total_seconds()),
+    }
+
+
 async def transfer_to_human(session: CallSession, params: FunctionCallParams) -> dict[str, Any]:
     number = session.settings.human_transfer_number
     if not number:
@@ -391,13 +411,17 @@ async def transfer_to_human(session: CallSession, params: FunctionCallParams) ->
     session.ended_by_agent = True
     session.disposition = "transferred_to_human"
 
+    brief = handover_brief(session, str(params.arguments.get("context_for_colleague") or ""))
+
     def _note(s):
         from .. import events
 
         run = s.get(CallRun, session.call_run_id)
         if run is not None:
+            # Kept with the call, so the colleague can read it in the console, and sent to the organization's own systems.
+            run.summary = {**(run.summary or {}), "handover": brief}
             events.emit(s, "CallTransferred", key=f"call:{run.id}:transferred", subject="call", subject_id=run.id, organization_id=run.organization_id,
-                        campaign_id=run.campaign_id, call_run_id=run.id, payload={})
+                        campaign_id=run.campaign_id, call_run_id=run.id, payload={"agent_note": brief["agent_note"]})
 
     await run_db(_note)
     return {"ok": True, "_run_llm": False}
