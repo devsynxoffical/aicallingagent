@@ -242,3 +242,15 @@ not at its version.
 - `call_runs.content_erased_at`: when what was said on a call was removed, by an
   erasure or by the organization's retention period.
 
+## Webhook endpoints (migration 0016)
+
+- `webhook_endpoints`: organization, address, description, signing secret (stored
+  readable: a signature cannot be made from a hash), the events it receives, whether
+  it is on and why not, failed deliveries in a row, the last answer.
+- `webhook_deliveries`: one event for one endpoint. Status (CHECK: pending,
+  delivered, failed), attempts, the last answer or error, how long it took. Unique
+  on (endpoint, event), so an event reaches an endpoint as one delivery. Removed
+  with their endpoint, and after 30 days.
+
+Both are tenant tables. See `WEBHOOKS.md`.
+

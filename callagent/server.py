@@ -22,7 +22,7 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from . import background, billing, db, events, jobs, leader, llm, observability, orgsettings, privacy
+from . import background, billing, db, events, jobs, leader, llm, observability, orgsettings, privacy, webhooks
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
@@ -45,6 +45,7 @@ from .intelligence.api import router as intelligence_router
 from .training import versions
 from .training.api import router as training_router
 from .training.service import resume_unfinished
+from .webhooks_api import router as webhooks_router
 from .voice.pipeline import run_call
 
 log = logging.getLogger("callagent.server")
@@ -101,6 +102,7 @@ async def lifespan(app: FastAPI):
             if runner.leading:
                 try:
                     await run_db(privacy.apply_retention, unrestricted=True, slow=True)
+                    await run_db(webhooks.prune_deliveries, unrestricted=True, slow=True)
                 except Exception:
                     log.exception("the retention pass failed")
             await asyncio.sleep(3600)
@@ -170,6 +172,7 @@ app.include_router(intake_router)
 app.include_router(requests_router)
 app.include_router(accounts_public_router)
 app.include_router(accounts_router)
+app.include_router(webhooks_router)
 
 
 def _runner() -> CampaignRunner:
@@ -869,7 +872,7 @@ def _cannot_call(s, settings: Settings) -> str | None:
 
 
 @app.post("/api/campaigns/{name}/start", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
-async def start_campaign(name: str, concurrency: int | None = None, force: bool = False, settings: Settings = Depends(get_settings)):
+async def start_campaign(name: str, request: Request, concurrency: int | None = None, force: bool = False, settings: Settings = Depends(get_settings)):
     await run_db(lambda s: _get_campaign(s, name).id)  # whose it is comes first: 404 before anything about configuration
     problem = await run_db(lambda s: _cannot_call(s, settings))
     if problem:
@@ -894,7 +897,14 @@ async def start_campaign(name: str, concurrency: int | None = None, force: bool 
 
     cid = await run_db(_prep)
     await _runner().start(cid)
-    return await run_db(lambda s: _campaign_out(s, _get_campaign(s, name)))
+
+    def _started(s):
+        c = _get_campaign(s, name)
+        events.emit(s, "CampaignStarted", key=f"campaign:{c.id}:started:{utcnow().isoformat()}", subject="campaign", subject_id=c.id,
+                    organization_id=c.organization_id, campaign_id=c.id, payload={"by": acting_as(request, "api token")})
+        return _campaign_out(s, c)
+
+    return await run_db(_started)
 
 
 @app.post("/api/campaigns/{name}/pause", response_model=CampaignOut, dependencies=[Depends(require_api_token)])

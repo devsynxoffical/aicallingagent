@@ -193,7 +193,10 @@ In order of what they block. Details in the audit's "Still open" table.
 9. **The campaign report, timeline and export computed in the database** (D-4).
 10. **A semantic knowledge index; reading scanned pages.**
 11. **Dashboards; external error reporting; an audit screen in the console.**
-12. **CRM and calendar integrations** beyond the booking webhook.
+12. **CRM and calendar integrations.** Signed webhooks for call, booking, campaign
+    and playbook events exist (`WEBHOOKS.md`), so any system can be told; no
+    ready-made connector for a named CRM or calendar exists, and no delivery has
+    been made to a real receiver.
 13. **A lock file for dependencies**; the vulnerability scan as a gate.
 
 ## 9. Database changes

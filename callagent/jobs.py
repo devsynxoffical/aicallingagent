@@ -53,8 +53,9 @@ LEASE_GRACE_SECONDS = 30  # beyond the timeout, before another worker may take t
 #   calls      what a call or its customer depends on: finishing interrupted calls, booking notifications
 #   analysis   call reviews and other model work about calls that are over
 #   knowledge  reading documents and websites, building drafts
+#   integrations  telling customers' own systems what happened; a slow endpoint of theirs waits here, not in "calls"
 #   default    everything else
-QUEUES: dict[str, int] = {"calls": 4, "analysis": 2, "knowledge": 2, "default": 2}
+QUEUES: dict[str, int] = {"calls": 4, "analysis": 2, "knowledge": 2, "integrations": 2, "default": 2}
 
 _handlers: dict[str, Handler] = {}
 _dead_hooks: dict[str, DeadHook] = {}

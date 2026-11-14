@@ -62,6 +62,12 @@ review are still queued directly by the code that books or finalizes. They are
 idempotent jobs written in the same transaction, which is the same guarantee; moving
 them to subscribers is a refactoring without a behaviour change.
 
+**Organizations' own systems.** When an event is recorded, a delivery is also
+queued, in the same transaction, for each webhook endpoint of the event's
+organization that asked for that kind (`callagent/webhooks.py`). They are consumers
+like any other: a job each, with its own retries and its own queue. `WEBHOOKS.md`
+describes what they receive.
+
 ## Jobs (`callagent/jobs.py`, tables `jobs`, `job_attempts`)
 
 A job has: id, organization, kind, idempotency key (unique), payload, queue,
@@ -76,6 +82,7 @@ the last error, the call it belongs to, and a row per attempt with its outcome.
 | `calls` | 4 | finishing interrupted calls, booking notifications |
 | `analysis` | 2 | call reviews |
 | `knowledge` | 2 | reading documents and websites, building drafts |
+| `integrations` | 2 | deliveries to organizations' webhook endpoints (`WEBHOOKS.md`) |
 | `default` | 2 | everything else, and any job whose queue no pool is configured for |
 
 A full queue does not hold up the others: the worker never waits for a slot in one

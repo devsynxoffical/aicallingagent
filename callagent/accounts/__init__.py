@@ -87,7 +87,7 @@ def required_role(method: str, route: str) -> str:
         return PLATFORM
     if route.startswith("/api/usage/") and method not in ("GET", "HEAD", "OPTIONS"):
         return PLATFORM  # correcting the ledger is for whoever bills, not for the organization billed
-    if route.startswith(("/api/users", "/api/audit", "/api/keys")):
+    if route.startswith(("/api/users", "/api/audit", "/api/keys", "/api/webhooks")):
         return "admin"
     if route.startswith("/api/auth/"):
         return "viewer"
@@ -402,9 +402,10 @@ def create_organization(s: Session, name: str, *, admin_email: str, admin_passwo
 # ----------------------------------------------------------------------------- API keys
 
 KEY_PREFIX = "dtk_"
-# What a key may never do, whatever its role: make more keys, manage people, or change a
-# password. A key that leaks must not be able to keep itself alive or let someone in.
-KEY_FORBIDDEN_ROUTES = ("/api/keys", "/api/users", "/api/auth/password")
+# What a key may never do, whatever its role: make more keys, manage people, change a
+# password, or have the organization's events sent to an address of its choosing. A key
+# that leaks must not be able to keep itself alive, let someone in, or open a tap.
+KEY_FORBIDDEN_ROUTES = ("/api/keys", "/api/users", "/api/auth/password", "/api/webhooks")
 
 
 def create_api_key(s: Session, organization_id: int, name: str, role: str, by: str) -> tuple[ApiKey, str]:

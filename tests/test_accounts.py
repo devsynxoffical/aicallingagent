@@ -183,7 +183,8 @@ def test_each_role_can_do_what_it_is_for_and_nothing_more(client):
 
     changes = {(m, p) for m, p in routes if m != "GET" and not p.startswith(("/api/auth/", "/api/users"))}
     # Who has access, and the record of who did what: for admins, reading included.
-    users = {(m, p) for m, p in routes if p.startswith(("/api/users", "/api/audit", "/api/keys"))}
+    # So is where the organization's events are sent.
+    users = {(m, p) for m, p in routes if p.startswith(("/api/users", "/api/audit", "/api/keys", "/api/webhooks"))}
     assert ("GET", "/api/audit") in users
     # Organizations are managed by the deployment's operator, which no role inside an organization is.
     # So is correcting the usage ledger: that is for whoever bills, not for the organization billed.

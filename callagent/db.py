@@ -453,6 +453,54 @@ class ApiKey(Base):
     __table_args__ = (CheckConstraint("role IN ('admin', 'operator', 'viewer')", name="ck_api_keys_role"),)
 
 
+class WebhookEndpoint(Base):
+    """An address of an organization's own system that is told about what happens:
+    a call ended, a meeting was booked. Each has its own signing secret."""
+
+    __tablename__ = "webhook_endpoints"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    url: Mapped[str] = mapped_column(String(500))
+    description: Mapped[str] = mapped_column(String(200), default="")
+    # Signs every delivery. It has to be stored readable: a signature cannot be made from a hash.
+    secret: Mapped[str] = mapped_column(String(80))
+    events: Mapped[list[str]] = mapped_column(JSON, default=list)  # public names, e.g. call.finalized; ["*"] is everything
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    disabled_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    failures: Mapped[int] = mapped_column(Integer, default=0)  # deliveries given up on, in a row
+    created_by: Mapped[str] = mapped_column(String(254), default="")
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    last_delivery_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    last_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class WebhookDelivery(Base):
+    """One event for one endpoint: whether it arrived, after how many attempts, and
+    what the endpoint answered."""
+
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    endpoint_id: Mapped[int] = mapped_column(ForeignKey("webhook_endpoints.id"), index=True)
+    event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id"), nullable=True)  # none for a test delivery
+    event_type: Mapped[str] = mapped_column(String(60))
+    status: Mapped[str] = mapped_column(String(12), default="pending")  # pending | delivered | failed
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    delivered_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+    __table_args__ = (
+        # An event reaches an endpoint as one delivery, however often it is recorded or retried.
+        Index("uq_webhook_deliveries_endpoint_event", "endpoint_id", "event_id", unique=True),
+        CheckConstraint("status IN ('pending', 'delivered', 'failed')", name="ck_webhook_deliveries_status"),
+    )
+
+
 class AuditEntry(Base):
     """Who changed what, when and from where. One row per attempt to change something
     through the API (successful or refused) and per sign-in attempt on a known account.
@@ -1020,6 +1068,7 @@ def dumps(obj: Any) -> str:
 TENANT_TABLES = (
     "campaigns", "leads", "call_runs", "appointments", "do_not_call", "usage_records", "training_documents", "knowledge_chunks",
     "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events", "ai_usage", "audit_log", "api_keys",
+    "webhook_endpoints", "webhook_deliveries",
 )
 # Rows of these may belong to no organization (the deployment's own housekeeping and facts).
 _SHARED_WHEN_UNOWNED = ("jobs", "events")

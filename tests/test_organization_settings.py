@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from callagent import accounts, background, db, orgsettings
+from callagent import accounts, background, db, orgsettings, outbound
 from callagent.config import get_settings, resolve_api_token
 from callagent.db import ApiKey, AuditEntry, CallRun, Campaign, Lead, Organization, UsageRecord, session_scope
 from callagent.dialer import reconcile, twilio_client
@@ -193,11 +193,12 @@ async def test_a_booking_is_reported_to_the_webhook_of_the_organization_it_belon
         async def __aexit__(self, *_exc):
             return False
 
-        async def post(self, url, content, headers):
+        async def post(self, url, content, headers, **_how):
             sent.append((url, content, headers))
             return httpx.Response(200)
 
     monkeypatch.setattr(background.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(outbound, "_checked", lambda url: (url, "93.184.216.34"))  # what bolt.example resolves to: a public address
     body = {"appointment_id": 1}
     await background.deliver_booking_webhook({"delivery_id": "d1", "body": body, "organization_id": bolt.id})
     await background.deliver_booking_webhook({"delivery_id": "d2", "body": body})  # queued before organizations had their own: the first customer's
@@ -206,8 +207,11 @@ async def test_a_booking_is_reported_to_the_webhook_of_the_organization_it_belon
         cobalt_id = cobalt.id
     await background.deliver_booking_webhook({"delivery_id": "d3", "body": body, "organization_id": cobalt_id})  # has no webhook: nothing is sent anywhere
 
-    assert [url for url, _content, _headers in sent] == ["https://bolt.example/hooks/bookings", DEPLOYMENT_HOOK]
+    # An address an organization typed in is connected to at the address that was checked, under its own name.
+    # The deployment's own, set by its operator, is used as it is.
+    assert [url for url, _content, _headers in sent] == ["https://93.184.216.34/hooks/bookings", DEPLOYMENT_HOOK]
     (_, content, headers), (_, _, first_headers) = sent
+    assert headers["Host"] == "bolt.example" and "Host" not in first_headers
     assert headers["X-Callagent-Signature"] == background.sign("bolt-signing-secret", content)  # signed with Bolt's secret, not the first customer's
     assert first_headers["X-Callagent-Signature"] == background.sign("first-customer-secret", content)
 

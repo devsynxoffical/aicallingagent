@@ -132,8 +132,19 @@ async def deliver_booking_webhook(payload: dict[str, Any]) -> None:
     is the same for every retry of one booking."""
     from . import orgsettings
 
+    from . import outbound
+    from .db import Organization
+
     organization_id = payload.get("organization_id")  # absent on jobs queued before organizations had their own webhook
-    settings = await run_db(lambda s: orgsettings.effective(s, organization_id if organization_id is not None else default_organization_id(s), get_settings()))
+
+    def _settings(s):
+        org_id = organization_id if organization_id is not None else default_organization_id(s)
+        # An address typed in by an organization's admin must be a public one. The one in
+        # the deployment's own environment was set by its operator, who may point inside.
+        own = bool(orgsettings.of(s.get(Organization, org_id)).booking_webhook_url)
+        return orgsettings.effective(s, org_id, get_settings()), own
+
+    settings, set_by_the_organization = await run_db(_settings)
     url = settings.booking_webhook_url
     if not url:
         return  # the webhook was switched off after the booking: nothing to deliver
@@ -141,10 +152,12 @@ async def deliver_booking_webhook(payload: dict[str, Any]) -> None:
     headers = {"Content-Type": "application/json", "X-Callagent-Event": "appointment.booked", "X-Callagent-Delivery": payload["delivery_id"]}
     if settings.booking_webhook_secret:
         headers["X-Callagent-Signature"] = sign(settings.booking_webhook_secret, body)
-    async with httpx.AsyncClient(timeout=settings.provider_timeout_seconds) as client:
-        response = await client.post(url, content=body, headers=headers)
-    if response.status_code >= 300:
-        raise RuntimeError(f"the booking webhook answered {response.status_code}")
+    try:
+        status = await outbound.post(url, body, headers, timeout=settings.provider_timeout_seconds, public_only=set_by_the_organization)
+    except outbound.DeliveryError as e:
+        raise RuntimeError(f"the booking webhook could not be delivered: {e}") from None
+    if status >= 300:
+        raise RuntimeError(f"the booking webhook answered {status}")
 
 
 # ----------------------------------------------------------------------------- call review safety net

@@ -105,7 +105,7 @@ area marked *absent* has no code today.
 | Background jobs | `jobs`, `background` | Built: four queues with their own limits, priority, fairness between organizations |
 | Events | `events` | Built: a log in the database, written in the same transaction as the change. See `EVENT_ARCHITECTURE.md` |
 | Calendar integrations | booking webhook only (`voice.tools`, `background`) | Minimal |
-| CRM integrations | - | *Absent* |
+| CRM integrations | signed webhooks per organization for call, booking, campaign and playbook events (`webhooks`, `WEBHOOKS.md`); no connector for a named CRM | Minimal |
 | Notifications | text message from a call (`voice.tools`) | Minimal |
 | Billing and usage | `billing` (ledger), `dialer.rules` (budget), `llm` (AI usage) | Built as a ledger of measured usage with corrections, and budgets enforced from it. No invoices, payments or balances. See `BILLING_ARCHITECTURE.md` |
 | Analytics and reporting | `intelligence.report`, routes in `server` | Built; the lead list pages in the database, the report is still computed in memory (D-4) |

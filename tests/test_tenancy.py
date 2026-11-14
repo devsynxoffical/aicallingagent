@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from callagent import accounts, db, jobs
+from callagent import accounts, db, jobs, webhooks
 from callagent.config import get_settings, resolve_api_token
 from callagent.db import Appointment, CallRun, Campaign, Job, Lead, UsageRecord, User, WebsiteRequest, session_scope
 from callagent.dialer import lifecycle
@@ -88,7 +88,11 @@ def two(client):
         key, _secret = accounts.create_api_key(s, acme_id, "Acme integration", "viewer", "test")
         db.add_dnc(s, "+14155550177", acme_id, "Acme opt-out")
         suppressed = s.execute(select(db.DoNotCall).where(db.DoNotCall.phone_e164 == "+14155550177")).scalar_one()
-        ids = {"call_run_id": call.id, "job_id": dead.id, "user_id": member["id"], "request_id": request.id, "document_id": document.json()["id"],
+        endpoint, _secret = webhooks.create_endpoint(s, acme_id, "https://hooks.acme.example/devytalk", ["*"], "CRM", "boss@acme.example")
+        delivery = db.WebhookDelivery(organization_id=acme_id, endpoint_id=endpoint.id, event_id=None, event_type="ping", status="failed")
+        s.add(delivery)
+        s.flush()
+        ids = {"endpoint_id": endpoint.id, "delivery_id": delivery.id, "call_run_id": call.id, "job_id": dead.id, "user_id": member["id"], "request_id": request.id, "document_id": document.json()["id"],
                "lead_id": lead.id, "number": draft.version, "experiment_id": 1, "name": "Acme only", "key_id": key.id, "entry_id": suppressed.id}
     return {"acme": acme, "bolt": bolt, "acme_id": acme_id, "bolt_id": bolt_id, "ids": ids}
 
@@ -108,6 +112,8 @@ def snapshot(acme_id):
             "requests": [(r.id, r.status) for r in s.execute(select(WebsiteRequest).where(WebsiteRequest.organization_id == acme_id)).scalars()],
             "campaigns": s.execute(select(func.count()).select_from(Campaign).where(Campaign.organization_id == acme_id)).scalar_one(),
             "keys": [(k.id, k.revoked_at) for k in accounts.list_api_keys(s, acme_id)],
+            "endpoints": [(e.id, e.url, e.secret, e.active, tuple(e.events)) for e in webhooks.list_endpoints(s, acme_id)],
+            "deliveries": [(d.id, d.status, d.attempts) for d in s.execute(select(db.WebhookDelivery).where(db.WebhookDelivery.organization_id == acme_id)).scalars()],
             "do_not_call": sorted(s.execute(select(db.DoNotCall.phone_e164).where(db.DoNotCall.organization_id == acme_id)).scalars()),
             "settings": dict(s.get(db.Organization, acme_id).settings_json or {}),
         }
@@ -126,6 +132,7 @@ VALID = {
     ("POST", "/api/campaigns/{name}/inbound"): {"params": {"number": "+14155550188"}},
     ("PATCH", "/api/users/{user_id}"): {"json": {"role": "admin", "active": False, "name": "Taken over", "password": "a new long password"}},
     ("POST", "/api/requests/{request_id}/handled"): {"json": {"handled": True}},
+    ("PATCH", "/api/webhooks/{endpoint_id}"): {"json": {"url": "https://tap.bolt.example/acme", "events": ["*"], "active": False}},
 }
 ACME_MARKERS = ["Acme only", "acme.example", "Acme secret", "Acme confidential", "Acme job error", "Acme inbound message", "acme-customer", "Acme draft", "Acme Member", "49 dollars"]
 

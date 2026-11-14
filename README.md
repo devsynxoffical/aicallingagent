@@ -548,6 +548,11 @@ number and booking webhook (`PUT /api/organization/settings`) and creates API ke
 for their own systems (`POST /api/keys`): a key has a role, is shown once, and is
 sent as `Authorization: Bearer dtk_…`.
 
+To be told what happens instead of asking, an admin registers webhook endpoints
+(`POST /api/webhooks`): signed deliveries for calls, bookings, campaigns and
+playbooks, retried for about an hour. `docs/WEBHOOKS.md` has the events, the body
+and the signature check to copy.
+
 ### Where things stand
 
 **No part of this has handled a real phone call.** It was built and tested without
