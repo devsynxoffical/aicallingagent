@@ -50,7 +50,7 @@ from .llm_service import LowLatencyAnthropicLLMService
 from .session import CallSession
 from .speech_filter import SpeechSanitizer
 from .tools import build_tools_schema, register_tool_handlers
-from .transcript import TranscriptCollector
+from .transcript import TranscriptCollector, TranscriptSaver
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +156,9 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
         language=LanguageTracker(allowed=plan.languages),
         knowledge=knowledge,
     )
+    # Saved as the call proceeds, so it can be followed live and survives a process that stops mid-call.
+    saver = TranscriptSaver(call_run_id, session)
+    session.on_transcript = saver.notify
     has_knowledge = knowledge is not None and len(knowledge) > 0 and mode != "voicemail"
 
     human_transfer = bool(settings.human_transfer_number)
@@ -343,6 +346,7 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
     finally:
         if opener_timer:
             opener_timer.cancel()
+        await saver.close()
 
     if error:
         def _err(s):

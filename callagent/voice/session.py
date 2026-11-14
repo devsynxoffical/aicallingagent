@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from ..config import Settings
 from ..languages import LanguageTracker
@@ -34,6 +34,8 @@ class CallSession:
     idle_nudges: int = 0
     user_has_spoken: bool = False
     latency: dict[str, list[float]] = field(default_factory=dict)
+    # Called after each line is added, so the transcript can be saved while the call is in progress.
+    on_transcript: Callable[[], None] | None = None
 
     def log_tool(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
         self.tool_events.append(
@@ -50,6 +52,8 @@ class CallSession:
         if not text:
             return
         self.transcript.append({"role": role, "text": text, "at": datetime.now(timezone.utc).isoformat()})
+        if self.on_transcript is not None:
+            self.on_transcript()
 
     def transcript_text(self) -> str:
         who = {"user": "Prospect", "assistant": self.playbook.persona.agent_name}

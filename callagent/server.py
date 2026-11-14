@@ -25,7 +25,7 @@ from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
 from .apideps import require_api_token
 from .config import Settings, get_settings
-from .db import Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
+from .db import ACTIVE_CALL_STATUSES, Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
 from .dialer import twilio_client
 from .dialer import rules as campaign_rules
 from .dialer.reconcile import reconcile_forever
@@ -596,6 +596,9 @@ async def get_call(call_run_id: int):
         return {
             "call_run_id": r.id,
             "status": r.status,
+            # True while the call is ringing or in progress: the transcript below is what
+            # has been said so far, and grows.
+            "live": r.status in ACTIVE_CALL_STATUSES and r.ended_at is None,
             "mode": r.mode,
             "direction": r.direction,
             "language": r.language,
