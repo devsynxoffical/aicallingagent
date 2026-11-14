@@ -336,6 +336,7 @@ def describe(campaign: Campaign, settings: Settings) -> dict[str, Any]:
         "ends_at": rules.ends_at.isoformat() if rules.ends_at else None,
         "stop_after_meetings": rules.stop_after_meetings,
         "max_opt_out_rate": rules.max_opt_out_rate,
+        "require_consent": rules.require_consent,
         "opt_out_min_calls": rules.opt_out_min_calls,
         "scoring_weights": rules.scoring_weights,
     }
