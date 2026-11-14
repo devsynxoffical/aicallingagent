@@ -82,6 +82,8 @@ def required_role(method: str, route: str) -> str:
     method = method.upper()
     if route.startswith("/api/organizations"):
         return PLATFORM
+    if route.startswith("/api/usage/") and method not in ("GET", "HEAD", "OPTIONS"):
+        return PLATFORM  # correcting the ledger is for whoever bills, not for the organization billed
     if route.startswith("/api/users") or route.startswith("/api/audit"):
         return "admin"
     if route.startswith("/api/auth/"):

@@ -24,7 +24,7 @@ from sqlalchemy import select  # noqa: E402
 
 from callagent import accounts, db  # noqa: E402
 from callagent.config import get_settings  # noqa: E402
-from callagent.dialer import rules  # noqa: E402
+from callagent.dialer import lifecycle, rules  # noqa: E402
 from callagent.intelligence import experiments  # noqa: E402
 from callagent.intelligence.scoring import apply_evidence  # noqa: E402
 from callagent.playbook.schema import Objection  # noqa: E402
@@ -74,6 +74,8 @@ class _Seeder:
             summary={"review": review.model_dump()} if review else {}, experiment_id=experiment[0], experiment_arm=experiment[1],
         )
         self.s.add(run)
+        self.s.flush()
+        lifecycle.record_usage(self.s, run, run.duration_seconds, cost)  # what the console shows as spend is read from the ledger
         lead.last_disposition = disposition
         if review:
             apply_evidence(lead, review.evidence.model_dump(), rules.rules_of(self.campaign).scoring_weights)

@@ -225,6 +225,10 @@ def record_usage(
                     cost_usd=cost, request_id=(request_id or None) and str(request_id)[:80],
                 )
             )
+            s.flush()
+            from . import billing
+
+            billing.record_ai(s, s.execute(select(db.AIUsage).order_by(db.AIUsage.id.desc()).limit(1)).scalar_one())
     except Exception:
         observability.AI_UNRECORDED.inc()
         log.exception("AI usage could not be recorded (workflow %s, model %s, %s tokens in, %s out)", workflow, model, tokens.get("input"), tokens.get("output"))

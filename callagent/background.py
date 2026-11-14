@@ -309,3 +309,50 @@ async def finalize_interrupted_call(payload: dict[str, Any]) -> None:
     playbook, transcript, tool_events, mode, direction = loaded
     log.warning("call %s was interrupted before it was finalized; finishing it from the %s transcript lines saved", call_run_id, len(transcript))
     await summarizer.finalize_call(call_run_id, playbook, transcript, tool_events, mode, None, settings, direction=direction)
+
+
+# ----------------------------------------------------------------------------- the provider's price for a call
+
+PROVIDER_PRICE = "provider_price"
+PROVIDER_PRICE_DELAY_SECONDS = 600
+
+
+def enqueue_provider_price(s, run: CallRun) -> Job:
+    return jobs.enqueue(s, PROVIDER_PRICE, f"provider-price:{run.id}", {"call_run_id": run.id}, delay_seconds=PROVIDER_PRICE_DELAY_SECONDS,
+                        max_attempts=6, timeout_seconds=60, call_run_id=run.id)
+
+
+@jobs.handler(PROVIDER_PRICE, queue="default")
+async def fetch_provider_price(payload: dict[str, Any], provider=None) -> None:
+    """Ask the phone provider what it charged for a call and correct the ledger to it.
+    Not priced yet is a failure of this attempt, so the queue asks again later."""
+    from decimal import Decimal, InvalidOperation
+
+    from . import billing
+    from .dialer import twilio_client
+
+    call_run_id = int(payload["call_run_id"])
+    settings = get_settings()
+    sid = await run_db(lambda s: getattr(s.get(CallRun, call_run_id), "twilio_call_sid", None))
+    if not sid:
+        return
+    found = await asyncio.wait_for(asyncio.to_thread((provider or twilio_client).fetch_call, sid, settings), timeout=settings.provider_timeout_seconds + 5)
+    if found is None:
+        return  # the provider has no such call: nothing to correct
+    if found.get("price") in (None, ""):
+        raise RuntimeError("the provider has not priced this call yet")
+    if str(found.get("price_unit") or "USD").upper() != "USD":
+        log.error("call %s: the provider priced it in %s; the ledger is in USD and was left as estimated", call_run_id, found.get("price_unit"))
+        return
+    try:
+        price = Decimal(str(found["price"]))
+    except InvalidOperation:
+        raise RuntimeError(f"the provider returned a price that is not a number: {found['price']!r}") from None
+
+    def _apply(s):
+        run = s.get(CallRun, call_run_id)
+        if run is not None:
+            billing.record_provider_price(s, run, price)
+
+    await run_db(_apply)
+

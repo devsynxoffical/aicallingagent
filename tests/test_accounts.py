@@ -186,8 +186,9 @@ def test_each_role_can_do_what_it_is_for_and_nothing_more(client):
     users = {(m, p) for m, p in routes if p.startswith(("/api/users", "/api/audit"))}
     assert ("GET", "/api/audit") in users
     # Organizations are managed by the deployment's operator, which no role inside an organization is.
-    platform = {(m, p) for m, p in routes if p.startswith("/api/organizations")}
-    assert platform == {("GET", "/api/organizations"), ("POST", "/api/organizations")}
+    # So is correcting the usage ledger: that is for whoever bills, not for the organization billed.
+    platform = {(m, p) for m, p in routes if p.startswith("/api/organizations") or (p.startswith("/api/usage/") and m != "GET")}
+    assert platform == {("GET", "/api/organizations"), ("POST", "/api/organizations"), ("POST", "/api/usage/{line_id}/adjustments")}
     changes -= platform
     assert refused["admin"] == platform
     assert refused["operator"] == (changes - accounts.OPERATOR_ROUTES) | users | platform

@@ -305,7 +305,8 @@ async def test_a_call_cut_off_by_a_restart_still_gets_an_outcome_and_frees_its_l
     assert after["disposition"] == "other"  # nobody could review it yet, and it says so rather than guess
     assert after["lead"] == "pending"  # not stuck in "calling" for ever: it can be dialed, also by hand
     assert job_of(background.call_review_key(run_id))["status"] == "queued"  # the review will be tried again by the analysis queue
-    assert event_types(run_id) == ["CallInitiated", "CallAnswered", "CallFinalized"]
+    # Ended by the engine, so the engine wrote the call's ledger line (the carrier's figure corrects it when it comes).
+    assert event_types(run_id) == ["CallInitiated", "CallAnswered", "UsageRecorded", "CallFinalized"]
 
     await background.finalize_interrupted_call({"call_run_id": run_id})  # delivered twice: the second does nothing
     assert state(run_id) == after and event_types(run_id).count("CallFinalized") == 1

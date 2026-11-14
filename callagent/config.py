@@ -84,11 +84,16 @@ class Settings(BaseSettings):
     default_timezone: str = "America/New_York"
     default_phone_region: str = "US"
     seconds_between_dials: float = 2.0
-    # What one connected minute and one dial attempt cost you, all providers together
-    # (telephony + speech recognition + model + voice). Measure it on your own calls.
+    # What one connected minute and one dial attempt cost you. Measure it on your own calls.
+    # Everything billed by time: telephony, speech recognition, voice. The AI model is
+    # measured in tokens and added to the ledger separately (llm.LIST_PRICES).
     # Used for per-call cost, campaign spend and budgets. 0 = not measured yet.
     cost_per_connected_minute_usd: float = 0.0
     cost_per_call_attempt_usd: float = 0.0
+    # Ask the phone provider what it charged for each call and correct the estimate to it.
+    # Turn on only when the per-minute rate above covers telephony alone: the provider's
+    # price knows nothing of speech services.
+    reconcile_provider_price: bool = False
 
     # Turn-taking
     use_smart_turn: bool = True

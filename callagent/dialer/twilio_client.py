@@ -123,7 +123,9 @@ def definitely_not_placed(error: Exception) -> bool:
 
 
 def fetch_call(call_sid: str, settings: Settings | None = None) -> dict[str, Any] | None:
-    """The provider's own record of a call: {"sid", "status", "duration"}. None if it has no such call."""
+    """The provider's own record of a call: {"sid", "status", "duration", "price", "price_unit"}.
+    The price is absent until the provider has rated the call, some minutes after it
+    ends, and is negative in the provider's convention (a charge). None if it has no such call."""
     settings = settings or get_settings()
     try:
         call = _client(settings).calls(call_sid).fetch()
@@ -131,7 +133,7 @@ def fetch_call(call_sid: str, settings: Settings | None = None) -> dict[str, Any
         if getattr(e, "status", None) == 404:
             return None
         raise
-    return {"sid": call.sid, "status": str(call.status), "duration": call.duration}
+    return {"sid": call.sid, "status": str(call.status), "duration": call.duration, "price": getattr(call, "price", None), "price_unit": getattr(call, "price_unit", None)}
 
 
 def find_call(to_number: str, started_after, settings: Settings | None = None) -> dict[str, Any] | None:

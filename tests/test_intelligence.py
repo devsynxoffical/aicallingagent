@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from callagent import db
+from callagent.dialer import lifecycle
 from callagent.config import Settings, get_settings, resolve_api_token
 from callagent.intelligence import coach
 from callagent.intelligence.report import campaign_report
@@ -69,9 +70,12 @@ def _seed(s, campaign, n, *, version, disposition, language="en", review=None, c
         lead = db.Lead(campaign_id=campaign.id, phone_e164=f"+1415{version}{start + i:06d}", status="completed")
         s.add(lead)
         s.flush()
-        s.add(db.CallRun(lead_id=lead.id, campaign_id=campaign.id, status="completed", disposition=disposition, stream_connected=answered,
-                         transcript=[{"role": "user", "text": "hi"}] if answered else [], playbook_version=version, language=language, cost_usd=cost,
-                         summary={"review": review} if review else {}))
+        run = db.CallRun(lead_id=lead.id, campaign_id=campaign.id, status="completed", disposition=disposition, stream_connected=answered,
+                         transcript=[{"role": "user", "text": "hi"}] if answered else [], playbook_version=version, language=language,
+                         summary={"review": review} if review else {})
+        s.add(run)
+        s.flush()
+        lifecycle.record_usage(s, run, 60, cost)  # what a call cost is what the ledger says it cost
 
 
 @pytest.fixture

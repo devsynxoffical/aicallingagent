@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from callagent import db
 from callagent.config import Settings, get_settings, resolve_api_token
-from callagent.dialer import rules
+from callagent.dialer import lifecycle, rules
 from callagent.dialer.campaign_runner import CampaignRunner, apply_twilio_status, in_calling_window, next_window_open, pick_next_lead
 
 UTC = timezone.utc
@@ -36,6 +36,8 @@ def _call(s, cid, *, cost=None, disposition=None, answered=False, started=None, 
                      stream_connected=answered, started_at=started or db.utcnow(), ended_at=db.utcnow())
     s.add(run)
     s.flush()
+    if cost is not None:  # what a call cost is what the ledger says it cost
+        lifecycle.record_usage(s, run, 60, cost)
     return run
 
 

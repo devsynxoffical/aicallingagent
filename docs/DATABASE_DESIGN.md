@@ -190,3 +190,20 @@ other tables refer to, is refused there.
 `ai_usage` is a measurement, not a bill. The ledger a bill is drawn from is
 `usage_records`; turning AI usage into ledger lines is phase 7 (D-1, D-2).
 
+
+## Audit trail and request ids (migration 0011)
+
+- `audit_log`: one row per attempt to change something through the API and per
+  sign-in on a known account. Organization (required), actor, role, operation,
+  method, declared route, the route's parameters, HTTP status, request id, address.
+  A tenant table. Rows are only added.
+- `jobs.request_id`: the id of the request that enqueued a job.
+
+## The usage ledger (migration 0012)
+
+`usage_records` becomes a ledger (see `BILLING_ARCHITECTURE.md`): a unique `key` per
+line replaces the unique (call, kind) index; `quantity`, `unit`, `currency`, `basis`
+(CHECK: estimate, provider, manual), `detail`, `note`, `created_by`; `adjusts_id`
+refers to the line a correction corrects; `campaign_id` and `call_run_id` may be
+empty. Existing lines are given their key and keep their amounts. The downgrade is
+refused while corrections or AI lines exist.

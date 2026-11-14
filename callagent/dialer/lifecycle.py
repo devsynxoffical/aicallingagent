@@ -68,30 +68,17 @@ def advance(run: CallRun, new: str, *, source: str = SYSTEM) -> bool:
 
 
 def record_usage(s: Session, run: CallRun, seconds: int | None, amount_usd: float) -> UsageRecord:
-    """Write the call's usage once. Reporting the same ending again finds the existing
-    row; it never adds a second one, and never changes an amount already recorded."""
-    existing = s.execute(select(UsageRecord).where(UsageRecord.call_run_id == run.id, UsageRecord.kind == "call")).scalars().first()
-    if existing is not None:
-        if existing.quantity_seconds != int(seconds or 0):
-            log.warning("call %s: usage already recorded as %ss, a later report said %ss; kept the first", run.id, existing.quantity_seconds, seconds)
-        return existing
-    campaign = s.get(Campaign, run.campaign_id)
-    from .. import events
+    """Write a call's ledger line with a stated amount, once. The engine itself goes
+    through ``billing.record_call``, which works the amount out from the configured
+    rates; this remains for callers that already hold one."""
+    from .. import billing
 
-    events.emit(s, "UsageRecorded", key=f"usage:call:{run.id}:call", subject="usage", subject_id=run.id, organization_id=run.organization_id,
-                campaign_id=run.campaign_id, call_run_id=run.id, payload={"kind": "call", "seconds": int(seconds or 0), "amount_usd": str(amount_usd)})
-    record = UsageRecord(
-        organization_id=campaign_organization_id(s, campaign) if campaign else None,
-        campaign_id=run.campaign_id,
-        call_run_id=run.id,
-        kind="call",
-        quantity_seconds=int(seconds or 0),
-        amount_usd=Decimal(str(amount_usd)).quantize(Decimal("0.0001")),
-    )
-    try:
-        with s.begin_nested():
-            s.add(record)
-            s.flush()
-    except IntegrityError:  # the same ending, reported twice at the same moment
-        return s.execute(select(UsageRecord).where(UsageRecord.call_run_id == run.id, UsageRecord.kind == "call")).scalars().one()
-    return record
+    campaign = s.get(Campaign, run.campaign_id)
+    minutes = -(-int(seconds or 0) // 60)
+    line = billing._insert(s, UsageRecord(
+        organization_id=campaign_organization_id(s, campaign) if campaign else None, campaign_id=run.campaign_id, call_run_id=run.id, kind="call",
+        key=f"call:{run.id}:call", quantity_seconds=int(seconds or 0), quantity=minutes, unit="minute",
+        amount_usd=Decimal(str(amount_usd)).quantize(Decimal("0.0001")), basis="estimate", detail={"seconds": int(seconds or 0), "minutes": minutes, "source": "stated"},
+    ))
+    billing._refresh_call_cost(s, run)
+    return line

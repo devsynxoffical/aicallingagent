@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
+from .. import billing
 from ..db import ACTIVE_CALL_STATUSES, TERMINAL_CALL_STATUSES, CallRun, Campaign, Lead, is_dnc, run_db, utcnow
 from . import lifecycle
 from . import rules as campaign_rules
@@ -76,7 +77,12 @@ def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: b
     from ..intelligence import experiments
 
     s.refresh(lead)
-    campaign = s.get(Campaign, campaign_id)
+    # The campaign row is locked from here to the end of the transaction, so two claims
+    # against the same budget are decided one after the other, whoever makes them.
+    campaign = s.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update()).scalar_one_or_none()
+    refusal = campaign_rules.budget_refusal(s, campaign, get_settings()) if campaign else None
+    if refusal:
+        raise LeadNotDialable(refusal)
     # In an A/B test the lead's side, and so the playbook version, is fixed for every attempt.
     experiment_id, arm, version = experiments.assign(s, campaign, lead) if campaign else (None, None, None)
     run = CallRun(lead_id=lead.id, campaign_id=campaign_id, status="created", playbook_version=version, experiment_id=experiment_id, experiment_arm=arm)
@@ -423,14 +429,19 @@ def apply_twilio_status(s: Session, call_run_id: int, form: dict[str, Any], sett
         # The carrier's duration is the billed one. It is written to the ledger exactly
         # once; a repeated report, even with different numbers, changes neither the
         # ledger nor the call.
-        usage = lifecycle.record_usage(s, run, seconds, campaign_rules.call_cost(seconds, settings))
+        usage = billing.record_call(s, run, seconds, settings, source="carrier")
+        billed = billing.billed_seconds(s, run.id)
         from .. import events
 
         events.emit(s, "CallCompleted" if status == "completed" else "CallFailed", key=f"call:{run.id}:ended", subject="call", subject_id=run.id,
                     organization_id=run.organization_id, campaign_id=run.campaign_id, call_run_id=run.id,
-                    payload={"status": status, "seconds": usage.quantity_seconds, "direction": run.direction or "outbound"})
-        run.duration_seconds = usage.quantity_seconds if (seconds is not None or run.duration_seconds is not None) else None
-        run.cost_usd = float(usage.amount_usd)
+                    payload={"status": status, "seconds": billed, "direction": run.direction or "outbound"})
+        run.duration_seconds = billed if (seconds is not None or run.duration_seconds is not None) else None
+        if settings.reconcile_provider_price and run.twilio_call_sid and usage.id is not None:
+            # The provider prices a call some minutes after it ends. Ask then, and correct the estimate.
+            from .. import background
+
+            background.enqueue_provider_price(s, run)
         lead = s.get(Lead, run.lead_id)
         if lead and run.direction == "inbound":
             if not run.stream_connected:

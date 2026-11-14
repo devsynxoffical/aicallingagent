@@ -101,6 +101,10 @@ Kept current as work lands. A finding not listed here is open.
 | E-3, A-13 No audit trail | Fixed for the trail: every attempt to change something through the API and every sign-in on a known account, readable by the organization's admins only. Request bodies are not kept. Password reset by email and a second factor: open | `test_every_attempt_to_change_something_is_recorded_with_who_and_how_it_ended`, `test_the_audit_trail_is_for_an_organizations_admins_and_nobody_elses` |
 | B-14 Latency: what is missing | Partly: the per-call response time is a metric with an alert; per-stage latency stays on the call record | `ops/prometheus-alerts.yml` (`CallsAnswerSlowly`) |
 
+| D-1 The ledger holds estimates, only for telephony | Fixed for the ledger's shape: a line per call and per AI use with quantity, unit, rates applied, currency and basis; corrections only as new lines; the provider's price as a correction (optional). Speech services and text messages are not separate lines; no amount has been compared with an invoice. See `BILLING_ARCHITECTURE.md` | `tests/test_billing.py` on SQLite and PostgreSQL |
+| D-2 Spend read from a floating-point copy | Fixed: spend, the budget and a call's displayed cost are sums of ledger lines | `test_the_engines_figure_is_corrected_by_the_carriers_without_changing_the_first_line`, `test_when_the_carrier_reports_first_the_engines_ending_adds_nothing` |
+| D-3 The budget can be exceeded by manual or concurrent calls | Fixed for outbound calls: checked in the transaction that reserves the lead, with the campaign locked, for every way a call is started. The AI cost of calls in progress is not reserved; inbound calls are never refused | `test_of_many_claims_against_a_budget_that_covers_one_call_exactly_one_is_placed`, `test_what_was_spent_and_what_is_in_progress_both_count_against_the_budget` |
+
 Found and fixed along the way (not in the audit, caught by the new tests): on SQLite
 a job or event written as the first change of a transaction survived a rollback of
 that transaction (the driver does not open a transaction before a savepoint); the

@@ -13,7 +13,7 @@ from sqlalchemy import select
 
 from ..db import Appointment, CallRun, Campaign, Lead, add_dnc, run_blocking, run_db
 from ..dialer import lifecycle
-from ..dialer.rules import call_cost, campaign_settings
+from ..dialer.rules import campaign_settings
 from ..llm import attributed, make_client, parse_structured
 from ..playbook.schema import Playbook
 from ..voice.tools import DISPOSITIONS
@@ -211,8 +211,12 @@ async def finalize_call(
         lifecycle.advance(run, "completed", source=lifecycle.SYSTEM)
         if run.started_at and run.duration_seconds is None:
             run.duration_seconds = int((run.ended_at - run.started_at).total_seconds())
-        if run.cost_usd is None:
-            run.cost_usd = call_cost(run.duration_seconds, settings)
+        # In the same transaction that ends the call, so the call is never neither "in
+        # progress" nor "spent" when a budget is checked. The carrier's duration, when
+        # it arrives and differs, is added as a correction.
+        from .. import billing
+
+        billing.record_call(s, run, run.duration_seconds, settings, source="engine")
         if transcript or mode == "voicemail":
             # Saved together with the transcript: if the review below does not finish (the
             # model is unreachable, the process stops), the queue reviews this call later.

@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..config import Settings
-from ..db import Appointment, CallRun, Campaign, Lead, utcnow
+from ..db import ACTIVE_CALL_STATUSES, Appointment, CallRun, Campaign, Lead, utcnow
 
 DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 DEFAULT_CALLING_DAYS = (0, 1, 2, 3, 4, 5)  # Monday to Saturday
@@ -137,7 +137,34 @@ def call_cost(duration_seconds: int | None, settings: Settings) -> float:
 
 
 def campaign_spend(s: Session, campaign_id: int) -> float:
-    return round(float(s.execute(select(func.coalesce(func.sum(CallRun.cost_usd), 0.0)).where(CallRun.campaign_id == campaign_id)).scalar() or 0.0), 4)
+    """What the campaign has cost so far: the sum of its ledger lines."""
+    from .. import billing
+
+    return round(float(billing.campaign_spend(s, campaign_id)), 4)
+
+
+def budget_refusal(s: Session, campaign: Campaign, settings: Settings) -> str | None:
+    """Why one more call may not be placed for budget reasons, or None.
+
+    Checked inside the transaction that reserves the lead, with the campaign row
+    locked, for every outbound call however it is started (the dial loop, a manual
+    dial, another process). A call in progress counts at its worst case: the longest
+    a call may last, at the configured rates. What the AI model adds is known only
+    after a call and is not reserved in advance.
+    """
+    rules = rules_of(campaign)
+    if rules.budget_usd is None:
+        return None
+    effective = campaign_settings(s, campaign.id, settings)
+    spent = campaign_spend(s, campaign.id)
+    worst_case = call_cost(effective.call_time_limit_seconds, effective)
+    in_progress = int(s.execute(select(func.count()).select_from(CallRun).where(
+        CallRun.campaign_id == campaign.id, CallRun.direction == "outbound", CallRun.status.in_(ACTIVE_CALL_STATUSES))).scalar() or 0)
+    if spent >= rules.budget_usd:
+        return f"the campaign's budget of ${rules.budget_usd:,.2f} is spent (${spent:,.2f})"
+    if spent + (in_progress + 1) * worst_case > rules.budget_usd:
+        return f"the campaign's remaining budget (${rules.budget_usd - spent:,.2f}) does not cover another call" + (f" while {in_progress} are in progress" if in_progress else "")
+    return None
 
 
 # ----------------------------------------------------------------------------- limits

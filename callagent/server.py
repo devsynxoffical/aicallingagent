@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 import hmac
 import csv
 import io
@@ -20,7 +21,7 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from . import background, events, jobs, llm, observability
+from . import background, billing, events, jobs, llm, observability
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
@@ -491,6 +492,40 @@ async def ai_usage(days: int = 30, campaign: str | None = None):
         return llm.usage_summary(s, organization_id(), since, _get_campaign(s, campaign).id if campaign else None)
 
     return await run_db(_q)
+
+
+@app.get("/api/usage", dependencies=[Depends(require_api_token)])
+async def usage_ledger(days: int = 30, campaign: str | None = None, limit: int = 100, before_id: int | None = None):
+    """The caller's organization's usage ledger over the last ``days`` days: totals by
+    kind and by how far each amount can be trusted, and the newest lines."""
+    from datetime import timedelta
+
+    since = utcnow() - timedelta(days=max(1, min(days, 366)))
+
+    def _q(s):
+        return billing.summary(s, organization_id(), since, _get_campaign(s, campaign).id if campaign else None, limit=limit, before_id=before_id)
+
+    return await run_db(_q)
+
+
+class AdjustmentIn(BaseModel):
+    amount_usd: Decimal = Field(description="The difference to apply; negative lowers the total.")
+    note: str = Field(min_length=3, max_length=300, description="Why. Shown with the line for good.")
+
+
+@app.post("/api/usage/{line_id}/adjustments", status_code=201, dependencies=[Depends(require_api_token)])
+async def adjust_usage(line_id: int, body: AdjustmentIn, request: Request):
+    """Correct a ledger line by adding one. The line itself is never changed. For the
+    deployment's operator, acting in the organization the line belongs to."""
+    who = acting_as(request, "operator")
+
+    def _adjust(s):
+        try:
+            return billing.describe(billing.adjust(s, line_id, body.amount_usd, note=body.note, by=who, organization_id=organization_id()))
+        except billing.LedgerError as e:
+            raise HTTPException(404 if "no such" in str(e) else 400, str(e)) from None
+
+    return await run_db(_adjust)
 
 
 @app.get("/api/timeline", dependencies=[Depends(require_api_token)])

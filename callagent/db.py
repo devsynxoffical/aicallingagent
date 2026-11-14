@@ -376,22 +376,43 @@ class TrainingRun(Base):
 
 
 class UsageRecord(Base):
-    """What a call used, written once when the call's final duration is known. This is
-    the ledger a bill would be drawn from: one row per call and kind, enforced by the
-    database, so reprocessing an event can never charge twice."""
+    """The usage ledger: what was used, by whom, and what it comes to. A bill, a
+    budget and a spend figure are all sums over these lines.
+
+    A line is never changed or removed once written. A correction is a new line that
+    points at the one it corrects (``adjusts_id``) and holds the difference, so the
+    history of every figure can be read back. ``key`` names what a line is for, and
+    is unique: writing the same fact twice (a repeated provider report, a retried
+    job) finds the existing line.
+
+    ``basis`` says how far the amount can be trusted: "estimate" is measured usage
+    at a configured or list price; "provider" is the provider's own figure.
+    """
 
     __tablename__ = "usage_records"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
-    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
-    call_run_id: Mapped[int] = mapped_column(ForeignKey("call_runs.id"))
-    kind: Mapped[str] = mapped_column(String(20), default="call")
-    quantity_seconds: Mapped[int] = mapped_column(Integer, default=0)
-    amount_usd: Mapped[Any] = mapped_column(Numeric(12, 4), default=0)  # exact decimal, not floating point
+    campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id"), nullable=True, index=True)
+    call_run_id: Mapped[int | None] = mapped_column(ForeignKey("call_runs.id"), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(20), default="call")  # call (telephony and speech, by time) | ai_model
+    key: Mapped[str] = mapped_column(String(160))
+    quantity_seconds: Mapped[int] = mapped_column(Integer, default=0)  # call lines: the seconds billed
+    quantity: Mapped[Any] = mapped_column(Numeric(18, 4), default=0)
+    unit: Mapped[str] = mapped_column(String(16), default="minute")  # minute | token
+    amount_usd: Mapped[Any] = mapped_column(Numeric(12, 4), default=0)  # exact decimal, not floating point; negative on a downward correction
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    basis: Mapped[str] = mapped_column(String(12), default="estimate")  # estimate | provider | manual
+    adjusts_id: Mapped[int | None] = mapped_column(ForeignKey("usage_records.id"), nullable=True)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # how the amount was arrived at: rates, counts, source
+    note: Mapped[str] = mapped_column(String(300), default="")
+    created_by: Mapped[str] = mapped_column(String(254), default="")  # a person, for a manual correction
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
-    __table_args__ = (Index("uq_usage_records_call_kind", "call_run_id", "kind", unique=True),)
+    __table_args__ = (
+        Index("uq_usage_records_key", "key", unique=True),
+        CheckConstraint("basis IN ('estimate', 'provider', 'manual')", name="ck_usage_records_basis"),
+    )
 
 
 class AuditEntry(Base):

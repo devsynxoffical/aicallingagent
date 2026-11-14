@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from callagent import db, jobs
+from callagent import accounts, db, jobs
 from callagent.config import get_settings, resolve_api_token
 from callagent.db import Appointment, CallRun, Campaign, Job, Lead, UsageRecord, User, WebsiteRequest, session_scope
 from callagent.dialer import lifecycle
@@ -127,6 +127,9 @@ ACME_MARKERS = ["Acme only", "acme.example", "Acme secret", "Acme confidential",
 def test_every_route_refuses_another_organizations_identifiers(client, two):
     before = snapshot(two["acme_id"])
     addressed = [(method.upper(), path) for path, operations in client.app.openapi()["paths"].items() if path.startswith("/api") and "{" in path for method in operations]
+    # Routes for the deployment's operator alone answer 403 to every organization's people, whatever id is named;
+    # that the operator cannot reach across organizations with them is tested with the ledger (tests/test_billing.py).
+    addressed = [(method, path) for method, path in addressed if accounts.required_role(method, path) != accounts.PLATFORM]
     assert len(addressed) > 30  # the sweep really covers the API
 
     answers = {}
