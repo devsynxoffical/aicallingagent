@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from ..config import Settings, get_settings
 from ..db import ACTIVE_CALL_STATUSES, TERMINAL_CALL_STATUSES, CallRun, Lead, run_db, utcnow
 from . import lifecycle, twilio_client
-from .campaign_runner import apply_twilio_status, release_inbound_lead
+from .campaign_runner import apply_twilio_status, call_settings, release_inbound_lead
 from .rules import campaign_settings
 
 log = logging.getLogger(__name__)
@@ -53,7 +53,8 @@ def _candidates(s: Session, settings: Settings) -> list[dict[str, Any]]:
         if not due:
             continue
         lead = s.get(Lead, run.lead_id)
-        out.append({"id": run.id, "sid": run.twilio_call_sid, "phone": lead.phone_e164 if lead else None, "started_at": run.started_at})
+        out.append({"id": run.id, "sid": run.twilio_call_sid, "phone": lead.phone_e164 if lead else None, "started_at": run.started_at,
+                    "settings": call_settings(s, run.id, settings)})
     return out
 
 
@@ -106,7 +107,8 @@ async def reconcile_calls(settings: Settings | None = None, provider=twilio_clie
             if candidate["sid"]:
                 lookup = asyncio.to_thread(provider.fetch_call, candidate["sid"], settings)
             elif candidate["phone"]:
-                lookup = asyncio.to_thread(provider.find_call, candidate["phone"], candidate["started_at"] - timedelta(minutes=1), settings)
+                # Looked for among the calls from the number this one was placed from: its organization's, not another's.
+                lookup = asyncio.to_thread(provider.find_call, candidate["phone"], candidate["started_at"] - timedelta(minutes=1), candidate["settings"])
             else:
                 continue
             found = await asyncio.wait_for(lookup, timeout=settings.provider_timeout_seconds + 5)

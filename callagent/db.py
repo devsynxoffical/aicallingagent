@@ -87,6 +87,9 @@ class Organization(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True)
+    # What is this organization's own: the numbers it calls from, where a call is handed
+    # to a person, where bookings are reported, its rates. See callagent/orgsettings.py.
+    settings_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=dict)
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
 
@@ -189,6 +192,9 @@ class CallRun(Base):
     experiment_arm: Mapped[str | None] = mapped_column(String(10), nullable=True)
     # Playbook version this call ran, so results can be compared between versions.
     playbook_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The number this call was placed from (one of its organization's), kept so that a
+    # text, a transfer and any question to the provider about this call use the same one.
+    from_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # What the conversation actually ran on: the model, and a fingerprint of the instructions it was given.
     ai_model: Mapped[str | None] = mapped_column(String(80), nullable=True)
     prompt_hash: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -415,6 +421,27 @@ class UsageRecord(Base):
         Index("uq_usage_records_key", "key", unique=True),
         CheckConstraint("basis IN ('estimate', 'provider', 'manual')", name="ck_usage_records_basis"),
     )
+
+
+class ApiKey(Base):
+    """A key an organization's own systems use to call the API. It belongs to one
+    organization and carries one role. Only a hash is stored: the key itself is shown
+    once, when it is created."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    role: Mapped[str] = mapped_column(String(12), default="viewer")
+    prefix: Mapped[str] = mapped_column(String(16))  # the first characters, to tell keys apart in a list
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_by: Mapped[str] = mapped_column(String(254), default="")
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+    __table_args__ = (CheckConstraint("role IN ('admin', 'operator', 'viewer')", name="ck_api_keys_role"),)
 
 
 class AuditEntry(Base):
@@ -983,7 +1010,7 @@ def dumps(obj: Any) -> str:
 # Every table whose rows belong to one organization. Row-level security covers exactly these.
 TENANT_TABLES = (
     "campaigns", "leads", "call_runs", "appointments", "do_not_call", "usage_records", "training_documents", "knowledge_chunks",
-    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events", "ai_usage", "audit_log",
+    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events", "ai_usage", "audit_log", "api_keys",
 )
 # Rows of these may belong to no organization (the deployment's own housekeeping and facts).
 _SHARED_WHEN_UNOWNED = ("jobs", "events")

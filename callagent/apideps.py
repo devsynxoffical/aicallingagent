@@ -42,6 +42,10 @@ async def require_api_token(
         principal = accounts.operator_principal(known) if known is not None else await run_db(_operator)
         if principal is None:
             raise HTTPException(status_code=404, detail="no such organization")
+    elif given.startswith(accounts.KEY_PREFIX):
+        principal = await run_db(lambda s: accounts.principal_for_api_key(s, given), unrestricted=True)
+        if principal is None:
+            raise HTTPException(status_code=401, detail="this API key is unknown or was revoked")
     else:
         principal = await run_db(lambda s: accounts.principal_for_session(s, given))
         if principal is None:
@@ -50,6 +54,8 @@ async def require_api_token(
     request.state.caller = principal
     route = getattr(request.scope.get("route"), "path", request.url.path)
     needed = accounts.required_role(request.method, route)
+    if principal.kind == "key" and route.startswith(accounts.KEY_FORBIDDEN_ROUTES):
+        raise HTTPException(status_code=403, detail="an API key cannot manage people, passwords or keys; sign in as a person for that")
     if not accounts.allows(principal, needed):
         if needed == accounts.PLATFORM:
             raise HTTPException(status_code=403, detail="only the operator of this deployment can manage organizations")
@@ -78,7 +84,7 @@ def acting_as(request: Request, given: str = "") -> str:
     """Who to record as having taken an action: the signed-in person, whatever the
     request body claims; for the API token, the name the caller gave."""
     principal = getattr(request.state, "principal", None)
-    if principal is not None and principal.kind == "user":
+    if principal is not None and principal.kind in ("user", "key"):
         return principal.email
     return given
 

@@ -85,8 +85,9 @@ def two(client):
         request = WebsiteRequest(organization_id=acme_id, kind="contact", email="visitor@acme-customer.example", name="Acme Visitor", message="Acme inbound message")
         s.add(request)
         s.flush()
+        key, _secret = accounts.create_api_key(s, acme_id, "Acme integration", "viewer", "test")
         ids = {"call_run_id": call.id, "job_id": dead.id, "user_id": member["id"], "request_id": request.id, "document_id": document.json()["id"],
-               "lead_id": lead.id, "number": draft.version, "experiment_id": 1, "name": "Acme only"}
+               "lead_id": lead.id, "number": draft.version, "experiment_id": 1, "name": "Acme only", "key_id": key.id}
     return {"acme": acme, "bolt": bolt, "acme_id": acme_id, "bolt_id": bolt_id, "ids": ids}
 
 
@@ -104,6 +105,8 @@ def snapshot(acme_id):
             "jobs": [(j.id, j.status, j.attempts) for j in s.execute(select(Job).where(Job.organization_id == acme_id)).scalars()],
             "requests": [(r.id, r.status) for r in s.execute(select(WebsiteRequest).where(WebsiteRequest.organization_id == acme_id)).scalars()],
             "campaigns": s.execute(select(func.count()).select_from(Campaign).where(Campaign.organization_id == acme_id)).scalar_one(),
+            "keys": [(k.id, k.revoked_at) for k in accounts.list_api_keys(s, acme_id)],
+            "settings": dict(s.get(db.Organization, acme_id).settings_json or {}),
         }
 
 

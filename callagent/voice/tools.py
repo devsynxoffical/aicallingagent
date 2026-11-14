@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+from sqlalchemy import select
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import EndWorkerFrame
@@ -291,7 +292,10 @@ async def book_meeting(session: CallSession, params: FunctionCallParams) -> dict
                 "lead_extra": session.lead.get("extra", {}),
                 "call_run_id": session.call_run_id,
             }
-            jobs.enqueue(s, background.BOOKING_WEBHOOK, key, {"delivery_id": key, "body": body}, max_attempts=8, timeout_seconds=30, call_run_id=session.call_run_id)
+            # Delivered to the webhook of the organization this booking belongs to, whoever else shares the deployment.
+            organization_id = s.execute(select(CallRun.organization_id).where(CallRun.id == session.call_run_id)).scalar()
+            jobs.enqueue(s, background.BOOKING_WEBHOOK, key, {"delivery_id": key, "body": body, "organization_id": organization_id}, max_attempts=8, timeout_seconds=30,
+                         call_run_id=session.call_run_id)
         return appt.id
 
     appt_id = await run_db(_save)

@@ -321,7 +321,7 @@ class RequestContext:
         endpoint = getattr(scope.get("route"), "name", None) or route
         forwarded = (headers.get(b"x-forwarded-for") or b"").decode("latin-1").split(",")[0].strip()
         address = forwarded or (scope.get("client") or ("", 0))[0]
-        actor = principal.email if principal.kind == "user" else "api token"
+        actor = principal.email if principal.kind in ("user", "key") else "api token"  # a key is named, so its actions are its own
 
         def _write(s) -> None:
             audit_entry(s, organization_id=principal.organization_id, actor=actor, role=principal.role, action=endpoint, method=method, route=route,

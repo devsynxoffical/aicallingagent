@@ -22,7 +22,7 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from . import background, billing, events, jobs, leader, llm, observability
+from . import background, billing, db, events, jobs, leader, llm, observability, orgsettings
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
@@ -651,6 +651,8 @@ async def create_campaign(body: CampaignIn):
 async def setup_status(settings: Settings = Depends(get_settings)):
     """What is connected and what is still missing before real calls can be placed or
     answered. Names of settings only: no value of any key is ever returned."""
+    # The phone number is the caller's organization's own, not necessarily the deployment's.
+    settings = await run_db(lambda s: orgsettings.effective(s, organization_id(), settings))
     stt, tts = get_stt(settings), get_tts(settings)
 
     def check(key: str, label: str, purpose: str, required: dict) -> dict:
@@ -777,12 +779,21 @@ async def upload_leads(name: str, file: UploadFile = File(...), settings: Settin
     return report.as_dict()
 
 
+def _cannot_call(s, settings: Settings) -> str | None:
+    """Why the caller's organization cannot place calls right now, or None."""
+    org = s.get(db.Organization, organization_id())
+    missing = orgsettings.effective(s, org.id, settings).missing_for_calls()
+    if missing == ["TWILIO_FROM_NUMBER"] and not orgsettings.is_default(org):
+        return "this organization has no phone number to call from yet. The operator of this deployment assigns one."
+    return f"cannot place calls, missing settings: {', '.join(missing)}" if missing else None
+
+
 @app.post("/api/campaigns/{name}/start", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def start_campaign(name: str, concurrency: int | None = None, force: bool = False, settings: Settings = Depends(get_settings)):
     await run_db(lambda s: _get_campaign(s, name).id)  # whose it is comes first: 404 before anything about configuration
-    missing = settings.missing_for_calls()
-    if missing:
-        raise HTTPException(400, f"cannot place calls, missing settings: {', '.join(missing)}")
+    problem = await run_db(lambda s: _cannot_call(s, settings))
+    if problem:
+        raise HTTPException(400, problem)
 
     def _prep(s):
         c = _get_campaign(s, name)
@@ -889,9 +900,9 @@ async def set_inbound_number(name: str, number: str | None = None, settings: Set
 async def dial_one(name: str, phone: str, first_name: str = "", settings: Settings = Depends(get_settings)):
     """Place a single test call to one number (added to the campaign as a lead)."""
     await run_db(lambda s: _get_campaign(s, name).id)  # whose it is comes first
-    missing = settings.missing_for_calls()
-    if missing:
-        raise HTTPException(400, f"cannot place calls, missing settings: {', '.join(missing)}")
+    problem = await run_db(lambda s: _cannot_call(s, settings))
+    if problem:
+        raise HTTPException(400, problem)
     e164 = normalize_phone(phone, settings.default_phone_region)
     if not e164:
         raise HTTPException(400, f"invalid phone number: {phone}")

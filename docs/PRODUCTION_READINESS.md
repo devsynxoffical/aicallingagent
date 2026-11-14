@@ -178,9 +178,10 @@ the environment's settings, not in a conversation.
 
 In order of what they block. Details in the audit's "Still open" table.
 
-1. **Telephony settings per organization** (A-11): the caller number, the transfer
-   number, the booking webhook and the rates are one set per deployment.
-2. **API keys per organization** (A-10).
+1. **Sign-up without the operator**: an organization is created by the operator,
+   who also assigns its caller numbers.
+2. **A phone provider account per organization**: every organization's numbers
+   are numbers of the deployment's one account.
 3. **Invoices, payments, plans, taxes, balances.** The ledger is what they would be
    drawn from.
 4. **Data retention and erasure.**
@@ -238,7 +239,9 @@ not been measured.
 1. **Nothing has met a real provider.** Status values and timing, media stream
    behaviour, model names and request options, usage reports: all assumptions.
 2. **Unknown call capacity.** Audio shares a process with the API and jobs.
-3. **A second organization shares the first one's phone number and webhook.**
+3. **A second organization has not been run for real.** Its numbers, webhook,
+   transfer number and rates are its own in every test; no second customer has
+   placed a call.
 4. **Backups stay on the machine unless you arrange otherwise.**
 5. **Costs are estimates** until a month is reconciled with the providers' invoices.
    The budget does not reserve AI cost in advance.
@@ -283,8 +286,7 @@ In this order:
 
 1. **Provider validation** (the pilot list above). Everything else rests on it, and
    it will change what else is worth doing.
-2. **Telephony settings and API keys per organization** (A-11, A-10): what a second
-   customer needs.
+2. **Sign-up, plans and statements**: what selling to many customers needs.
 3. **Retention and erasure**, with the customer's requirements.
 4. **The report in SQL and pruning of old rows** (D-4, D-9), once real campaign
    sizes are known.

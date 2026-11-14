@@ -223,3 +223,15 @@ refused while corrections or AI lines exist.
 With `AUTO_MIGRATE=false`, none of these run when a process starts: `callagent db
 upgrade` applies them, and a process refuses to start against a database that is
 not at its version.
+
+## Organization settings and API keys (migration 0014)
+
+- `organizations.settings_json`: what is one organization's own (caller numbers,
+  transfer number, booking webhook and secret, rates). Empty means nothing of its
+  own. Validated by `callagent/orgsettings.py`, not by the database.
+- `call_runs.from_number`: the number a call was placed from, decided when the
+  call is created.
+- `api_keys`: organization, name, role (CHECK), the first characters of the key, a
+  SHA-256 of the key (unique), who created it, when it was last used and revoked.
+  A tenant table. The key itself is never stored.
+

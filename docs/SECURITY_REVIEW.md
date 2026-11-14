@@ -17,15 +17,13 @@ numbers or email addresses. Backups can be encrypted.
 
 What still stands between this and selling to a second customer:
 
-1. **Telephony settings are one set per deployment** (A-11): the phone number calls
-   come from, the transfer number, the booking webhook and the cost rates. A second
-   organization would dial from the first one's number.
-2. **The engine's API token is one all-powerful secret** (A-10). It is the
-   deployment operator's credential; there are no API keys per organization.
-3. **No password reset by email and no second factor** (A-13).
-4. **No data retention or erasure**: transcripts and lead data are kept until
+1. **No password reset by email and no second factor** (A-13).
+2. **No data retention or erasure**: transcripts and lead data are kept until
    someone deletes them in the database.
-5. **Nothing has been attacked on purpose.**
+3. **One phone provider account serves every organization.** Each organization has
+   its own caller numbers, assigned by the operator, but they are all numbers of
+   the deployment's account.
+4. **Nothing has been attacked on purpose.**
 
 ## By area
 
@@ -34,9 +32,12 @@ What still stands between this and selling to a second customer:
 | Authentication | Built | Passwords hashed with scrypt and a per-password salt; session tokens are random, stored only as a SHA-256, expire after 12 hours, and end at sign-out or deactivation; the same answer for an unknown email, a wrong password and a deactivated account. `tests/test_accounts.py` |
 | Brute force | Partly | An account locks for 15 minutes after 5 wrong passwords. The console limits sign-in attempts per address, keyed on the address its own proxy reports, not one the client can choose. The engine has no limit per address (A-12), so someone can lock a known account out repeatedly |
 | Roles | Built | viewer, operator, admin, decided on the server from the declared route; the console's hiding of buttons is a convenience only. A test calls every route as every role |
-| Organization isolation | Built, two layers | Application: every lookup goes through the caller's organization; another organization's object answers 404. Database: row-level security on 17 tables, forced on the owner too, set per transaction. `tests/test_tenancy.py` calls every addressable route as another organization, on SQLite and on PostgreSQL as an ordinary role; `tests/test_row_level_security.py` runs unfiltered queries against the policies |
+| Organization isolation | Built, two layers | Application: every lookup goes through the caller's organization; another organization's object answers 404. Database: row-level security on 18 tables, forced on the owner too, set per transaction. `tests/test_tenancy.py` calls every addressable route as another organization, on SQLite and on PostgreSQL as an ordinary role; `tests/test_row_level_security.py` runs unfiltered queries against the policies |
 | Row-level security in a deployment | **Depends on the database role** | A superuser or a role with BYPASSRLS is not bound by the policies. `/api/status` reports `enforced`, `bypassed` or `missing`; run the engine as an ordinary role |
-| The operator's token | Open (A-10) | One static secret for the whole deployment, compared in constant time. It creates organizations, corrects the ledger, reads metrics, and acts in any organization it names. Set it explicitly, keep it in a secret store, rotate by changing it and restarting |
+| The operator's token | By design | One static secret for the deployment's operator, compared in constant time. It creates organizations, assigns caller numbers and rates, corrects the ledger, reads metrics, and acts in any organization it names. Set it explicitly, keep it in a secret store, rotate by changing it and restarting |
+| API keys | Built | Per organization, with a role; only a SHA-256 is stored and the key is shown once; revocable at once. A key cannot create keys, manage people or change a password, whatever its role, so a leaked key cannot keep itself alive. What a key does is in the audit trail under its name |
+| Caller numbers | Built | Assigned to an organization by the operator only: an organization cannot type a caller number of its choosing. A number belongs to one organization. An organization without a number cannot place calls, and never falls back to another's |
+| Booking webhook secret | Built | Per organization, write-only: never returned by the API. Stored in the database in the clear |
 | Provider webhooks | Built | The phone provider's signature is checked on every webhook, against the public URL. Switching the check off (`TWILIO_VALIDATE_SIGNATURE=false`) is logged as an error at start; it is still possible |
 | Webhook replay | Mitigated | The provider's signatures carry no timestamp, so a captured request can be sent again. A replay changes nothing: statuses only move forward, the ledger has one line per key, inbound calls are unique per provider call id |
 | Media WebSocket | Built | Public endpoint; needs the per-call random token from our own instructions to the provider; the claim is a single conditional update, so exactly one connection gets a call; a connection that does not complete its opening exchange in 10 seconds is dropped |
@@ -82,12 +83,10 @@ What still stands between this and selling to a second customer:
 
 ## Before a second customer
 
-1. Telephony, webhook, transfer number and rates per organization (A-11).
-2. API keys per organization, stored hashed, with a role (A-10).
-3. The engine running as an ordinary database role, with `/api/status` showing
+1. The engine running as an ordinary database role, with `/api/status` showing
    row-level security `enforced`.
-4. A retention period and an erase operation, decided with the customer.
-5. An outside security review, and the dependency scan read and acted on.
+2. A retention period and an erase operation, decided with the customer.
+3. An outside security review, and the dependency scan read and acted on.
 
 ## Smaller items
 

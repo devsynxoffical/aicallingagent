@@ -526,6 +526,28 @@ callagent db restore PATH      # stop the server first
 - **Stopping.** `callagent serve` waits for calls in progress when it is told to
   stop (`SHUTDOWN_DRAIN_SECONDS`). Give your process manager a longer grace period.
 
+### Several customers on one deployment
+
+Each organization has its own caller numbers, transfer number, booking webhook and
+rates, and its own API keys. The deployment's environment settings
+(`TWILIO_FROM_NUMBER`, `HUMAN_TRANSFER_NUMBER`, `BOOKING_WEBHOOK_URL`) belong to the
+default organization only: another organization never borrows them, and cannot place
+calls until it has a number.
+
+```bash
+# the operator (the engine's API token): a new customer, then the numbers it calls from
+curl -X POST $ENGINE/api/organizations -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name": "Bolt", "admin_email": "boss@bolt.example", "admin_password": "…"}'
+curl -X PUT $ENGINE/api/organizations/2/telephony -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"from_numbers": ["+14155550210", "+14155550211"]}'
+```
+
+The numbers must be ones you hold at the phone provider. With several, each lead is
+always called from the same one. The organization's admin then sets the transfer
+number and booking webhook (`PUT /api/organization/settings`) and creates API keys
+for their own systems (`POST /api/keys`): a key has a role, is shown once, and is
+sent as `Authorization: Bearer dtk_…`.
+
 ### Where things stand
 
 **No part of this has handled a real phone call.** It was built and tested without

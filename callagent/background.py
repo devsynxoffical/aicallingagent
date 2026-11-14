@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from . import jobs
 from .config import get_settings
-from .db import CallRun, Campaign, Job, Lead, TrainingDocument, TrainingRun, run_blocking, run_db, utcnow
+from .db import CallRun, Campaign, Job, Lead, TrainingDocument, TrainingRun, default_organization_id, run_blocking, run_db, utcnow
 from .llm import attributed
 
 log = logging.getLogger(__name__)
@@ -130,7 +130,10 @@ async def deliver_booking_webhook(payload: dict[str, Any]) -> None:
     """Tell the customer's system about a booked meeting. Anything but a 2xx answer is a
     failure and is retried. The receiver can de-duplicate on X-Callagent-Delivery, which
     is the same for every retry of one booking."""
-    settings = get_settings()
+    from . import orgsettings
+
+    organization_id = payload.get("organization_id")  # absent on jobs queued before organizations had their own webhook
+    settings = await run_db(lambda s: orgsettings.effective(s, organization_id if organization_id is not None else default_organization_id(s), get_settings()))
     url = settings.booking_webhook_url
     if not url:
         return  # the webhook was switched off after the booking: nothing to deliver

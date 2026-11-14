@@ -61,7 +61,8 @@ Kept current as work lands. A finding not listed here is open.
 | A-7 Tables without an organization | Fixed | Migration 0007; `test_a_database_of_the_previous_release_gets_an_organization_on_every_row` on SQLite and PostgreSQL |
 | A-8 Shared do-not-call list | Fixed | `test_an_opt_out_belongs_to_the_organization_that_was_asked` |
 | A-9 Inbound number conflict names the owner | Fixed (the disclosure); ownership of numbers still open with A-11 | `test_every_new_row_is_filed_under_its_campaigns_organization` |
-| A-10 One all-powerful API token | Partly: it is now the operator's credential (creates organizations, names the one to act in). Per-organization API keys: open | `test_the_organization_comes_from_the_account_never_from_the_request` |
+| A-10 One all-powerful API token | Fixed: the engine's token is the operator's credential; each organization has its own API keys, stored as hashes, with a role, shown once, revocable. A key cannot make keys, manage people or change a password | `test_a_key_is_shown_once_stored_as_a_hash_and_acts_within_its_organization_and_role`, `test_a_key_cannot_make_keys_or_manage_people_and_stops_working_when_revoked` |
+| A-11 Telephony settings are one set per deployment | Fixed: caller numbers (a pool, assigned by the operator, one organization per number), the transfer number, the booking webhook and its secret, and rates are per organization. Only the default organization inherits the deployment's environment. One provider account still serves every organization | `tests/test_organization_settings.py` on SQLite and PostgreSQL |
 | Defence in depth (asked for in the brief) | Added: PostgreSQL row-level security on every tenant table (16 today), migration 0008 | `tests/test_row_level_security.py` runs unfiltered queries as an ordinary role; the whole isolation suite also runs on PostgreSQL with the policies enforced |
 | D-5 Migrations and new databases differ | Fixed except concurrent index builds: an upgraded database and a new one are compared column by column on both databases; rollbacks of the organization and ledger migrations are tested; with `AUTO_MIGRATE=false` a process refuses a database that is not at its version and changes nothing | `test_an_upgraded_database_and_a_new_one_have_the_same_schema`, `test_with_automatic_migration_off_a_process_refuses_an_out_of_date_database` |
 | D-8 Schema integrity | Partly: CHECK constraints on the four status columns. Missing foreign keys and the appointment time: open | Same migration tests |
@@ -128,8 +129,6 @@ Not in the table above means not done. In order of what they block:
 
 | Finding | What it blocks |
 | --- | --- |
-| A-11 Telephony number, transfer number, booking webhook and rates are one set per deployment | A second customer on the same deployment |
-| A-10 API keys per organization | Integrations by a customer |
 | Real provider validation (every B and C finding was tested with stand-ins) | Any production use |
 | A-12 Sign-in attempts limited per address on the engine | A known account can be locked out repeatedly |
 | A-13 Password reset by email, a second factor | Self-service; stronger sign-in |

@@ -88,7 +88,10 @@ def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: b
             raise LeadNotDialable(refusal)
     # In an A/B test the lead's side, and so the playbook version, is fixed for every attempt.
     experiment_id, arm, version = experiments.assign(s, campaign, lead) if campaign else (None, None, None)
-    run = CallRun(lead_id=lead.id, campaign_id=campaign_id, status="created", playbook_version=version, experiment_id=experiment_id, experiment_arm=arm)
+    from .. import orgsettings
+
+    run = CallRun(lead_id=lead.id, campaign_id=campaign_id, status="created", playbook_version=version, experiment_id=experiment_id, experiment_arm=arm,
+                  from_number=orgsettings.number_for(campaign_settings(s, campaign_id, get_settings()), lead.id))
     s.add(run)
     try:
         s.flush()
@@ -99,6 +102,17 @@ def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: b
     events.emit(s, "CallInitiated", key=f"call:{run.id}:initiated", subject="call", subject_id=run.id, organization_id=run.organization_id,
                 campaign_id=campaign_id, call_run_id=run.id, payload={"lead_id": lead.id, "manual": manual, "playbook_version": version})
     return run.id, lead.phone_e164
+
+
+def call_settings(s: Session, call_run_id: int, settings: Settings) -> Settings:
+    """The settings one call runs under: its campaign's and organization's, with the
+    number this call is placed from. A text, a transfer and any question to the
+    provider about the call use that same number."""
+    run = s.get(CallRun, call_run_id)
+    if run is None:
+        return settings
+    effective = campaign_settings(s, run.campaign_id, settings)
+    return effective.model_copy(update={"twilio_from_number": run.from_number}) if run.from_number else effective
 
 
 def in_calling_window(
@@ -325,8 +339,9 @@ class CampaignRunner:
         """Reserve the lead, then place the call. Returns the CallRun id.
         Raises :class:`LeadNotDialable` when the lead must not be rung now."""
         run_id, phone = await run_db(lambda s: claim_lead_for_call(s, campaign_id, lead_id, manual=manual))
+        placing = await run_db(lambda s: call_settings(s, run_id, self.settings))
         try:
-            sid = await twilio_client.place_call_async(run_id, phone, self.settings)
+            sid = await twilio_client.place_call_async(run_id, phone, placing)
         except Exception as e:
             log.exception("Twilio call failed for lead %s", lead_id)
             err = str(e)

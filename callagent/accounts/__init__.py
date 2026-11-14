@@ -26,7 +26,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..db import Organization, User, UserSession, default_organization_id, utcnow
+from ..db import ApiKey, Organization, User, UserSession, default_organization_id, utcnow
 
 ROLES = ("viewer", "operator", "admin")
 RANK = {role: rank for rank, role in enumerate(ROLES)}
@@ -84,7 +84,7 @@ def required_role(method: str, route: str) -> str:
         return PLATFORM
     if route.startswith("/api/usage/") and method not in ("GET", "HEAD", "OPTIONS"):
         return PLATFORM  # correcting the ledger is for whoever bills, not for the organization billed
-    if route.startswith("/api/users") or route.startswith("/api/audit"):
+    if route.startswith(("/api/users", "/api/audit", "/api/keys")):
         return "admin"
     if route.startswith("/api/auth/"):
         return "viewer"
@@ -392,3 +392,61 @@ def create_organization(s: Session, name: str, *, admin_email: str, admin_passwo
     s.flush()
     admin = create_user(s, admin_email, admin_password, name=admin_name, role="admin", organization_id=org.id)
     return org, admin
+
+
+# ----------------------------------------------------------------------------- API keys
+
+KEY_PREFIX = "dtk_"
+# What a key may never do, whatever its role: make more keys, manage people, or change a
+# password. A key that leaks must not be able to keep itself alive or let someone in.
+KEY_FORBIDDEN_ROUTES = ("/api/keys", "/api/users", "/api/auth/password")
+
+
+def create_api_key(s: Session, organization_id: int, name: str, role: str, by: str) -> tuple[ApiKey, str]:
+    """A new key for an organization's own systems. Returns the record and the key
+    itself, which is shown this once and cannot be read back."""
+    name = (name or "").strip()
+    if not name or len(name) > 100:
+        raise AccountError("give the key a name of at most 100 characters, such as what will use it")
+    if role not in ROLES:
+        raise AccountError(f"role must be one of {', '.join(ROLES)}")
+    key = KEY_PREFIX + secrets.token_urlsafe(32)
+    record = ApiKey(organization_id=organization_id, name=name, role=role, prefix=key[:12], key_hash=_token_hash(key), created_by=by[:254])
+    s.add(record)
+    s.flush()
+    return record, key
+
+
+def list_api_keys(s: Session, organization_id: int) -> list[ApiKey]:
+    return list(s.execute(select(ApiKey).where(ApiKey.organization_id == organization_id).order_by(ApiKey.id.desc())).scalars())
+
+
+def revoke_api_key(s: Session, organization_id: int, key_id: int) -> ApiKey | None:
+    record = s.get(ApiKey, key_id)
+    if record is None or record.organization_id != organization_id:
+        return None
+    record.revoked_at = record.revoked_at or utcnow()
+    return record
+
+
+def describe_api_key(record: ApiKey) -> dict[str, Any]:
+    return {
+        "id": record.id, "name": record.name, "role": record.role, "starts_with": record.prefix, "created_by": record.created_by,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "last_used_at": record.last_used_at.isoformat() if record.last_used_at else None,
+        "revoked_at": record.revoked_at.isoformat() if record.revoked_at else None,
+    }
+
+
+def principal_for_api_key(s: Session, key: str) -> Principal | None:
+    """Who a key acts as: its organization, with its role. None when it is unknown or revoked."""
+    if not key.startswith(KEY_PREFIX):
+        return None
+    record = s.execute(select(ApiKey).where(ApiKey.key_hash == _token_hash(key), ApiKey.revoked_at.is_(None))).scalars().first()
+    if record is None:
+        return None
+    now = utcnow()
+    if record.last_used_at is None or (now - record.last_used_at).total_seconds() > 300:
+        record.last_used_at = now  # roughly when: not a write on every request
+    return Principal(kind="key", role=record.role, organization_id=record.organization_id, name=record.name, email=f"api key: {record.name}")
+

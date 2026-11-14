@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 
 from .. import accounts
 from ..apideps import current_principal, require_api_token
+from .. import orgsettings
+from ..config import get_settings
 from ..db import Organization, User, run_db
 
 public = APIRouter(prefix="/api/auth", tags=["accounts"])
@@ -159,3 +161,109 @@ async def create_organization(body: OrganizationIn):
         return {**accounts.describe_organization(s, org), "admin": accounts.describe(admin)}
 
     return await run_db(_create, unrestricted=True)
+
+
+class TelephonyIn(BaseModel):
+    from_numbers: list[str] | None = Field(default=None, description="Every number this organization may call from, in international form. Replaces the list.")
+    cost_per_connected_minute_usd: float | None = Field(default=None, ge=0)
+    cost_per_call_attempt_usd: float | None = Field(default=None, ge=0)
+    clear_rates: bool = Field(default=False, description="Go back to the deployment's rates.")
+
+
+@router.put("/organizations/{organization_id}/telephony")
+async def set_organization_telephony(organization_id: int, body: TelephonyIn):
+    """Assign an organization the numbers it calls from, and its rates. For the
+    deployment's operator: a caller number must be one the operator holds at the phone
+    provider, so it is not for the organization to type in."""
+
+    def _set(s):
+        org = s.get(Organization, organization_id)
+        if org is None:
+            raise HTTPException(404, "no such organization")
+        try:
+            orgsettings.set_by_operator(s, org, from_numbers=body.from_numbers, cost_per_connected_minute_usd=body.cost_per_connected_minute_usd,
+                                        cost_per_call_attempt_usd=body.cost_per_call_attempt_usd, clear_rates=body.clear_rates)
+        except orgsettings.SettingsError as e:
+            raise HTTPException(409 if "already assigned" in str(e) else 400, str(e)) from None
+        return {**accounts.describe_organization(s, org), "settings": orgsettings.describe(org, get_settings())}
+
+    return await run_db(_set, unrestricted=True)
+
+
+# ----------------------------------------------------------------------------- an organization's own settings
+
+
+class OrganizationSettingsIn(BaseModel):
+    human_transfer_number: str | None = Field(default=None, description="Where a call is handed to a person. Empty: the agent cannot transfer.")
+    booking_webhook_url: str | None = Field(default=None, description="Where booked meetings are reported. https only. Empty: nowhere.")
+    booking_webhook_secret: str | None = Field(default=None, description="Signs each report. Leave out to keep the one already set; it is never shown.")
+
+
+@router.get("/organization/settings")
+async def get_organization_settings(request: Request):
+    """What is this organization's own: its caller numbers, transfer number, booking webhook and rates."""
+    principal = current_principal(request)
+    return await run_db(lambda s: orgsettings.describe(s.get(Organization, principal.organization_id), get_settings()))
+
+
+@router.put("/organization/settings")
+async def set_organization_settings(body: OrganizationSettingsIn, request: Request):
+    """Set where calls are transferred and where bookings are reported. The caller
+    numbers and the rates are assigned by the deployment's operator."""
+    principal = current_principal(request)
+
+    def _set(s):
+        org = s.get(Organization, principal.organization_id)
+        try:
+            orgsettings.set_by_admin(org, human_transfer_number=body.human_transfer_number, booking_webhook_url=body.booking_webhook_url,
+                                     booking_webhook_secret=body.booking_webhook_secret, keep_secret="booking_webhook_secret" not in body.model_fields_set)
+        except orgsettings.SettingsError as e:
+            raise HTTPException(400, str(e)) from None
+        return orgsettings.describe(org, get_settings())
+
+    return await run_db(_set)
+
+
+# ----------------------------------------------------------------------------- API keys
+
+
+class ApiKeyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100, description="What will use it, so it can be recognised later.")
+    role: str = Field(default="viewer", description="viewer, operator or admin: what the key may do.")
+
+
+@router.get("/keys")
+async def list_api_keys(request: Request):
+    principal = current_principal(request)
+    return await run_db(lambda s: [accounts.describe_api_key(k) for k in accounts.list_api_keys(s, principal.organization_id)])
+
+
+@router.post("/keys", status_code=201)
+async def create_api_key(body: ApiKeyIn, request: Request):
+    """Create a key for this organization's own systems. The key is in the answer and
+    is not stored: copy it now."""
+    principal = current_principal(request)
+
+    def _create(s):
+        try:
+            record, key = accounts.create_api_key(s, principal.organization_id, body.name, body.role, principal.email or "api token")
+        except accounts.AccountError as e:
+            raise HTTPException(400, str(e)) from None
+        return {**accounts.describe_api_key(record), "key": key}
+
+    return await run_db(_create)
+
+
+@router.delete("/keys/{key_id}")
+async def revoke_api_key(key_id: int, request: Request):
+    """Revoke a key. It stops working at once and cannot be restored."""
+    principal = current_principal(request)
+
+    def _revoke(s):
+        record = accounts.revoke_api_key(s, principal.organization_id, key_id)
+        if record is None:
+            raise HTTPException(404, "no such key")
+        return accounts.describe_api_key(record)
+
+    return await run_db(_revoke)
+

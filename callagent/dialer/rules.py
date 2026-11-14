@@ -103,10 +103,17 @@ def rules_of(campaign: Campaign) -> CampaignRules:
 
 
 def campaign_settings(s: Session, campaign_id: int, settings: Settings) -> Settings:
-    """The global settings with this campaign's own retry and calling-window rules applied.
-    Code that already reads ``settings.max_attempts`` and friends gets the campaign's values."""
+    """The deployment's settings as they apply to this campaign: its organization's own
+    numbers, webhook and rates, then the campaign's retry and calling-window rules.
+    Code that already reads ``settings.max_attempts`` and friends gets the right values."""
+    from .. import orgsettings
+
     campaign = s.get(Campaign, campaign_id)
-    if campaign is None or not campaign.rules_json:
+    if campaign is None:
+        return settings
+    # First what is the organization's own (its numbers, transfer number, webhook, rates), then the campaign's rules.
+    settings = orgsettings.effective(s, campaign.organization_id, settings)
+    if not campaign.rules_json:
         return settings
     rules = rules_of(campaign)
     update: dict[str, Any] = {}

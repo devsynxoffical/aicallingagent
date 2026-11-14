@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
     twilio_from_number: str | None = None
+    # Filled per organization at run time (callagent/orgsettings.py): every number an
+    # organization may call from. The deployment's own number above is the default organization's.
+    twilio_from_numbers: list[str] = []
     twilio_validate_signature: bool = True
     public_base_url: str | None = None
     human_transfer_number: str | None = None

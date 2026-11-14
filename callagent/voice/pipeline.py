@@ -43,6 +43,7 @@ from ..db import CallRun, Campaign, Lead, campaign_organization_id, run_blocking
 from ..llm import attributed, prompt_hash, record_live_call
 from ..observability import active_calls, call_id
 from ..dialer import lifecycle
+from ..dialer.campaign_runner import call_settings
 from ..languages import LanguageSwitch, LanguageTracker
 from ..playbook.prompt_builder import build_system_prompt
 from ..playbook.schema import Playbook
@@ -150,6 +151,8 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
     call_id.set(call_run_id)  # every log line of this conversation carries it
     mode = str(body.get("mode", "live"))
     lead, playbook, campaign_id, stored_sid, direction, knowledge = await load_call_context(call_run_id)
+    # The organization's own transfer number, booking webhook and rates, and this call's own number.
+    settings = await run_db(lambda s: call_settings(s, call_run_id, settings))
     if direction == "inbound":
         mode = "inbound"
     active_calls.add(call_run_id)  # a stop signal waits for this to empty (observability.drain)
