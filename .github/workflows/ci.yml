@@ -33,7 +33,12 @@ jobs:
       - name: Install
         run: |
           # The backup tools must be of the database server's major version (16, the service above).
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client-16
+          # Taken from the PostgreSQL project's own package repository, as in the image: the
+          # runner's distribution carries only its own version.
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-common ca-certificates
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-16
+          /usr/lib/postgresql/16/bin/pg_dump --version
           pip install -e ".[dev,postgres]" pyyaml
       - name: The code compiles and imports
         run: |
