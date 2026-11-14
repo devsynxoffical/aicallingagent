@@ -72,7 +72,8 @@ async def post(url: str, body: bytes, headers: dict[str, str], *, timeout: float
         try:
             checked, address = await asyncio.to_thread(_checked, url)
         except IngestError as e:
-            raise DeliveryError(str(e)) from None
+            # The check is shared with the website reader, whose messages speak of websites.
+            raise DeliveryError(str(e).replace("the website", "the address").replace("public website address", "public address")) from None
         target, extra, extensions = pinned_request(checked, address)
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
