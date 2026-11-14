@@ -548,6 +548,11 @@ number and booking webhook (`PUT /api/organization/settings`) and creates API ke
 for their own systems (`POST /api/keys`): a key has a role, is shown once, and is
 sent as `Authorization: Bearer dtk_…`.
 
+What an organization used is read per calendar month (`GET /api/usage/statements`):
+calls, AI and corrections added up from the ledger, with a CSV of every line. A
+month that is over never changes. It is a statement of usage, not a tax invoice;
+nothing here takes a payment.
+
 People join by invitation: an admin makes a one-time link (`POST /api/invitations`,
 or the Team screen), hands it over, and the person chooses their own password. The
 same kind of link resets a forgotten password (`POST /api/users/{id}/reset-link`).

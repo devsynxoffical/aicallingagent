@@ -583,6 +583,33 @@ async def usage_ledger(days: int = 30, campaign: str | None = None, limit: int =
     return await run_db(_q)
 
 
+@app.get("/api/usage/statements", dependencies=[Depends(require_api_token)])
+async def usage_statements():
+    """The months the caller's organization has usage in, newest first, with each month's total."""
+    return await run_db(lambda s: billing.statement_months(s, organization_id()))
+
+
+@app.get("/api/usage/statements/{period}", dependencies=[Depends(require_api_token)])
+async def usage_statement(period: str, format: str = "json"):
+    """What the caller's organization used in one calendar month (``YYYY-MM``, UTC):
+    calls, AI, corrections, by campaign. ``format=csv`` gives every line of the month
+    instead. A statement of usage, not a tax invoice."""
+    try:
+        year, month = billing.parse_period(period)
+    except billing.LedgerError as e:
+        raise HTTPException(400, str(e)) from None
+    if format == "csv":
+        rows = await run_db(lambda s: billing.statement_lines(s, organization_id(), year, month), slow=True)
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=["line", "written_at", "kind", "campaign", "call", "quantity", "unit", "amount_usd", "basis", "corrects_line", "note"])
+        writer.writeheader()
+        writer.writerows({key: spreadsheet_safe(value) for key, value in row.items()} for row in rows)
+        return Response(out.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="usage-{year:04d}-{month:02d}.csv"'})
+    if format != "json":
+        raise HTTPException(400, "format is json or csv")
+    return await run_db(lambda s: billing.statement(s, organization_id(), year, month))
+
+
 class AdjustmentIn(BaseModel):
     amount_usd: Decimal = Field(description="The difference to apply; negative lowers the total.")
     note: str = Field(min_length=3, max_length=300, description="Why. Shown with the line for good.")

@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from callagent import accounts, db, jobs, webhooks
 from callagent.accounts import invitations
 from callagent.config import get_settings, resolve_api_token
-from callagent.db import Appointment, CallRun, Campaign, Job, Lead, UsageRecord, User, WebsiteRequest, session_scope
+from callagent.db import utcnow, Appointment, CallRun, Campaign, Job, Lead, UsageRecord, User, WebsiteRequest, session_scope
 from callagent.dialer import lifecycle
 from callagent.dialer.campaign_runner import claim_lead_for_call
 from callagent.training import versions
@@ -95,7 +95,7 @@ def two(client):
         s.flush()
         invitation, _token = invitations.invite(s, acme_id, "newcomer@acme.example", role="viewer", by="boss@acme.example")
         # A one-time link is opened by whoever holds its token, signed in or not: it names nothing by id.
-        ids = {"invitation_id": invitation.id, "token": "dti_not-a-link-anyone-was-given", "endpoint_id": endpoint.id, "delivery_id": delivery.id, "call_run_id": call.id, "job_id": dead.id, "user_id": member["id"], "request_id": request.id, "document_id": document.json()["id"],
+        ids = {"period": utcnow().strftime("%Y-%m"), "invitation_id": invitation.id, "token": "dti_not-a-link-anyone-was-given", "endpoint_id": endpoint.id, "delivery_id": delivery.id, "call_run_id": call.id, "job_id": dead.id, "user_id": member["id"], "request_id": request.id, "document_id": document.json()["id"],
                "lead_id": lead.id, "number": draft.version, "experiment_id": 1, "name": "Acme only", "key_id": key.id, "entry_id": suppressed.id}
     return {"acme": acme, "bolt": bolt, "acme_id": acme_id, "bolt_id": bolt_id, "ids": ids}
 
@@ -158,6 +158,8 @@ def test_every_route_refuses_another_organizations_identifiers(client, two):
         for marker in ACME_MARKERS[1:]:  # the campaign name itself is what Bolt typed; a 404 may repeat it
             assert marker not in response.text, f"{method} {path} showed Bolt something of Acme's: {marker}"
 
+    # A month names nothing of anyone's: Bolt asking for this month gets its own statement, which is empty (checked for markers above, and in tests/test_billing.py).
+    assert answers.pop(("GET", "/api/usage/statements/{period}")) == 200
     # Someone else's campaign, call, job, person, request or document does not exist as far as Bolt can tell.
     assert {route: status for route, status in answers.items() if status != 404} == {}
     assert snapshot(two["acme_id"]) == before  # and nothing of Acme's changed

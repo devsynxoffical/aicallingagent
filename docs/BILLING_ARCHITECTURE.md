@@ -123,6 +123,8 @@ Limits to know:
 | --- | --- | --- |
 | `GET /api/usage?days=30&campaign=name` | Any signed-in member of the organization | Total, totals by kind and basis, the newest lines (paged with `before_id`) |
 | `POST /api/usage/{line_id}/adjustments` | The deployment's operator, acting in the line's organization | Adds a correction: `{"amount_usd": "-0.12", "note": "why"}` |
+| `GET /api/usage/statements` | Any signed-in member | The months there is usage in, newest first, each with its total |
+| `GET /api/usage/statements/2026-11` | Any signed-in member | That month's statement; `?format=csv` gives every line of the month |
 | `GET /api/ai-usage` | Any signed-in member | AI use by workflow and model, including what could not be priced |
 | `GET /api/campaigns/{name}/rules` | Any signed-in member | The budget and `spend_usd` (the ledger sum) |
 
@@ -131,6 +133,25 @@ row-level security on PostgreSQL). An organization's admin cannot correct a line
 that is for whoever bills them. Corrections appear in the audit trail.
 
 Each line also produces a `UsageRecorded` event when it is a call's first line.
+
+### Monthly statements
+
+A statement is one calendar month (UTC) of an organization's ledger, added up:
+calls (how many, billed minutes, amount), AI (requests, tokens, amount),
+corrections, totals by basis and by campaign, and the grand total. Its number is
+`<organization>-<year>-<month>`.
+
+- **A line belongs to the month it was written in**, corrections included. A credit
+  given in March for a call of February is on March's statement.
+- So **the statement of a month that is over never changes**: no line is ever
+  changed or backdated. Tested: writing a new call and a correction to an old line
+  leaves the old month's statement identical.
+- The current month is marked `open`.
+- It is a statement of measured usage, and says so in its own text. It is **not a
+  tax invoice**: no tax, no seller or buyer details, no payment. Turning it into an
+  invoice needs those, and a payment provider.
+- The CSV has one row per line, with cells a spreadsheet would run as formulas
+  neutralised.
 
 ## 6. Moving an older database
 
@@ -177,4 +198,4 @@ Not verified:
 | Currencies other than USD | Not built |
 | Reserving AI cost in the budget | Not built |
 | Database-level protection of ledger lines (no UPDATE or DELETE for the application's role) | Not built; a permission change on PostgreSQL would do it |
-| Monthly statements and exports | `GET /api/usage` only |
+| Monthly statements and exports | Built: statements per calendar month and a CSV of their lines. No PDF, no invoice numbering scheme an accountant would accept as is |

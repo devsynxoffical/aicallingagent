@@ -20,11 +20,11 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -213,3 +213,111 @@ def summary(s: Session, organization_id: int, since: datetime, campaign_id: int 
         "what_the_amounts_are": "measured usage at configured rates and list prices, corrected where the provider's own figure is known; not an invoice",
         "lines": [describe(line) for line in s.execute(lines.order_by(UsageRecord.id.desc()).limit(max(1, min(limit, 500)))).scalars()],
     }
+
+
+# ----------------------------------------------------------------------------- statements
+
+
+STATEMENT_NOTE = ("A statement of measured usage: calls at the rates in force when each was made, AI at list prices, corrected where the provider's own figure "
+                  "is known. It is not a tax invoice: it carries no tax and no seller or buyer details, and this system collects no payment.")
+
+
+def month_bounds(year: int, month: int) -> tuple[datetime, datetime]:
+    """The first moment of a calendar month and of the next one, in UTC."""
+    if not (1 <= month <= 12 and 2000 <= year <= 2200):
+        raise LedgerError("give the month as YYYY-MM")
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    return start, datetime(year + (month == 12), month % 12 + 1, 1, tzinfo=timezone.utc)
+
+
+def parse_period(period: str) -> tuple[int, int]:
+    try:
+        year, month = period.split("-")
+        if len(year) != 4 or len(month) != 2:
+            raise ValueError
+        found = int(year), int(month)
+    except ValueError:
+        raise LedgerError("give the month as YYYY-MM") from None
+    month_bounds(*found)
+    return found
+
+
+def _in_month(organization_id: int, year: int, month: int) -> list[Any]:
+    start, end = month_bounds(year, month)
+    return [UsageRecord.organization_id == organization_id, UsageRecord.created_at >= start, UsageRecord.created_at < end]
+
+
+def statement(s: Session, organization_id: int, year: int, month: int, now: datetime | None = None) -> dict[str, Any]:
+    """What an organization used in one calendar month (UTC), from the ledger.
+
+    A line belongs to the month it was written in, corrections included: a correction
+    made in March to a call of February is on March's statement. Since no line is ever
+    changed or backdated, the statement of a month that is over never changes."""
+    from .db import Organization
+
+    scope = _in_month(organization_id, year, month)
+    start, end = month_bounds(year, month)
+    original, correction = UsageRecord.adjusts_id.is_(None), UsageRecord.adjusts_id.is_not(None)
+
+    def total(*where: Any, column: Any = UsageRecord.amount_usd) -> Decimal:
+        return Decimal(str(s.execute(select(func.coalesce(func.sum(column), 0)).where(*scope, *where)).scalar() or 0))
+
+    def lines(*where: Any) -> int:
+        return int(s.execute(select(func.count()).select_from(UsageRecord).where(*scope, *where)).scalar() or 0)
+
+    is_call, is_ai = UsageRecord.kind == "call", UsageRecord.kind == "ai_model"
+    by_campaign = s.execute(
+        select(UsageRecord.campaign_id, func.sum(UsageRecord.amount_usd),
+               func.sum(case((is_call & original, 1), else_=0)), func.sum(case((is_call, UsageRecord.quantity), else_=0)))
+        .where(*scope).group_by(UsageRecord.campaign_id)).all()
+    names = dict(s.execute(select(Campaign.id, Campaign.name).where(Campaign.id.in_([cid for cid, *_rest in by_campaign if cid is not None]))).all()) if by_campaign else {}
+    by_basis = s.execute(select(UsageRecord.basis, func.count(), func.sum(UsageRecord.amount_usd)).where(*scope).group_by(UsageRecord.basis).order_by(UsageRecord.basis)).all()
+    organization = s.get(Organization, organization_id)
+    money = lambda amount: str(Decimal(str(amount or 0)).quantize(CENT_HUNDREDTHS))  # noqa: E731
+    return {
+        "number": f"{organization_id}-{year:04d}-{month:02d}",
+        "organization": {"id": organization_id, "name": organization.name if organization else ""},
+        "period": {"year": year, "month": month, "from": start.isoformat(), "until": end.isoformat()},
+        # An open month is still being added to.
+        "status": "open" if (now or datetime.now(timezone.utc)) < end else "closed",
+        "currency": "USD",
+        "total_usd": money(total()),
+        "calls": {"count": lines(is_call, original), "minutes": str(total(is_call, column=UsageRecord.quantity).normalize() + ZERO), "amount_usd": money(total(is_call, original))},
+        "ai": {"requests": lines(is_ai, original), "tokens": int(total(is_ai, original, column=UsageRecord.quantity)), "amount_usd": money(total(is_ai, original))},
+        "corrections": {"lines": lines(correction), "amount_usd": money(total(correction))},
+        "by_basis": [{"basis": basis, "lines": int(count), "amount_usd": money(amount)} for basis, count, amount in by_basis],
+        "by_campaign": sorted(({"campaign_id": cid, "campaign": names.get(cid, "") if cid is not None else "", "calls": int(calls or 0),
+                                "minutes": str(Decimal(str(minutes or 0)).normalize() + ZERO), "amount_usd": money(amount)} for cid, amount, calls, minutes in by_campaign),
+                              key=lambda row: -Decimal(row["amount_usd"])),
+        "lines": lines(),
+        "what_this_is": STATEMENT_NOTE,
+    }
+
+
+def statement_months(s: Session, organization_id: int, limit: int = 24, now: datetime | None = None) -> list[dict[str, Any]]:
+    """The months an organization has anything in the ledger for, newest first."""
+    first = s.execute(select(func.min(UsageRecord.created_at)).where(UsageRecord.organization_id == organization_id)).scalar()
+    if first is None:
+        return []
+    now = now or datetime.now(timezone.utc)
+    year, month, out = now.year, now.month, []
+    if first.tzinfo is None:
+        first = first.replace(tzinfo=timezone.utc)
+    while (year, month) >= (first.year, first.month) and len(out) < limit:
+        scope = _in_month(organization_id, year, month)
+        count, amount = s.execute(select(func.count(), func.coalesce(func.sum(UsageRecord.amount_usd), 0)).where(*scope)).one()
+        if count:
+            out.append({"period": f"{year:04d}-{month:02d}", "lines": int(count), "total_usd": str(Decimal(str(amount)).quantize(CENT_HUNDREDTHS)),
+                        "status": "open" if now < month_bounds(year, month)[1] else "closed"})
+        year, month = (year - 1, 12) if month == 1 else (year, month - 1)
+    return out
+
+
+def statement_lines(s: Session, organization_id: int, year: int, month: int) -> list[dict[str, Any]]:
+    """Every line of a month, oldest first, as flat rows for a spreadsheet."""
+    rows = s.execute(select(UsageRecord, Campaign.name).outerjoin(Campaign, Campaign.id == UsageRecord.campaign_id).where(*_in_month(organization_id, year, month))
+                     .order_by(UsageRecord.id)).all()
+    return [{"line": line.id, "written_at": line.created_at.isoformat() if line.created_at else "", "kind": line.kind, "campaign": name or "", "call": line.call_run_id or "",
+             "quantity": str(line.quantity), "unit": line.unit, "amount_usd": str(line.amount_usd), "basis": line.basis, "corrects_line": line.adjusts_id or "",
+             "note": line.note or ""} for line, name in rows]
+

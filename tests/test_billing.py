@@ -371,3 +371,118 @@ def test_the_ledger_is_read_by_its_organization_and_corrected_only_by_the_operat
         assert after["total_usd"] == "0.2000" and [(k["basis"], k["amount_usd"]) for k in after["by_kind"]] == [("estimate", "0.3200"), ("manual", "-0.1200")]
         assert client.get("/api/campaigns/q4/rules", headers=acme).json()["spend_usd"] == pytest.approx(0.20)
     get_settings.cache_clear()
+
+
+# ----------------------------------------------------------------------------- monthly statements
+
+
+def _line(campaign, key, amount, *, at, kind="call", quantity=1, unit="minute", adjusts=None, basis="estimate", note=None) -> int:
+    """A ledger line written at a chosen moment (the ledger itself always writes 'now')."""
+    with session_scope() as s:
+        line = UsageRecord(organization_id=campaign.org, campaign_id=campaign.campaign, kind=kind, key=key, quantity=quantity, unit=unit, amount_usd=Decimal(amount),
+                           basis=basis, adjusts_id=adjusts, note=note, created_at=at, quantity_seconds=int(quantity * 60) if kind == "call" else 0)
+        s.add(line)
+        s.flush()
+        return line.id
+
+
+def test_a_month_s_statement_adds_up_calls_ai_and_corrections_and_stays_as_it_is(campaign):
+    from datetime import datetime, timezone
+
+    october, november = datetime(2026, 10, 31, 23, 59, 59, tzinfo=timezone.utc), datetime(2026, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
+    first = _line(campaign, "call:1:call", "0.3200", at=october, quantity=3)
+    _line(campaign, "call:2:call", "0.1200", at=november, quantity=1)
+    _line(campaign, "call:3:call", "0.5200", at=datetime(2026, 11, 14, 9, 0, tzinfo=timezone.utc), quantity=5)
+    _line(campaign, "ai:1", "0.0150", at=datetime(2026, 11, 14, 9, 5, tzinfo=timezone.utc), kind="ai_model", quantity=4200, unit="token")
+    # A credit given in November for October's call belongs to November: October's statement was already final.
+    _line(campaign, "call:1:call:adjust:1", "-0.1000", at=datetime(2026, 11, 20, tzinfo=timezone.utc), quantity=0, adjusts=first, basis="manual", note="Credit for a dropped call")
+
+    now = datetime(2026, 11, 25, tzinfo=timezone.utc)
+    with session_scope() as s:
+        was = billing.statement(s, campaign.org, 2026, 10, now=now)
+        this = billing.statement(s, campaign.org, 2026, 11, now=now)
+        months = billing.statement_months(s, campaign.org, now=now)
+        rows = billing.statement_lines(s, campaign.org, 2026, 11)
+
+    assert (was["status"], was["total_usd"], was["calls"], was["lines"]) == ("closed", "0.3200", {"count": 1, "minutes": "3", "amount_usd": "0.3200"}, 1)
+    assert this["status"] == "open" and this["number"] == f"{campaign.org}-2026-11" and this["lines"] == 4
+    assert this["calls"] == {"count": 2, "minutes": "6", "amount_usd": "0.6400"}
+    assert this["ai"] == {"requests": 1, "tokens": 4200, "amount_usd": "0.0150"}
+    assert this["corrections"] == {"lines": 1, "amount_usd": "-0.1000"}
+    assert this["total_usd"] == "0.5550" == str(Decimal(this["calls"]["amount_usd"]) + Decimal(this["ai"]["amount_usd"]) + Decimal(this["corrections"]["amount_usd"]))
+    assert this["by_basis"] == [{"basis": "estimate", "lines": 3, "amount_usd": "0.6550"}, {"basis": "manual", "lines": 1, "amount_usd": "-0.1000"}]
+    assert this["by_campaign"] == [{"campaign_id": campaign.campaign, "campaign": "q4", "calls": 2, "minutes": "6", "amount_usd": "0.5550"}]
+    assert "not a tax invoice" in this["what_this_is"] and this["period"]["from"].startswith("2026-11-01T00:00:00") and this["period"]["until"].startswith("2026-12-01T00:00:00")
+    assert months == [{"period": "2026-11", "lines": 4, "total_usd": "0.5550", "status": "open"}, {"period": "2026-10", "lines": 1, "total_usd": "0.3200", "status": "closed"}]
+    assert [r["amount_usd"] for r in rows] == ["0.1200", "0.5200", "0.0150", "-0.1000"] and rows[-1]["corrects_line"] == first and rows[-1]["note"] == "Credit for a dropped call"
+
+    # Nothing written later can change a month that is over: every new line carries the moment it was written.
+    with session_scope() as s:
+        run = CallRun(lead_id=_a_lead(s, campaign), campaign_id=campaign.campaign, status="in-progress", twilio_call_sid="CA-late")
+        s.add(run)
+        s.flush()
+        apply_twilio_status(s, run.id, {"CallSid": "CA-late", "CallStatus": "completed", "CallDuration": "60"}, SETTINGS)
+        billing.adjust(s, first, Decimal("-0.05"), note="A second credit for October's call", by="operator")
+        assert billing.statement(s, campaign.org, 2026, 10, now=now) == was
+
+    with session_scope() as s:
+        empty = billing.statement(s, campaign.org, 2025, 1, now=now)
+        assert (empty["total_usd"], empty["lines"], empty["by_campaign"], empty["status"]) == ("0.0000", 0, [], "closed")
+        assert billing.statement(s, campaign.org, 2026, 12, now=now)["period"]["until"].startswith("2027-01-01")
+    for nonsense in ("2026-13", "2026-1", "26-11", "november", "2026-00", ""):
+        with pytest.raises(billing.LedgerError):
+            billing.parse_period(nonsense)
+
+
+def _a_lead(s, campaign) -> int:
+    lead = Lead(campaign_id=campaign.campaign, phone_e164="+14155550177", status="calling", attempts=1)
+    s.add(lead)
+    s.flush()
+    return lead.id
+
+
+def test_a_statement_is_read_by_its_organization_as_figures_or_as_a_sheet(tmp_path, monkeypatch, sample_playbook):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'statement.db'}")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    get_settings.cache_clear()
+    db.reset_engine_for_tests(f"sqlite:///{tmp_path / 'statement.db'}")
+    from callagent.server import app
+
+    password = "correct horse battery"
+    with TestClient(app) as client:
+        client.headers["Authorization"] = f"Bearer {resolve_api_token(get_settings())}"
+        assert client.post("/api/users", json={"email": "viewer@acme.example", "role": "viewer", "password": password}).status_code == 201
+        client.post("/api/organizations", json={"name": "Bolt", "admin_email": "boss@bolt.example", "admin_password": password})
+        sign_in = lambda email: {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": email, "password": password}, headers={"Authorization": ""}).json()["token"]}  # noqa: E731
+        acme, bolt = sign_in("viewer@acme.example"), sign_in("boss@bolt.example")
+        with session_scope() as s:
+            c = Campaign(name="=SUM(A1)", status="running", playbook_json=sample_playbook.model_dump())  # a name a spreadsheet would run
+            s.add(c)
+            s.flush()
+            lead = Lead(campaign_id=c.id, phone_e164="+14155550100", status="calling", attempts=1)
+            s.add(lead)
+            s.flush()
+            run = CallRun(lead_id=lead.id, campaign_id=c.id, status="in-progress", twilio_call_sid="CA1")
+            s.add(run)
+            s.flush()
+            apply_twilio_status(s, run.id, {"CallSid": "CA1", "CallStatus": "completed", "CallDuration": "170"}, SETTINGS)
+        period = utcnow().strftime("%Y-%m")
+
+        assert client.get("/api/usage/statements", headers=acme).json() == [{"period": period, "lines": 1, "total_usd": "0.3200", "status": "open"}]
+        mine = client.get(f"/api/usage/statements/{period}", headers=acme).json()
+        assert (mine["total_usd"], mine["calls"]["count"], mine["calls"]["minutes"], mine["organization"]["name"]) == ("0.3200", 1, "3", "default")
+        sheet = client.get(f"/api/usage/statements/{period}", params={"format": "csv"}, headers=acme)
+        assert sheet.headers["content-type"].startswith("text/csv") and f"usage-{period}.csv" in sheet.headers["content-disposition"]
+        header, row = sheet.text.strip().splitlines()
+        assert header == "line,written_at,kind,campaign,call,quantity,unit,amount_usd,basis,corrects_line,note"
+        assert ",call,'=SUM(A1)," in row and row.endswith(",0.3200,estimate,,")  # the name is text in a spreadsheet, not a formula
+
+        # Another organization has its own months, and none of this one's.
+        assert client.get("/api/usage/statements", headers=bolt).json() == []
+        theirs = client.get(f"/api/usage/statements/{period}", headers=bolt).json()
+        assert (theirs["total_usd"], theirs["lines"], theirs["organization"]["name"]) == ("0.0000", 0, "Bolt")
+        assert client.get(f"/api/usage/statements/{period}", params={"format": "csv"}, headers=bolt).text.strip() == header
+        assert client.get("/api/usage/statements/2026-13", headers=acme).status_code == 400
+        assert client.get(f"/api/usage/statements/{period}", params={"format": "pdf"}, headers=acme).status_code == 400
+    get_settings.cache_clear()
+    db.reset_engine_for_tests(f"sqlite:///{tmp_path / 'after.db'}")
