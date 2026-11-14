@@ -162,6 +162,7 @@ def test_every_api_route_needs_a_sign_in_except_signing_in_itself(client):
         response = client.request(method, url_of(path), headers={"Authorization": ""})
         if response.status_code != 401:
             public.append((method, path))
+    # Signing in takes a password instead; the website's intake takes its own token and refuses everything else (see test_intake).
     assert public == [("POST", "/api/auth/login")]
 
 
@@ -169,7 +170,7 @@ def test_each_role_can_do_what_it_is_for_and_nothing_more(client):
     for role in accounts.ROLES:
         add_user(client, f"{role}@example.com", role)
     headers = {role: sign_in(client, f"{role}@example.com") for role in accounts.ROLES}
-    routes = set(api_routes(client.app)) - {("POST", "/api/auth/login")}
+    routes = set(api_routes(client.app)) - {("POST", "/api/auth/login"), ("POST", "/api/intake/requests")}
     assert accounts.OPERATOR_ROUTES <= routes, "an operator route no longer exists: " + str(accounts.OPERATOR_ROUTES - routes)
 
     refused = {role: set() for role in accounts.ROLES}
@@ -268,4 +269,4 @@ def test_a_database_from_before_accounts_gets_the_tables_on_upgrade(tmp_path):
     assert migrate.upgrade(engine) == "upgraded"
     with engine.connect() as connection:
         assert {"users", "user_sessions"} <= set(inspect(connection).get_table_names())
-        assert migrate.current_revision(connection) == migrate.head_revision() == "0005"
+        assert migrate.current_revision(connection) == migrate.head_revision()

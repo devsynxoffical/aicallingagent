@@ -118,6 +118,9 @@ class Settings(BaseSettings):
     inbound_campaign: str | None = None
     # Bearer token for /api/*. Generated into DATA_DIR/api_token on first run if unset; the CLI reads the same file.
     api_token: str | None = None
+    # Lets the website hand over what visitors send through its forms, and nothing else.
+    # Set the same value as DEVYTALK_INTAKE_TOKEN on the website. Unset: intake is off.
+    intake_token: str | None = None
 
     @field_validator("calling_window_start", "calling_window_end", mode="before")
     @classmethod

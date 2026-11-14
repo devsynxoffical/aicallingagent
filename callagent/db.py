@@ -398,6 +398,27 @@ class UserSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
 
 
+class WebsiteRequest(Base):
+    """What someone sent through a form on the website: a demo or trial request, a
+    message, a newsletter sign-up or a request to be called back."""
+
+    __tablename__ = "website_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)  # demo | trial | contact | newsletter | callback
+    email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    company: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    team_size: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(12), default="new", index=True)  # new | handled
+    handled_by: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    handled_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+
 class Job(Base):
     """A unit of background work that must not be lost: it survives restarts, is retried
     with backoff, and ends either done or dead (kept, with its error, for a person to see).

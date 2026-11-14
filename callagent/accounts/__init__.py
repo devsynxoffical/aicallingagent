@@ -63,6 +63,7 @@ OPERATOR_ROUTES = frozenset(
         ("POST", "/api/campaigns/{name}/experiments"),
         ("POST", "/api/campaigns/{name}/experiments/{experiment_id}/stop"),
         ("POST", "/api/jobs/{job_id}/retry"),
+        ("POST", "/api/requests/{request_id}/handled"),
     }
 )
 
