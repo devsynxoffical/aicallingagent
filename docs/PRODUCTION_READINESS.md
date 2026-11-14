@@ -34,13 +34,13 @@ Evidence levels used below:
 | 1. Audit | Done: `BACKEND_AUDIT.md`, 40 findings with priorities and acceptance criteria |
 | 2. Database | Mostly done: migrations, uniqueness, indexes, pool settings, transactions for reservation and publishing, backup and restore. Open: organization columns and row-level security, status CHECK constraints, decimal call costs |
 | 3. Background jobs | Done for the core, booking notifications, review safety net and training. Open: document reading as a queue job, a separate executor for slow jobs |
-| 4. Calling engine | Mostly done: state machine, duplicate-dial prevention, provider timeout, reconciliation, restart behaviour, usage ledger. Open: incremental transcript saving, atomic WebSocket claim, recording references, dial-loop lease across processes |
+| 4. Calling engine | Mostly done: state machine, duplicate-dial prevention, provider timeout, reconciliation, restart behaviour, usage ledger, transcript saved while the call is in progress (C-7), inbound calls turned away cleanly when the public address is not set. Open: atomic WebSocket claim, recording references, dial-loop lease across processes |
 | 5. AI orchestration | **Open.** Structured output is validated and the live voice path does not wait for analysis (both pre-existing). No usage accounting, prompt versions, explicit timeouts, fallback or injection hardening |
-| 6. Security | Reviewed (`SECURITY_REVIEW.md`); several fixes landed. **Open: organization isolation, roles, rate limits, audit log, retention** |
+| 6. Security | Reviewed (`SECURITY_REVIEW.md`); several fixes landed. Personal accounts, sessions and three roles checked on every route are in place, with a dedicated intake credential for the website. **Open: organization isolation (every account belongs to the one organization), rate limits on the API, audit log, retention** |
 | 7. Observability | **Open**, apart from job statistics and stored per-call latency |
 | 8. Load tests | Done for what can run without providers. Open: live calls, ingestion, scheduling, AI analysis |
 | 9. Disaster recovery | Done: backup, verify, restore, drill, documented objectives and procedures. Open: scheduling, off-machine copies, point-in-time recovery (deployment choices) |
-| 10. Testing | 242 tests (227 on SQLite plus 15 repeated on PostgreSQL), including concurrency, failure-injection, recovery and ledger-consistency tests. Open: security isolation tests, API contract tests, any real-provider test |
+| 10. Testing | 291 tests (276 on SQLite plus 15 repeated on PostgreSQL), including concurrency, failure-injection, recovery and ledger-consistency tests, every API route called as every role, and the campaign setup flow. The console adds 65 unit tests and 24 browser tests against a real engine. Open: organization isolation tests, any real-provider test |
 
 ## Before a single-organization pilot with real calls
 
@@ -63,7 +63,9 @@ the database by hand.
 1. **Nothing has been exercised against real providers.** Integration details (Twilio
    status values and timing, media stream behaviour under load, model identifiers and
    beta flags) are untested assumptions.
-2. **No tenant isolation.** One token, no scoping.
+2. **No tenant isolation.** People have their own accounts and roles, but all of them
+   see the one organization's data. A second customer needs organization scoping on
+   every query, with tests that one organization cannot read another's.
 3. **Unknown call capacity.** Audio processing shares one process with everything else.
 4. **Little observability.** A production incident would be investigated from
    free-text logs and SQL.

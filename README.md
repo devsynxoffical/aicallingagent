@@ -265,6 +265,20 @@ they do, never mixing languages in one reply.
 - Every call record has a `language` block: the language detected, the final language
   and each switch with its turn number.
 
+## Setting up without the command line
+
+- `GET /api/status` says which providers are connected and names the settings still
+  missing. It never returns a value. It also gives the inbound webhook address.
+- `POST /api/campaign-briefs` creates a campaign from a short form with a working,
+  conservative playbook and no AI model. It states only what the form says, discloses
+  that the agent is an AI, and can open in English, French or Arabic.
+- `GET`/`PUT /api/campaigns/{name}/languages` reads and sets the languages.
+- `POST /api/campaigns/{name}/inbound?number=` sets the number a campaign answers.
+- `GET /api/campaigns/{name}/calls?direction=inbound|outbound`, and `by_direction` in
+  the report, tell outbound and inbound apart.
+- `GET /api/calls/{id}` returns `"live": true` and the transcript so far while a call
+  is in progress: the transcript is saved as the call proceeds.
+
 ## Inbound calls
 
 ```bash
@@ -364,9 +378,33 @@ The server must be reachable by Twilio, so it is public. Two layers protect it:
   streamed, and whose Twilio call SID matches. Anything else is closed before a single
   model or voice request is made.
 - The control API (`/api/*`, which can start campaigns and dial numbers) requires
-  `Authorization: Bearer <token>`. Set `API_TOKEN`, or let the server generate one into
-  `DATA_DIR/api_token` on first start. The CLI reads the same file, so on one machine it
-  just works. Toll fraud is real; do not disable this.
+  `Authorization: Bearer <token>`: the session of a signed-in person, or the engine's
+  API token. Set `API_TOKEN`, or let the server generate one into `DATA_DIR/api_token`
+  on first start. The CLI reads the same file, so on one machine it just works. Toll
+  fraud is real; do not disable this.
+
+### People and roles
+
+People sign in with an email and a password (`POST /api/auth/login`) and get a session
+valid for 12 hours. Passwords are stored as salted scrypt hashes, session tokens as
+SHA-256 hashes. Five wrong passwords lock an account for 15 minutes.
+
+| Role | May |
+| --- | --- |
+| viewer | read everything except the list of users |
+| operator | also start and pause dialing, call one number, import leads, manage documents, build drafts, ask the coach, start and stop A/B tests, retry background work, mark website requests handled |
+| admin | also approve, reject and roll back playbooks, promote a test, change rules, budgets, languages and the inbound number, create campaigns, manage users |
+
+The role is checked on every route by the same dependency that checks the token. A
+route that changes something is admin-only unless it is listed for operators in
+`callagent/accounts/__init__.py`. The API token has the admin role. Create the first
+admin with `callagent users add you@example.com --role admin`, or sign in to the
+console with the API token and add people under Team.
+
+### Other credentials
+
+- `INTAKE_TOKEN` lets the website hand over what visitors send through its forms
+  (`POST /api/intake/requests`) and nothing else. Unset: intake is off.
 
 ## Deploying
 

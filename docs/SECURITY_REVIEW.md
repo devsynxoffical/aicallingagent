@@ -6,8 +6,11 @@ test against a real provider were performed. Status reflects the code on this br
 ## Summary
 
 The service is safe to run for **one organization** behind TLS with its API token kept
-secret. It is **not** safe to put two customers on one deployment: there is one shared
-token and no request is scoped by organization. That is the most important open item
+secret. People now sign in with their own accounts and one of three roles, checked on
+every route (see "People and roles" in the README, and `tests/test_accounts.py`, which
+calls every route as every role). It is still **not** safe to put two customers on one
+deployment: every account belongs to the one organization and no request is scoped by
+organization. That is the most important open item
 and it blocks the acceptance criterion "no cross-organization data access in security
 tests": those tests do not exist yet because the isolation they would test does not
 exist yet.
