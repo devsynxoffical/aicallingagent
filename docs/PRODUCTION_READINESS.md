@@ -137,11 +137,12 @@ Each line names what a test proves. The test names are in the audit's status tab
 
 | What | What is missing |
 | --- | --- |
-| Draining calls on a stop signal | The waiting logic is tested with stand-in calls. The signal handling inside the server has not been exercised, and never with a real call |
+| Draining calls on a stop signal | The waiting logic is tested with stand-in calls. A real server process was started, sent a stop signal with no call in progress, and stopped cleanly in two seconds. It has never waited for a real call |
 | Several engine processes | The lease, the job leases and the lead reservation are each tested. Two real processes behind a load balancer have not been run |
 | Scheduled backups | The "is one due" logic and the backup itself are tested; the loop inside the server has not run for hours |
-| The container image and compose file | Written and reviewed; **not built**: there is no container daemon in this environment. CI builds the image on first run |
-| The CI workflows | Written; valid YAML; **never run** |
+| The container image | Built by CI, where it runs as an ordinary user and starts the command line. It has not been run as a server, and its health check has not been seen to pass |
+| The compose file | Written; never started (no container daemon in the environment this was built in) |
+| The CI workflows | Run on GitHub for both repositories. The first engine run found a fault in the tests' own database setup (a role without a password), since fixed. The dependency scan step reports as a warning and its output has not been read |
 | The alert rules | Valid, and refer only to metrics that exist; never loaded into a monitoring system or seen to fire |
 | Live-call AI usage | The accumulation is tested with synthetic usage reports; the voice library's real reports have not been seen |
 | The 0012 and 0013 migrations on a large database | Tested on small ones. The index of 0013 should be built concurrently beforehand on a large, busy PostgreSQL database |
@@ -254,7 +255,7 @@ not been measured.
 
 | Need | Detail |
 | --- | --- |
-| PostgreSQL 16 | The engine's role must not be a superuser or have BYPASSRLS. A managed service with point-in-time recovery is the recommended start |
+| PostgreSQL 16 | The engine's role must not be a superuser or have BYPASSRLS. A managed service with point-in-time recovery is the recommended start. The backup tools on the engine's machine must be of the server's major version (the image carries 16; build with `PG_MAJOR` for another) |
 | One or more engine processes | The image in this repository. Behind a load balancer that uses `/health/ready`; a stop grace period longer than `SHUTDOWN_DRAIN_SECONDS` |
 | TLS in front | The phone provider requires HTTPS and WSS; `PUBLIC_BASE_URL` is the public address |
 | A proxy that sets `X-Forwarded-For` | The audit trail and the console's sign-in limit read it |

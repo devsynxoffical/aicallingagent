@@ -1,5 +1,7 @@
 # DEVSYNX AI Calling Agent: architecture and build plan
 
+> **Kept as the original build plan, last updated 2026-11-13.** The system as it is built now is described in `ENTERPRISE_ARCHITECTURE.md`; where things stand is in `PRODUCTION_READINESS.md`.
+
 This document is the answer to "inspect what exists, say what is missing, design the
 whole thing before changing it". It is the working plan: each phase lists what is
 done, what is next, and how it will be proven.

@@ -60,11 +60,50 @@ def _sqlite_path(url: str) -> Path:
     return Path(database)
 
 
-def _pg_tool(name: str) -> str:
-    found = shutil.which(name) or next(iter(sorted(glob(f"/usr/lib/postgresql/*/bin/{name}"), reverse=True)), None)
+_PG_ROOT = "/usr/lib/postgresql"  # where Debian and Ubuntu install each major version's tools side by side
+
+
+def _server_major(url: str) -> int:
+    engine = create_engine(url)
+    try:
+        with engine.connect() as connection:
+            return int(connection.execute(text("SHOW server_version_num")).scalar()) // 10000
+    finally:
+        engine.dispose()
+
+
+def _tool_major(path: str) -> int | None:
+    try:
+        printed = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for word in printed.split():
+        if word[:1].isdigit():
+            return int(word.split(".")[0])
+    return None
+
+
+def _pg_tool(name: str, server_major: int) -> str:
+    """The PostgreSQL client tool of the same major version as the server.
+
+    The versions must match. An older tool refuses a newer server. A newer tool writes
+    a backup with settings the older server does not know, and that backup is refused
+    when it is restored: the worst moment to find out. So a mismatch is an error here,
+    when the backup is taken."""
+    candidates = [f"{_PG_ROOT}/{server_major}/bin/{name}", shutil.which(name), *sorted(glob(f"{_PG_ROOT}/*/bin/{name}"), reverse=True)]
+    found: dict[str, int | None] = {}
+    for candidate in candidates:
+        if candidate and candidate not in found and os.path.exists(candidate):
+            found[candidate] = _tool_major(candidate)
+            if found[candidate] == server_major:
+                return candidate
     if not found:
-        raise BackupError(f"{name} was not found. Install the PostgreSQL client tools on this machine.")
-    return found
+        raise BackupError(f"{name} was not found. Install the PostgreSQL {server_major} client tools on this machine (postgresql-client-{server_major}).")
+    have = ", ".join(sorted({str(major) for major in found.values() if major is not None})) or "an unknown version"
+    raise BackupError(
+        f"the database server is PostgreSQL {server_major}, but the {name} on this machine is version {have}. "
+        f"They must match, or a backup may not restore. Install the PostgreSQL {server_major} client tools (postgresql-client-{server_major})."
+    )
 
 
 def _pg_env(url: str) -> tuple[dict[str, str], str]:
@@ -183,7 +222,7 @@ def create_backup(destination: Path, settings: Settings | None = None) -> Path:
         else:
             database_file = target / "database.pgdump"
             env, name = _pg_env(url)
-            _run([_pg_tool("pg_dump"), "--format=custom", "--no-owner", "--no-privileges", f"--file={database_file}", name], env)
+            _run([_pg_tool("pg_dump", _server_major(url)), "--format=custom", "--no-owner", "--no-privileges", f"--file={database_file}", name], env)
             kind = "postgresql"
         uploads = target / "uploads.tar.gz"
         with tarfile.open(uploads, "w:gz") as archive:
@@ -319,7 +358,7 @@ def restore_backup(path: Path, settings: Settings | None = None, *, replace_exis
         else:
             env, name = _pg_env(url)
             # One transaction: the database is the old one or the restored one, never part of each.
-            _run([_pg_tool("pg_restore"), "--clean", "--if-exists", "--no-owner", "--no-privileges", "--single-transaction", f"--dbname={name}", str(staged["database.pgdump"])], env)
+            _run([_pg_tool("pg_restore", _server_major(url)), "--clean", "--if-exists", "--no-owner", "--no-privileges", "--single-transaction", f"--dbname={name}", str(staged["database.pgdump"])], env)
 
         uploads, arriving_uploads = settings.data_dir / "uploads", staging / "unpacked" / "uploads"
         outgoing = settings.data_dir / f".uploads-replaced-{stamp}"

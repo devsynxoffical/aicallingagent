@@ -46,6 +46,13 @@ callagent db verify-backup /mnt/backups/backup-20261114T181500Z
   kept, so a schedule that stopped running does not end with none.
 - The PostgreSQL password is passed to `pg_dump` in the environment, never on the
   command line.
+- **The database tools must be of the server's major version.** A backup written by
+  newer tools contains settings an older server does not know, and that server
+  refuses it on restore. The backup command therefore picks the tools of the
+  server's version and refuses to run when the machine has none, saying which
+  package to install. The engine's image carries the tools for PostgreSQL 16
+  (`PG_MAJOR`). This was found by the first CI run, where the runner's tools were
+  newer than the test server.
 
 ### Scheduled
 
@@ -151,7 +158,8 @@ source:
   "not ready", and waits up to `SHUTDOWN_DRAIN_SECONDS` (180) for the calls it is
   carrying to finish. A second signal stops at once. Give the process manager a
   longer grace period than that (the compose file sets 200 s). Tested with stand-in
-  calls; not exercised with a real call.
+  calls, and a real server process stopped cleanly on the signal with no call in
+  progress; it has never waited for a real call.
 - **On start**: migrations are applied or verified; interrupted training runs are
   closed or resumed; documents accepted but not read are queued again; jobs whose
   worker died are taken over when their lease runs out; the process takes the

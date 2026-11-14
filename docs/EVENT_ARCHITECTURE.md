@@ -28,15 +28,17 @@ of one call for the caller's organization.
 | `CallInitiated` | a lead is reserved and its call created | `call:{id}:initiated` |
 | `CallAnswered` | the call's audio stream connects | `call:{id}:answered` |
 | `CallCompleted`, `CallFailed` | the provider reports the final status | `call:{id}:ended` |
-| `UsageRecorded` | the usage ledger row is written | `usage:call:{id}:call` |
+| `UsageRecorded` | a call's first ledger line is written (by the provider's final report, or by the engine when it ends the call) | `usage:call:{id}:call` |
+| `CallTransferred` | the provider accepted handing the call to a person | `call:{id}:transferred` |
 | `CallFinalized` | the outcome is decided and the lead updated | `call:{id}:finalized` |
 | `AppointmentBooked` | a meeting is booked on a call | `appointment:{id}:booked` |
 | `CampaignPaused` | a person pauses a campaign | per pause |
-| `CampaignStopped` | the dialer stops a campaign (budget, schedule, done) | per stop |
+| `CampaignStopped` | the dialer stops a campaign (budget, schedule, a failing provider, done) | per stop |
 | `PlaybookApproved` | a version goes live | per approval |
 | `DocumentUploaded`, `DocumentProcessed` | a source is accepted; it has been read | per document, per reading |
 
-`CallTransferred` and `CampaignStarted` are defined and not yet emitted.
+`CampaignStarted` is defined and not yet emitted. Corrections to the ledger and AI
+usage lines do not produce events; they are in the ledger and the audit trail.
 
 **Duplicates.** The key identifies the fact. Recording it again (a repeated webhook, a
 retried job) adds nothing and starts no consumer a second time. Tested with the

@@ -1,5 +1,7 @@
 # Reliability: what is guaranteed, how, and what is not yet
 
+> **Kept as a record of 2026-11-13.** The guarantees below still hold, but several items it lists as missing have since been built. The current description is `CALLING_ENGINE_RELIABILITY.md`; the status of every finding is in `ENTERPRISE_BACKEND_AUDIT.md`.
+
 Every guarantee below names the test that proves it. "Not validated with a real
 provider" means exactly that: no telephony, speech or model credential exists in the
 environment where this was built.

@@ -3,6 +3,8 @@
 # process, the database on the same host, no TLS. See docs/PRODUCTION_READINESS.md.
 services:
   db:
+    # The same major version as the client tools in the engine's image (PG_MAJOR in the
+    # Dockerfile). `callagent db backup` refuses to run when they differ.
     image: postgres:16
     environment:
       POSTGRES_DB: callagent

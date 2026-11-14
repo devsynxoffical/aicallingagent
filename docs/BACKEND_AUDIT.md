@@ -1,5 +1,7 @@
 # Backend audit
 
+> **Kept as a record of 2026-11-13.** This first audit was followed by a deeper one, `ENTERPRISE_BACKEND_AUDIT.md`, which carries the current status of every finding. Statements here about what is missing describe that earlier day.
+
 Audit date: 2026-11-13. Commit audited: `4476176` (branch `claude/epic-newton-y166t4`).
 
 Scope: everything under `callagent/`, the deployment files, the tests, and

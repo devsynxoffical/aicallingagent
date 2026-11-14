@@ -11,8 +11,16 @@ RUN pip wheel --wheel-dir /wheels ".[postgres]"
 FROM python:3.13-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DATA_DIR=/app/data
-# pg_dump and pg_restore, for `callagent db backup` against PostgreSQL. curl, for the health check.
-RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client curl && rm -rf /var/lib/apt/lists/* \
+# pg_dump and pg_restore, for `callagent db backup` against PostgreSQL. They must be of
+# the same major version as the database server (a backup written by newer tools is
+# refused by an older server when restored), so the version is chosen here and not left
+# to whatever the base image carries. Build with --build-arg PG_MAJOR=17 for a 17 server.
+# curl is for the health check.
+ARG PG_MAJOR=16
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates postgresql-common \
+    && /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y \
+    && apt-get install -y --no-install-recommends postgresql-client-${PG_MAJOR} \
+    && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 callagent \
     && mkdir -p /app/data && chown -R callagent:callagent /app
 COPY --from=build /wheels /wheels

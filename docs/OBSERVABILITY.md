@@ -101,7 +101,7 @@ Read from the database and the process at each scrape (correct after a restart):
 | `callagent_thread_pool_backlog` | pool | Work waiting for a thread: `db` is the request and call path, `background` the slow work |
 | `callagent_worker_running`, `callagent_ready` | | 1 or 0 |
 
-A scrape runs four small queries. Scrape every 15 to 30 seconds.
+A scrape runs at most seven small queries. Scrape every 15 to 30 seconds.
 
 With more than one engine process, the counters are per process and Prometheus sums
 them; the gauges read from the database would be reported by each process and must

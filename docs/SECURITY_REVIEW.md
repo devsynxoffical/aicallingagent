@@ -59,7 +59,7 @@ What still stands between this and selling to a second customer:
 | Data retention and erasure | **Open** | No retention period, no erase operation for a person's data, no export of one person's data |
 | Recording and consent | **Needs a decision per market** (B-13) | The opening can disclose the AI and the recording; what is required where is a legal question |
 | Dependencies | Open | Lower-bound versions, no lock file. CI runs a vulnerability scan as a warning, not a gate; nobody has read its output yet |
-| Container | Built, not built here | Runs as an ordinary user, with a health check; the image could not be built in this environment (no container daemon) and is first exercised by CI |
+| Container | Built | Runs as an ordinary user (checked in CI, where the image is built), with a health check that has not been seen to pass yet |
 | Transport | Deployment concern | The server speaks plain HTTP; TLS must be terminated in front of it. The phone provider requires HTTPS and WSS |
 | Several engine processes | Built | The database decides who dials (a lease), who gets a lead, a call and a job |
 

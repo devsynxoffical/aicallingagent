@@ -32,7 +32,8 @@ jobs:
           cache: pip
       - name: Install
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+          # The backup tools must be of the database server's major version (16, the service above).
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client-16
           pip install -e ".[dev,postgres]" pyyaml
       - name: The code compiles and imports
         run: |
@@ -63,3 +64,5 @@ jobs:
           docker build -t callagent:ci .
           test "$(docker run --rm callagent:ci id -u)" != "0"
           docker run --rm callagent:ci callagent --help > /dev/null
+          # The backup tools in the image are of the version the compose file's database is.
+          docker run --rm callagent:ci /usr/lib/postgresql/16/bin/pg_dump --version | grep -q " 16\."

@@ -219,3 +219,32 @@ def test_a_scheduled_backup_is_taken_when_the_newest_is_too_old_and_not_before(s
     assert backup.backup_if_due(scheduled) is None  # one was just taken
     first.rename(first.with_name("backup-20200101T000000Z"))  # as if it were years old
     assert backup.backup_if_due(scheduled) is not None
+
+
+def test_the_database_tools_must_be_of_the_servers_version(tmp_path, monkeypatch):
+    """Found by the first CI run: newer tools write a backup an older server refuses to
+    restore. The mismatch is refused when the backup is taken, with what to install."""
+
+    def tool(directory, version):
+        directory.mkdir(parents=True)
+        path = directory / "pg_dump"
+        path.write_text(f"#!/bin/sh\necho 'pg_dump (PostgreSQL) {version}'\n")
+        path.chmod(0o755)
+        return str(path)
+
+    elsewhere = tool(tmp_path / "on-the-path", "17.2")  # what the shell finds first: a newer version
+    monkeypatch.setattr(backup, "_PG_ROOT", str(tmp_path / "installed"))  # nothing of this machine's own tools is seen
+    monkeypatch.setattr(backup.shutil, "which", lambda name: elsewhere)
+
+    with pytest.raises(backup.BackupError, match=r"server is PostgreSQL 16, but the pg_dump on this machine is version 17.*postgresql-client-16"):
+        backup._pg_tool("pg_dump", 16)
+    assert backup._pg_tool("pg_dump", 17) == elsewhere
+
+    matching = tool(tmp_path / "installed" / "16" / "bin", "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)")
+    tool(tmp_path / "installed" / "18" / "bin", "18.0")
+    assert backup._pg_tool("pg_dump", 16) == matching  # several installed: the server's own version is chosen, whatever the shell finds first
+
+    monkeypatch.setattr(backup.shutil, "which", lambda name: None)
+    monkeypatch.setattr(backup, "_PG_ROOT", str(tmp_path / "nothing-here"))
+    with pytest.raises(backup.BackupError, match="was not found.*postgresql-client-16"):
+        backup._pg_tool("pg_dump", 16)
