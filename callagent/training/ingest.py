@@ -10,12 +10,19 @@ from __future__ import annotations
 import csv
 import io
 import re
+import time
 import zipfile
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+# A Word or PowerPoint file is an archive. What it unpacks to is bounded too, so a small
+# upload cannot expand into gigabytes in memory.
+MAX_UNPACKED_BYTES = 300 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 5000
+MAX_PDF_PAGES = 600
+EXTRACT_SECONDS = 300  # reading one PDF may take this long, checked page by page
 MAX_CSV_ROWS = 2000
 FILE_TYPES = {
     ".pdf": "pdf",
@@ -70,9 +77,13 @@ def validate_upload(filename: str, data: bytes) -> str:
         if not data.startswith(b"PK"):
             raise IngestError(f"this file is named .{file_type} but is not an Office document")
         try:
-            names = zipfile.ZipFile(io.BytesIO(data)).namelist()
+            entries = zipfile.ZipFile(io.BytesIO(data)).infolist()
         except zipfile.BadZipFile:
             raise IngestError(f"this .{file_type} file is damaged and cannot be opened") from None
+        names = [entry.filename for entry in entries]
+        # The archive states how large each part becomes; reading stops at that size, so the sum is a true bound.
+        if len(entries) > MAX_ARCHIVE_ENTRIES or sum(entry.file_size for entry in entries) > MAX_UNPACKED_BYTES:
+            raise IngestError(f"this .{file_type} file unpacks to more than {MAX_UNPACKED_BYTES // (1024 * 1024)} MB and was refused")
         marker = "word/" if file_type == "docx" else "ppt/"
         if not any(n.startswith(marker) for n in names):
             raise IngestError(f"this file is named .{file_type} but is a different kind of Office document")
@@ -104,15 +115,35 @@ def _clean(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def _from_pdf(data: bytes) -> list[Section]:
+def _page_ranges(numbers: list[int]) -> str:
+    """[3, 4, 5, 9] -> "3-5, 9"."""
+    ranges, start, previous = [], numbers[0], numbers[0]
+    for n in numbers[1:] + [None]:
+        if n is not None and n == previous + 1:
+            previous = n
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        if n is not None:
+            start = previous = n
+    return ", ".join(ranges)
+
+
+def _from_pdf(data: bytes, warnings: list[str] | None = None) -> list[Section]:
     from pypdf import PdfReader
     from pypdf.errors import PdfReadError
 
+    deadline = time.monotonic() + EXTRACT_SECONDS
     try:
         reader = PdfReader(io.BytesIO(data))
         if reader.is_encrypted and not reader.decrypt(""):
             raise IngestError("this PDF is password-protected; upload an unlocked copy")
-        pages = [(i + 1, _clean(page.extract_text() or "")) for i, page in enumerate(reader.pages)]
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise IngestError(f"this PDF has {len(reader.pages)} pages; the limit is {MAX_PDF_PAGES}. Split it and upload the parts")
+        pages = []
+        for i, page in enumerate(reader.pages):
+            if time.monotonic() > deadline:
+                raise IngestError(f"reading this PDF took longer than {EXTRACT_SECONDS // 60} minutes and was stopped at page {i + 1}; upload a simpler or smaller copy")
+            pages.append((i + 1, _clean(page.extract_text() or "")))
     except PdfReadError as e:
         raise IngestError(f"this PDF could not be read ({e})") from None
     sections = [Section(f"page {n}", text) for n, text in pages if text]
@@ -121,6 +152,10 @@ def _from_pdf(data: bytes) -> list[Section]:
             "no selectable text was found: this looks like a scanned PDF. Scanned documents are not "
             "supported yet; upload the original file or a text version"
         )
+    blank = [n for n, text in pages if not text]
+    if blank and warnings is not None:
+        # Most often scanned pages inside an otherwise digital file. The agent will not know what they say.
+        warnings.append(f"no text could be read from page{'s' if len(blank) > 1 else ''} {_page_ranges(blank)} of {len(pages)} (scanned or image-only); the agent does not know their content")
     return sections
 
 
@@ -276,10 +311,11 @@ def _from_csv(data: bytes) -> list[Section]:
     return [Section("", "\n".join(lines))] if lines else []
 
 
-def extract_sections(file_type: str, data: bytes) -> list[Section]:
-    """All readable text of a file, in reading order. Raises IngestError when there is none."""
+def extract_sections(file_type: str, data: bytes, warnings: list[str] | None = None) -> list[Section]:
+    """All readable text of a file, in reading order. Raises IngestError when there is none.
+    What was left out of an otherwise readable file is added to ``warnings``."""
     if file_type == "pdf":
-        sections = _from_pdf(data)
+        sections = _from_pdf(data, warnings)
     elif file_type == "docx":
         sections = _from_docx(data)
     elif file_type == "pptx":

@@ -187,6 +187,9 @@ class CallRun(Base):
     experiment_arm: Mapped[str | None] = mapped_column(String(10), nullable=True)
     # Playbook version this call ran, so results can be compared between versions.
     playbook_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # What the conversation actually ran on: the model, and a fingerprint of the instructions it was given.
+    ai_model: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    prompt_hash: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Estimated cost of this call from the configured rates. None until the call ends.
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Language the prospect mostly spoke (base code), filled when the call ends.
@@ -270,6 +273,7 @@ class TrainingDocument(Base):
     # pending | processing | ready | failed | superseded
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    warning: Mapped[str | None] = mapped_column(Text, nullable=True)  # read, but something was left out (and what)
     language: Mapped[str | None] = mapped_column(String(16), nullable=True)
     char_count: Mapped[int] = mapped_column(Integer, default=0)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -388,6 +392,46 @@ class UsageRecord(Base):
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
 
     __table_args__ = (Index("uq_usage_records_call_kind", "call_run_id", "kind", unique=True),)
+
+
+AI_OUTCOMES = ("ok", "refused", "overloaded", "timeout", "unreachable", "busy", "failed")
+
+
+class AIUsage(Base):
+    """One row per use of the AI model: what it was for, which model and prompt, how many
+    tokens it used, how long it took and how it ended. Token counts are the provider's
+    own figures from its answer; the cost is those tokens at the price table in force,
+    and stays empty when no price is known for the model (unknown, not free).
+
+    A background request (a review, a coach run, a training run) is one row. A live
+    call is one row for the whole conversation, with ``requests`` counting its turns.
+    """
+
+    __tablename__ = "ai_usage"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id"), nullable=True, index=True)
+    call_run_id: Mapped[int | None] = mapped_column(ForeignKey("call_runs.id"), nullable=True, index=True)
+    workflow: Mapped[str] = mapped_column(String(40))  # call_review | coach | playbook_analysis | localization | rehearsal | live_call
+    model: Mapped[str] = mapped_column(String(80))
+    prompt_hash: Mapped[str | None] = mapped_column(String(16), nullable=True)  # which instructions were in force
+    requests: Mapped[int] = mapped_column(Integer, default=1)
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)  # not counting the cached ones below
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    outcome: Mapped[str] = mapped_column(String(16), default="ok")
+    cost_usd: Mapped[Any] = mapped_column(Numeric(12, 6), nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(80), nullable=True)  # the provider's id, for a support case
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+    __table_args__ = (
+        CheckConstraint("outcome IN ('ok','refused','overloaded','timeout','unreachable','busy','failed')", name="ck_ai_usage_outcome"),
+        Index("ix_ai_usage_org_created", "organization_id", "created_at"),
+    )
 
 
 class User(Base):
@@ -855,7 +899,7 @@ def dumps(obj: Any) -> str:
 # Every table whose rows belong to one organization. Row-level security covers exactly these.
 TENANT_TABLES = (
     "campaigns", "leads", "call_runs", "appointments", "do_not_call", "usage_records", "training_documents", "knowledge_chunks",
-    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events",
+    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events", "ai_usage",
 )
 # Rows of these may belong to no organization (the deployment's own housekeeping and facts).
 _SHARED_WHEN_UNOWNED = ("jobs", "events")

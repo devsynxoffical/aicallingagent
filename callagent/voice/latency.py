@@ -22,14 +22,15 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     VADUserStartedSpeakingFrame,
 )
-from pipecat.metrics.metrics import TTFBMetricsData
+from pipecat.metrics.metrics import LLMUsageMetricsData, TTFBMetricsData
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
 class LatencyMonitor(FrameProcessor):
-    def __init__(self, sink: dict[str, list[float]], **kwargs):
+    def __init__(self, sink: dict[str, list[float]], usage: dict[str, int] | None = None, **kwargs):
         super().__init__(**kwargs)
         self._sink = sink
+        self._usage = usage
         self._bot_speaking = False
         self._barge_in_at: float | None = None
 
@@ -40,6 +41,8 @@ class LatencyMonitor(FrameProcessor):
                 if isinstance(d, TTFBMetricsData) and d.value > 0:
                     key = _short_name(d.processor)
                     self._sink.setdefault(key, []).append(round(d.value, 3))
+                elif isinstance(d, LLMUsageMetricsData) and self._usage is not None:
+                    add_model_usage(self._usage, d.value)
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
             self._barge_in_at = None
@@ -52,6 +55,16 @@ class LatencyMonitor(FrameProcessor):
             self._bot_speaking = False
             self._barge_in_at = None
         await self.push_frame(frame, direction)
+
+
+def add_model_usage(total: dict[str, int], turn) -> None:
+    """Add one model turn's token counts to the call's running total. The provider
+    reports its input tokens without the cached ones, which come separately."""
+    total["requests"] = total.get("requests", 0) + 1
+    total["input"] = total.get("input", 0) + int(turn.prompt_tokens or 0)
+    total["output"] = total.get("output", 0) + int(turn.completion_tokens or 0)
+    total["cache_read"] = total.get("cache_read", 0) + int(turn.cache_read_input_tokens or 0)
+    total["cache_write"] = total.get("cache_write", 0) + int(turn.cache_creation_input_tokens or 0)
 
 
 def record_response_latency(sink: dict[str, list[float]], seconds: float) -> None:

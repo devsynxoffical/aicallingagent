@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import Campaign, KnowledgeChunk, TrainingDocument, TrainingRun, run_db, utcnow
+from ..llm import AITransientError, attributed
 from ..playbook.schema import Playbook
 from . import versions
 
@@ -87,8 +88,14 @@ async def run_training(run_id: int, analyzer_factory=None) -> None:
                 analyzer = PlaybookAnalyzer()
             else:
                 analyzer = analyzer_factory()
-            version = build_draft(s, campaign, analyzer)
+            with attributed(organization_id=campaign.organization_id, campaign_id=campaign.id):
+                version = build_draft(s, campaign, analyzer)
             run.status, run.version = "done", version.version
+        except AITransientError:
+            # The model was overloaded or unreachable: that is no verdict on the material.
+            # The run stays "running" and the job queue tries again later.
+            s.rollback()
+            raise
         except Exception as e:
             s.rollback()
             run = s.get(TrainingRun, run_id)

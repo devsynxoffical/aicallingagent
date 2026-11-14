@@ -92,25 +92,27 @@ def propose_improvements(s: Session, campaign: Campaign, *, client=None, setting
         from ..llm import make_client
 
         client = make_client(settings)
-    from ..llm import parse_structured
+    from ..llm import attributed, parse_structured
 
     slim_report = {k: report[k] for k in ("calls", "objections", "lost_reasons", "competitors", "missed_opportunities", "unsupported_statements", "by_language")}
-    proposal = parse_structured(
-        client,
-        model=settings.onboarding_model,
-        system=COACH_SYSTEM,
-        messages=[
-            {
-                "role": "user",
-                "content": "<playbook>\n" + current.model_dump_json(indent=2) + "\n</playbook>\n\n<report>\n"
-                + json.dumps(slim_report, ensure_ascii=False, indent=2) + "\n</report>\n\n<reviewer_notes>\n"
-                + json.dumps(_notes(s, campaign), ensure_ascii=False, indent=2) + "\n</reviewer_notes>\n\nPropose the improved playbook.",
-            }
-        ],
-        output_model=CoachProposal,
-        effort=settings.onboarding_effort,
-        settings=settings,
-    )
+    with attributed(organization_id=campaign.organization_id, campaign_id=campaign.id):
+        proposal = parse_structured(
+            client,
+            workflow="coach",
+            model=settings.onboarding_model,
+            system=COACH_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "<playbook>\n" + current.model_dump_json(indent=2) + "\n</playbook>\n\n<report>\n"
+                    + json.dumps(slim_report, ensure_ascii=False, indent=2) + "\n</report>\n\n<reviewer_notes>\n"
+                    + json.dumps(_notes(s, campaign), ensure_ascii=False, indent=2) + "\n</reviewer_notes>\n\nPropose the improved playbook.",
+                }
+            ],
+            output_model=CoachProposal,
+            effort=settings.onboarding_effort,
+            settings=settings,
+        )
     if not proposal.changes:
         return {"version": None, "changes": [], "reviewed_calls": reviewed}
 

@@ -14,7 +14,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import EndWorkerFrame
 from pipecat.services.llm_service import FunctionCallParams, FunctionCallResultProperties
 
-from ..db import Appointment, CallRun, Lead, add_dnc, run_blocking, run_db
+from ..db import Appointment, CallRun, Lead, add_dnc, executor, run_blocking, run_db
 from ..dialer import twilio_client
 from .session import CallSession
 
@@ -215,7 +215,9 @@ async def lookup_knowledge(session: CallSession, params: FunctionCallParams) -> 
     index = session.knowledge
     if not query or index is None or len(index) == 0:
         return {"ok": True, "results": [], "note": "Nothing on file. Do not guess: say a colleague will follow up with the details."}
-    hits = index.search(query, limit=3)
+    # Off the event loop, on the call path's own threads: a search over a large campaign
+    # takes long enough to be heard as a gap in the audio if it ran here.
+    hits = await asyncio.get_running_loop().run_in_executor(executor("db"), index.search, query, 3)
     if not hits:
         return {
             "ok": True,

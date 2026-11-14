@@ -9,7 +9,7 @@ from loguru import logger
 from pipecat.services.anthropic.llm import AnthropicLLMService
 
 from ..config import Settings
-from ..llm import live_call_request_options
+from ..llm import live_call_request_options, make_live_client
 
 
 class LowLatencyAnthropicLLMService(AnthropicLLMService):
@@ -24,6 +24,8 @@ class LowLatencyAnthropicLLMService(AnthropicLLMService):
         self._extra_betas: list[str] = list(opts.pop("betas", []))
         self._speed: str | None = opts.pop("speed", None)
         thinking = opts.pop("thinking")
+        # Our own client, so a model that goes quiet mid-call is given up after seconds.
+        kwargs.setdefault("client", make_live_client(settings))
         super().__init__(
             api_key=api_key,
             settings=AnthropicLLMService.Settings(

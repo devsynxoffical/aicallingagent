@@ -248,3 +248,116 @@ def test_a_page_is_fetched_from_the_address_that_was_checked(monkeypatch):
     with pytest.raises(IngestError, match="not a public website address"):
         web.safe_get("https://rebind.example/pricing", resolver=resolver)  # an internal answer to the check itself is refused
     assert len(connected) == 1
+
+
+# ----------------------------------------------------------------------------- document limits (audit C-14)
+
+
+def test_an_office_file_that_unpacks_to_far_more_than_it_weighs_is_refused(monkeypatch):
+    import io
+    import zipfile
+
+    from callagent.training import ingest
+
+    packed = io.BytesIO()
+    with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"0" * (6 * 1024 * 1024))  # 6 MB of zeros packs into a few kilobytes
+    data = packed.getvalue()
+    assert len(data) < 50_000
+    assert ingest.validate_upload("notes.docx", data) == "docx"  # within the limit: accepted
+    monkeypatch.setattr(ingest, "MAX_UNPACKED_BYTES", 5 * 1024 * 1024)
+    with pytest.raises(ingest.IngestError, match="unpacks to more than 5 MB"):
+        ingest.validate_upload("notes.docx", data)
+
+
+def test_a_pdf_with_too_many_pages_is_refused_and_unreadable_pages_are_reported(monkeypatch):
+    from fixtures import make_pdf
+
+    from callagent.training import ingest
+
+    warnings: list[str] = []
+    sections = ingest.extract_sections("pdf", make_pdf(["Pricing starts at forty-nine dollars.", "", "", "Support is included.", ""]), warnings)
+    assert [s.label for s in sections] == ["page 1", "page 4"]
+    assert warnings == ["no text could be read from pages 2-3, 5 of 5 (scanned or image-only); the agent does not know their content"]
+
+    monkeypatch.setattr(ingest, "MAX_PDF_PAGES", 4)
+    with pytest.raises(ingest.IngestError, match="has 5 pages; the limit is 4"):
+        ingest.extract_sections("pdf", make_pdf(["a b c d e f g h"] * 5))
+
+
+def test_reading_a_pdf_stops_at_its_time_limit(monkeypatch):
+    from fixtures import make_pdf
+
+    from callagent.training import ingest
+
+    monkeypatch.setattr(ingest, "EXTRACT_SECONDS", -1)  # the limit has already passed
+    with pytest.raises(ingest.IngestError, match="took longer than"):
+        ingest.extract_sections("pdf", make_pdf(["Pricing starts at forty-nine dollars."]))
+
+
+def test_the_warning_is_kept_with_the_document_and_cleared_when_it_is_read_again(tmp_path):
+    from fixtures import make_pdf
+
+    from callagent import db
+    from callagent.training import service
+
+    db.reset_engine_for_tests(f"sqlite:///{tmp_path / 'warn.db'}")
+    settings = Settings(anthropic_api_key="x", data_dir=tmp_path / "data")
+    with session_scope() as s:
+        c = Campaign(name="docs", status="draft", playbook_json={})
+        s.add(c)
+        s.flush()
+        document = service.add_file(s, c, "brochure.pdf", make_pdf(["Pricing starts at forty-nine dollars per month.", ""]), settings)
+        read = service.process_document_sync(s, document.id)
+        assert read.status == "ready" and "page 2 of 2" in service.describe(read)["warning"]
+        full = service.add_file(s, c, "brochure.pdf", make_pdf(["Pricing starts at forty-nine dollars per month.", "Support is included."]), settings)
+        assert service.describe(service.process_document_sync(s, full.id))["warning"] is None
+
+
+# ----------------------------------------------------------------------------- a model that fails mid-call (audit B-6)
+
+
+async def test_a_failed_model_turn_is_covered_by_a_sentence_and_a_second_one_ends_the_call(sample_playbook):
+    """The model service here is a stand-in raising its error event; what a caller
+    really hears on a failing provider has not been checked on a phone call."""
+    from types import SimpleNamespace
+
+    from callagent.languages import LanguageTracker
+    from callagent.voice.fallback import ASK_AGAIN, GIVE_UP, ModelFailure
+    from callagent.voice.session import CallSession
+
+    session = CallSession(call_run_id=7, lead={}, campaign_id=1, playbook=sample_playbook, settings=SETTINGS, twilio_call_sid="CA1", language=LanguageTracker(allowed=["fr", "en"]))
+    spoken, ended = [], []
+
+    async def say(sentence):
+        spoken.append(sentence)
+
+    async def end(sentence, reason):
+        ended.append((sentence, reason))
+
+    on_error = ModelFailure(session, say, end)
+    await on_error(None, SimpleNamespace(exception=TimeoutError("the model went quiet")))
+    assert spoken == [ASK_AGAIN["fr"]] and ended == [] and session.failure is None  # in the call's language, and the call goes on
+
+    await on_error(None, SimpleNamespace(exception=TimeoutError("again")))
+    assert ended == [(GIVE_UP["fr"], "model unavailable")]
+    assert "failed 2 times" in session.failure and session.end_reason == "model unavailable"
+    assert [e["tool"] for e in session.tool_events] == ["model_failure", "model_failure"]
+
+    await on_error(None, SimpleNamespace(exception=None))  # the call is already ending: nothing more is said
+    assert len(spoken) == 1 and len(ended) == 1
+
+
+def test_calls_that_ended_because_the_model_kept_failing_trip_the_campaign_breaker(campaigns):
+    spoke = [{"role": "assistant", "text": "Bonjour."}]
+    for _ in range(rules.FAILING_CALLS_TO_STOP):
+        add_call(campaigns["q4"]["campaign"], campaigns["q4"]["lead"], stream_connected=True, ended_at=utcnow(), started_at=utcnow(), transcript=spoke,
+                 error="the AI model failed 2 times during the call (APITimeoutError)")
+    assert verdict(campaigns).action == "stop"
+
+
+def test_the_live_model_client_gives_up_in_seconds_not_minutes():
+    from callagent import llm
+
+    client = llm.make_live_client(Settings(anthropic_api_key="x", call_model_read_timeout_seconds=12, call_model_connect_timeout_seconds=2))
+    assert client.timeout.read == 12 and client.timeout.connect == 2 and client.max_retries == 1

@@ -37,3 +37,14 @@ def postgres_app_url() -> str:
         c.execute(text(f"CREATE SCHEMA public AUTHORIZATION {APP_ROLE}"))
     admin.dispose()
     return make_url(POSTGRES_URL).set(username=APP_ROLE, password=None).render_as_string(hide_password=False)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_knowledge_cache():
+    """Knowledge indexes are kept between calls of a campaign. Tests start new databases
+    that reuse the same ids, so each test starts with nothing kept."""
+    from callagent.training import search
+
+    search.clear_cache()
+    yield
+    search.clear_cache()

@@ -124,6 +124,7 @@ def rehearse_once(
         prospect_messages.append({"role": "user", "content": spoken or "(silence)"})
         prospect_reply = text_completion(
             client,
+            workflow="rehearsal",
             model=settings.onboarding_model,
             system=PROSPECT_SYSTEM.format(persona=persona, offer=playbook.offer_summary),
             messages=prospect_messages,
@@ -165,6 +166,7 @@ def coach(client: anthropic.Anthropic, playbook: Playbook, transcripts: list[Reh
 Write the coach report."""
     return parse_structured(
         client,
+        workflow="rehearsal",
         model=settings.onboarding_model,
         system=COACH_SYSTEM,
         messages=[{"role": "user", "content": user}],
@@ -185,6 +187,7 @@ def apply_coach_edits(client: anthropic.Anthropic, playbook: Playbook, report: C
     user = f"<playbook>\n{playbook.model_dump_json(indent=2)}\n</playbook>\n\n<edits>\n{edits}\n</edits>\n\nReturn the updated Playbook."
     return parse_structured(
         client,
+        workflow="rehearsal",
         model=settings.onboarding_model,
         system=APPLY_SYSTEM,
         messages=[{"role": "user", "content": user}],

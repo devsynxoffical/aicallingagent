@@ -23,9 +23,9 @@ PASSAGES = [
 
 
 def test_words_are_normalized_across_plurals_accents_and_arabic_variants():
-    assert normalize("Prices, pricing and the price") == ["pric", "pric", "pric"]
+    assert len(set(normalize("Prices, pricing and the price"))) == 1 and len(normalize("Prices, pricing and the price")) == 3
     assert normalize("posted posting posts") == ["post", "post", "post"]
-    assert normalize("Déploiement des tarifs") == ["deploiement", "tarif"]
+    assert normalize("Déploiement des offres") == ["deploiement", "offr"]
     # Diacritics, tatweel and alef/teh-marbuta variants do not hide a match.
     assert normalize("الفَوْتَرة") == normalize("الفوتره")
     assert normalize("إدارة") == normalize("اداره")
@@ -48,6 +48,43 @@ def test_nothing_is_returned_rather_than_something_irrelevant():
     # A passage that only shares a weak word with the query is dropped next to a strong match.
     hits = index.search("payment posting dollars")
     assert hits[0].source == "services.docx, Payment posting" and all(h.score >= hits[0].score * 0.4 for h in hits)
+
+
+def test_arabic_and_french_questions_find_what_the_documents_say(tmp_path):
+    """The three searches the audit found failing (C-13), and their neighbours."""
+    index = KnowledgeIndex([
+        ("tarifs.pdf, page 1", "Tarifs : la formule Pro est à 500 dirhams par mois, sans engagement."),
+        ("ar.pdf, page 2", "السعر الشهري للباقة الأساسية ٥٠٠ درهم، والاسترداد خلال ١٤ يوما."),
+        ("livraison.txt", "Livraison sous 48 heures partout au Maroc."),
+        ("about.txt", "Notre équipe est basée à Casablanca et parle trois langues."),
+    ])
+    # The article is not part of the word: "سعر" finds "السعر", and behind a particle too.
+    assert "ar.pdf, page 2" in {h.source for h in index.search("سعر")}
+    assert normalize("بالسعر") == normalize("سعر") == normalize("والسعر")
+    assert normalize("العيادة") == normalize("عيادة") and index.search("باقة")[0].source in {"ar.pdf, page 2", "tarifs.pdf, page 1"}
+    # Arabic-Indic digits are digits: 500 finds ٥٠٠, and the other way round.
+    assert {h.source for h in index.search("500")} == {"tarifs.pdf, page 1", "ar.pdf, page 2"}
+    assert normalize("١٤ يوما")[0] == "14"
+    # A question about "prix" finds the page that says "Tarifs"; "abonnement" finds "formule".
+    assert index.search("quel est le prix")[0].source == "tarifs.pdf, page 1"
+    assert index.search("abonnement")[0].source == "tarifs.pdf, page 1"
+    assert index.search("remboursement")[0].source == "ar.pdf, page 2"  # the Arabic page is the one that mentions refunds
+    assert index.search("l'équipe")[0].source == "about.txt"  # l' is not a word
+
+
+def test_a_passage_that_only_shares_a_common_word_is_not_an_answer():
+    index = KnowledgeIndex([
+        ("plans.txt", "Our plan for next year is to open a second office and hire a larger team."),
+        ("hours.txt", "The office is open Monday to Friday."),
+        ("team.txt", "The team has twelve people in the office."),
+    ])
+    # "office" is in every passage and says nothing; nothing here is about warranties or weather.
+    assert index.search("what is the warranty period for office furniture") == []
+    assert index.search("is the weather nice at your office") == []
+    # Words that ask nothing are not searched for at all.
+    assert index.search("could you please tell me about it") == []
+    # Half of what was asked is enough when it is the telling half.
+    assert index.search("monday opening")[0].source == "hours.txt"
 
 
 def _campaign(s, org_name: str, campaign_name: str) -> db.Campaign:
@@ -103,6 +140,41 @@ def test_reuploading_a_file_replaces_the_old_version_in_search_but_keeps_its_rec
         assert [d.version for d in service.list_documents(s, c)] == [2]
         with pytest.raises(service.IngestError, match="already uploaded"):
             service.add_file(s, c, "copy.txt", b"Starter is fifty-nine dollars since January.", settings)
+
+
+def test_the_index_is_built_once_and_reused_until_the_documents_change(tmp_path):
+    """Audit C-8: a second call on an unchanged campaign builds nothing."""
+    from callagent.training import search
+
+    db.reset_engine_for_tests(f"sqlite:///{tmp_path / 'cache.db'}")
+    settings = Settings(anthropic_api_key="x", data_dir=tmp_path / "data")
+    with db.session_scope() as s:
+        c = _campaign(s, "acme", "c")
+        other = _campaign(s, "rival", "c")
+        first = service.add_file(s, c, "pricing.txt", b"Starter is forty-nine dollars.", settings)
+        service.process_document_sync(s, first.id)
+        ids = (c.organization_id, c.id, other.organization_id, other.id)
+    org, campaign, other_org, other_campaign = ids
+
+    before = search.builds
+    with db.session_scope() as s:
+        one = load_index(s, org, campaign)
+    with db.session_scope() as s:  # the next call
+        two = load_index(s, org, campaign)
+        assert two is one and search.builds == before + 1
+        # Kept per organization and campaign: another organization never receives this one.
+        assert len(load_index(s, other_org, campaign)) == 0 and len(load_index(s, other_org, other_campaign)) == 0
+
+    with db.session_scope() as s:  # a new document: the next call sees it
+        second = service.add_file(s, s.get(db.Campaign, campaign), "faq.txt", b"Support answers within one business day.", settings)
+        assert load_index(s, org, campaign) is one  # uploaded, not read yet: nothing changed for calls
+        service.process_document_sync(s, second.id)
+        three = load_index(s, org, campaign)
+        assert three is not one and len(three) == 2 and search.builds == before + 2
+        assert load_index(s, org, campaign) is three
+
+        service.remove_document(s, s.get(db.Campaign, campaign), second.id)  # removed: gone from the next call
+        assert len(load_index(s, org, campaign)) == 1
 
 
 def test_a_document_that_cannot_be_read_says_why_and_is_not_searchable(tmp_path):

@@ -106,6 +106,7 @@ class PlaybookAnalyzer:
 
         return parse_structured(
             self.client,
+            workflow="playbook_analysis",
             model=self.settings.onboarding_model,
             system=ANALYST_SYSTEM,
             messages=[{"role": "user", "content": "\n\n".join(parts)}],
@@ -127,6 +128,7 @@ class PlaybookAnalyzer:
 
         result = parse_structured(
             self.client,
+            workflow="localization",
             model=self.settings.onboarding_model,
             system=LOCALIZER_SYSTEM,
             messages=[

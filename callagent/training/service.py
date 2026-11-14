@@ -112,7 +112,7 @@ def _accepted(s: Session, document: TrainingDocument) -> None:
                 campaign_id=document.campaign_id, payload={"kind": document.kind, "name": document.filename or document.source_url or ""})
 
 
-def _read(info: dict[str, Any], fetcher=None, resolver=None) -> tuple[list[Section], int]:
+def _read(info: dict[str, Any], fetcher=None, resolver=None, warnings: list[str] | None = None) -> tuple[list[Section], int]:
     """Blocking: returns the document's sections and its size in bytes."""
     if info["kind"] == "url":
         kwargs = {k: v for k, v in (("fetcher", fetcher), ("resolver", resolver)) if v is not None}
@@ -122,7 +122,7 @@ def _read(info: dict[str, Any], fetcher=None, resolver=None) -> tuple[list[Secti
             raise IngestError("no readable text was found on this website")
         return sections, sum(len(s.text.encode()) for s in sections)
     data = Path(info["storage_path"]).read_bytes()
-    return extract_sections(info["file_type"], data), len(data)
+    return extract_sections(info["file_type"], data, warnings), len(data)
 
 
 def process_document_sync(s: Session, document_id: int, *, fetcher=None, resolver=None) -> TrainingDocument | None:
@@ -132,14 +132,15 @@ def process_document_sync(s: Session, document_id: int, *, fetcher=None, resolve
     if document is None:
         return None
     document.status = "processing"
-    document.error = None
+    document.error = document.warning = None
     # Committed before any reading starts. Fetching a website can take minutes; holding a
     # write transaction open that long would block every other writer on SQLite (call
     # status updates, dialing) and hold a row lock on a server database.
     s.commit()
     info = {k: getattr(document, k) for k in ("kind", "source_url", "max_pages", "storage_path", "file_type")}
+    warnings: list[str] = []
     try:
-        sections, size = _read(info, fetcher, resolver)
+        sections, size = _read(info, fetcher, resolver, warnings)
         name = document.filename if document.kind == "file" else (document.source_url or "website")
         passages = chunk_sections(sections, name if document.kind == "file" else "website")
         if not passages:
@@ -165,6 +166,7 @@ def process_document_sync(s: Session, document_id: int, *, fetcher=None, resolve
             )
         )
     document.status = "ready"
+    document.warning = "; ".join(warnings)[:2000] or None
     document.language = _language_of(sections)
     document.char_count = sum(len(p.text) for p in passages)
     document.chunk_count = len(passages)
@@ -237,6 +239,7 @@ def describe(document: TrainingDocument) -> dict[str, Any]:
         "version": document.version,
         "status": document.status,
         "error": document.error,
+        "warning": document.warning,  # read, but not all of it
         "language": document.language,
         "passages": document.chunk_count,
         "characters": document.char_count,

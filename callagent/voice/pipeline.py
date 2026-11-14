@@ -13,7 +13,10 @@ Every hop streams. Silero VAD gives barge-in: when the prospect starts talking t
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import WebSocket
@@ -36,7 +39,8 @@ from .. import background, events
 from ..config import Settings, get_settings
 from datetime import timedelta
 
-from ..db import CallRun, Campaign, Lead, campaign_organization_id, run_db, utcnow
+from ..db import CallRun, Campaign, Lead, campaign_organization_id, run_blocking, run_db, utcnow
+from ..llm import attributed, prompt_hash, record_live_call
 from ..dialer import lifecycle
 from ..languages import LanguageSwitch, LanguageTracker
 from ..playbook.prompt_builder import build_system_prompt
@@ -44,6 +48,7 @@ from ..playbook.schema import Playbook
 from ..postcall.summarizer import finalize_call
 from ..providers import SpeechPlan, get_stt, get_tts
 from ..training.search import KnowledgeIndex, load_index
+from .fallback import ModelFailure
 from .fillers import FillerProcessor
 from .language_follower import LanguageFollower
 from .latency import LatencyMonitor, record_response_latency, summarize
@@ -63,6 +68,11 @@ SILENCE_GOODBYE = {
     "fr": "Très bien, je vous laisse. Bonne journée.",
     "ar": "تمام، لن أطيل عليكم. يومكم سعيد.",
 }
+
+
+# The instructions' fingerprint is taken with a fixed clock and no lead, so it names the
+# playbook and rules a call ran on and nothing about when or to whom.
+FINGERPRINT_TIME = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 
 def _playbook_for(s, campaign: Campaign, run: CallRun) -> Playbook:
@@ -179,6 +189,19 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
         knowledge_languages=knowledge.languages if has_knowledge else None,
     )
 
+    # What this conversation runs on, kept with the call: the model, and a fingerprint of
+    # its instructions (the same playbook and rules give the same one, whoever is called).
+    instructions = prompt_hash(build_system_prompt(playbook, {}, mode=mode, now=FINGERPRINT_TIME, human_transfer_available=human_transfer,
+                                                   knowledge_languages=knowledge.languages if has_knowledge else None))
+
+    def _note_what_runs(s):
+        run = s.get(CallRun, call_run_id)
+        if run is not None:
+            run.ai_model, run.prompt_hash = settings.call_model, instructions
+
+    await run_db(_note_what_runs)
+    conversation_started = time.monotonic()
+
     # ---- transport
     serializer = TwilioFrameSerializer(
         stream_sid=stream_sid,
@@ -207,6 +230,15 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
         settings=settings,
     )
     register_tool_handlers(llm, session)
+
+    async def say(sentence: str) -> None:
+        await task.queue_frame(TTSSpeakFrame(sentence))
+
+    async def say_and_end(sentence: str, reason: str) -> None:
+        await task.queue_frames([TTSSpeakFrame(sentence), EndWorkerFrame(reason=reason)])
+
+    # A model that fails a turn is covered by a spoken sentence, not by silence.
+    llm.add_event_handler("on_error", ModelFailure(session, say, say_and_end))
 
     # ---- voice
     tts_adapter = get_tts(settings)
@@ -241,7 +273,7 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
 
     aggregators = LLMContextAggregatorPair(context, user_params=user_params)
     collector = TranscriptCollector(session)
-    latency_monitor = LatencyMonitor(session.latency)
+    latency_monitor = LatencyMonitor(session.latency, usage=session.ai_usage)
 
     processors = [transport.input(), stt, follower, aggregators.user(), llm]
     if settings.call_fillers and mode != "voicemail":
@@ -356,6 +388,7 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
             opener_timer.cancel()
         await saver.close()
 
+    error = error or session.failure  # the call ended because the model kept failing
     if error:
         def _err(s):
             run = s.get(CallRun, call_run_id)
@@ -363,6 +396,18 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
                 run.error = error
                 run.ended_at = utcnow()
         await run_db(_err)
+
+    try:
+        with attributed(campaign_id=campaign_id, call_run_id=call_run_id):
+            await run_blocking(
+                functools.partial(
+                    record_live_call, settings.call_model, session.ai_usage, requests=session.ai_usage.get("requests", 0),
+                    duration_ms=int((time.monotonic() - conversation_started) * 1000), fingerprint=instructions,
+                    fast=settings.call_fast_mode, settings=settings,
+                )
+            )
+    except Exception:
+        log.exception("call %s: model usage could not be recorded", call_run_id)
 
     try:
         await finalize_call(

@@ -124,6 +124,18 @@ class Settings(BaseSettings):
     db_threads: int = 16
     background_threads: int = 4
 
+    # AI model use outside live calls (reviews, coaching, training). At most this many
+    # requests run at once, so a backlog of analysis cannot use up the capacity the
+    # live conversations need from the same provider account.
+    ai_background_concurrency: int = 2
+    # Live conversation: the longest silence from the model, mid-answer, before the turn
+    # is given up, and how long connecting may take. One quick retry on a dropped connection.
+    call_model_read_timeout_seconds: float = 15.0
+    call_model_connect_timeout_seconds: float = 3.0
+    # Prices in US dollars per million tokens, to override or extend the built-in list
+    # prices, as JSON: {"model-id": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}}
+    ai_prices: str | None = None
+
     # Lets the website hand over what visitors send through its forms, and nothing else.
     # Set the same value as DEVYTALK_INTAKE_TOKEN on the website. Unset: intake is off.
     intake_token: str | None = None

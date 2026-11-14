@@ -35,6 +35,11 @@ class CallSession:
     idle_nudges: int = 0
     user_has_spoken: bool = False
     latency: dict[str, list[float]] = field(default_factory=dict)
+    # What the model used over the whole conversation, as reported by the provider turn by turn.
+    ai_usage: dict[str, int] = field(default_factory=lambda: {"requests": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
+    # Times the model failed to answer a turn on this call, and what goes on the call record if it ended for that.
+    model_failures: int = 0
+    failure: str | None = None
     # Called after each line is added, so the transcript can be saved while the call is in progress.
     on_transcript: Callable[[], None] | None = None
     # The tools this call may use (see voice.tools.allowed_tools). None = not restricted (tests, rehearsal).

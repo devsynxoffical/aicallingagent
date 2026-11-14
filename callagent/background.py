@@ -18,6 +18,7 @@ from sqlalchemy import select
 from . import jobs
 from .config import get_settings
 from .db import CallRun, Campaign, Job, Lead, TrainingDocument, TrainingRun, run_blocking, run_db, utcnow
+from .llm import attributed
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +72,9 @@ async def _training_gave_up(payload: dict[str, Any], error: str) -> None:
     def _mark(s):
         run = s.get(TrainingRun, int(payload["run_id"]))
         if run is not None and run.status == "running":
-            run.status, run.error, run.finished_at = "failed", TRAINING_INTERRUPTED, utcnow()
+            # When the model was the reason, say so: "try again later" is then the right advice.
+            reason = error.split(": ", 1)[-1][:2000] if error.startswith("AITransientError") else TRAINING_INTERRUPTED
+            run.status, run.error, run.finished_at = "failed", reason, utcnow()
 
     await run_db(_mark)
 
@@ -175,14 +178,15 @@ async def review_call_later(payload: dict[str, Any]) -> None:
         playbook: Playbook = _playbook_for(s, campaign, run)
         who = {"user": "Prospect", "assistant": playbook.persona.agent_name}
         text = "\n".join(f"{who.get(t['role'], t['role'])}: {t['text']}" for t in run.transcript or [])
-        return playbook, text, list(run.tool_events or []), run.mode
+        return playbook, text, list(run.tool_events or []), run.mode, campaign.id
 
     loaded = await run_db(_load)
     if loaded is None:
         return
-    playbook, text, tool_events, mode = loaded
+    playbook, text, tool_events, mode, campaign_id = loaded
     client = summarizer.make_client(settings)
-    review = await run_blocking(summarizer.review_call, client, playbook, text, tool_events, mode, settings)
+    with attributed(campaign_id=campaign_id, call_run_id=call_run_id):
+        review = await run_blocking(summarizer.review_call, client, playbook, text, tool_events, mode, settings)
 
     def _store(s):
         run = s.get(CallRun, call_run_id)

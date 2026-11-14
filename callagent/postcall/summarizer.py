@@ -14,7 +14,7 @@ from sqlalchemy import select
 from ..db import Appointment, CallRun, Campaign, Lead, add_dnc, run_blocking, run_db
 from ..dialer import lifecycle
 from ..dialer.rules import call_cost, campaign_settings
-from ..llm import make_client, parse_structured
+from ..llm import attributed, make_client, parse_structured
 from ..playbook.schema import Playbook
 from ..voice.tools import DISPOSITIONS
 
@@ -166,6 +166,7 @@ Valid dispositions: {", ".join(DISPOSITIONS)}.
 Review the call."""
     return parse_structured(
         client,
+        workflow="call_review",
         model=settings.postcall_model_id,
         system=REVIEW_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
@@ -231,7 +232,8 @@ async def finalize_call(
             who = {"user": "Prospect", "assistant": playbook.persona.agent_name}
             text = "\n".join(f"{who.get(t['role'], t['role'])}: {t['text']}" for t in transcript)
             client = make_client(settings)
-            review = await run_blocking(review_call, client, playbook, text, tool_events, mode, settings)  # off the call path's threads
+            with attributed(call_run_id=call_run_id):
+                review = await run_blocking(review_call, client, playbook, text, tool_events, mode, settings)  # off the call path's threads
         except Exception as e:  # review is best-effort; the call record must still close
             review = None
             err = str(e)

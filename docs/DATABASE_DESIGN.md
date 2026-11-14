@@ -168,3 +168,25 @@ one organization requires PostgreSQL.**
 refuses otherwise, because names and do-not-call numbers could then collide), and
 applied again; both directions are tested on SQLite and PostgreSQL. On PostgreSQL an
 upgraded database and a newly created one are compared column by column in a test.
+
+## AI usage and what a call ran on (migration 0010)
+
+- `ai_usage`: one row per use of the AI model (a background request, or one whole
+  phone conversation). Organization (required), campaign and call (optional),
+  workflow, model, prompt fingerprint, token counts as the provider reported them,
+  duration, outcome (CHECK constraint on the seven allowed values) and cost
+  (`NUMERIC(12,6)`, empty when no price is known for the model). Indexed by
+  organization and time, campaign, and call. It is a tenant table: the row-level
+  security policy of migration 0008 applies to it.
+- `call_runs.ai_model`, `call_runs.prompt_hash`: the model and the fingerprint of
+  the instructions a conversation ran on, set when the audio starts.
+- `training_documents.warning`: what was left out of a document that was otherwise
+  read (pages with no text).
+
+Rolling back 0010 drops the table and the three columns in place. On SQLite the
+columns are dropped with `ALTER TABLE ... DROP COLUMN`; rebuilding `call_runs`, which
+other tables refer to, is refused there.
+
+`ai_usage` is a measurement, not a bill. The ledger a bill is drawn from is
+`usage_records`; turning AI usage into ledger lines is phase 7 (D-1, D-2).
+

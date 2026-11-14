@@ -13,19 +13,20 @@ from pathlib import Path
 import secrets as _secrets
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket
-from fastapi.responses import PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from . import background, events, jobs
+from . import background, events, jobs, llm
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
 from .apideps import acting_as, current_principal, organization_id, require_api_token
 from .intake import intake_router, requests_router
 from .config import Settings, get_settings
+from .llm import AIError, AITransientError, attributed
 from .db import ACTIVE_CALL_STATUSES, Appointment, get_engine, row_level_security, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow, run_blocking
 from .dialer import twilio_client
 from .dialer import rules as campaign_rules
@@ -78,6 +79,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="callagent", lifespan=lifespan)
+
+
+@app.exception_handler(AIError)
+async def ai_request_failed(_request: Request, error: AIError) -> JSONResponse:
+    """A model request made on behalf of a console action failed. Say which kind: a busy
+    provider is worth another click in a minute, a rejected request is not."""
+    if isinstance(error, AITransientError):
+        return JSONResponse({"detail": "The AI provider is busy or unreachable right now. Nothing was changed; try again in a minute."}, status_code=503, headers={"Retry-After": "60"})
+    log.error("an AI request was rejected: %s", error)
+    return JSONResponse({"detail": "The AI provider did not accept this request. Nothing was changed."}, status_code=502)
 app.include_router(training_router)
 app.include_router(intelligence_router)
 app.include_router(intake_router)
@@ -411,6 +422,20 @@ async def list_events(type: str | None = None, call_run_id: int | None = None, c
     return await run_db(_q)
 
 
+@app.get("/api/ai-usage", dependencies=[Depends(require_api_token)])
+async def ai_usage(days: int = 30, campaign: str | None = None):
+    """What the caller's organization used of the AI model over the last ``days`` days,
+    by workflow and model: requests, tokens and cost at the price table in force."""
+    from datetime import timedelta
+
+    since = utcnow() - timedelta(days=max(1, min(days, 366)))
+
+    def _q(s):
+        return llm.usage_summary(s, organization_id(), since, _get_campaign(s, campaign).id if campaign else None)
+
+    return await run_db(_q)
+
+
 @app.get("/api/timeline", dependencies=[Depends(require_api_token)])
 async def timeline(days: int = 14, settings: Settings = Depends(get_settings)):
     """Calls per day over the last ``days`` days, across campaigns, counted from the call
@@ -565,9 +590,11 @@ async def set_languages(name: str, body: LanguagesIn, request: Request, settings
         from .playbook.analyzer import PlaybookAnalyzer
 
         analyzer = PlaybookAnalyzer()
-        for code in codes[1:]:
-            if pb.localized_for(code) is None:
-                pb.localized.append(await run_blocking(analyzer.localize, pb, code))
+        campaign_id = await run_db(lambda s: _get_campaign(s, name).id)
+        with attributed(campaign_id=campaign_id):
+            for code in codes[1:]:
+                if pb.localized_for(code) is None:
+                    pb.localized.append(await run_blocking(analyzer.localize, pb, code))
     who = acting_as(request, "api token")
 
     def _save(s):
