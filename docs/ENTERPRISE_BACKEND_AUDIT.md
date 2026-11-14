@@ -28,8 +28,10 @@ still open are carried over here under their original ids (for example C-8, A-1)
 | --- | --- | --- | --- | --- |
 | A. Organization isolation and access | 6 | 5 | 3 | 1 |
 | C. AI orchestration and knowledge | 0 | 8 | 7 | 1 |
+| D. Database, background jobs and billing | 1 | 6 | 5 | 0 |
+| E. Observability, security surface and deployment | 0 | 4 | 5 | 0 |
 
-(Areas B, D and E are added below as their review completes.)
+(Area B, the calling engine, is added below when its review completes.)
 
 ---
 
@@ -449,3 +451,247 @@ structured output raises instead of being used; no API key is logged.
 
 - Duplicate detection is exact-hash per campaign; websites are never re-read;
   superseded and failed files are never deleted; `resume_unfinished` takes no lock.
+
+---
+
+## D. Database, background jobs and billing
+
+Verified as sound and left alone: one usage row per call and kind (unique index and
+savepoint), stored as `Numeric(12,4)`; a lead cannot be dialed twice at once
+(conditional update plus a partial unique index); job claiming is safe on both
+databases, with idempotent enqueue, backoff with jitter, dead letter, attempt
+history and manual retry; call status only moves forward and the provider corrects
+endings the engine inferred; timestamps are consistently UTC; the pool pings and
+recycles connections; SQLite runs with foreign keys, write-ahead log and a busy
+timeout; PostgreSQL takes an advisory lock around migration; backups use the
+database's own snapshot tools with checksums and refuse to overwrite live data.
+
+### D-1 (P0) The usage ledger holds estimates, and only for telephony
+
+- **Now**: `rules.call_cost` = an attempt fee plus started minutes times one blended
+  rate from the environment (default 0). The first amount written for a call is kept
+  forever. Nothing records AI model, speech-to-text, voice or text-message usage, and
+  the provider's own price for a call is never fetched.
+- **Weakness / cause**: the ledger was built for budget enforcement, not billing.
+- **Scenario**: rates are unset, or corrected a month later; every stored row is 0 or
+  wrong and there is no way to correct one without editing history.
+- **Impact**: a customer cannot be billed, and margins cannot be known.
+- **Fix**: one immutable ledger line per component (telephony, speech-to-text, voice,
+  AI model, text message) with quantity, unit, the rate applied, currency and whether
+  the amount is an estimate or the provider's figure; corrections only as new
+  adjustment lines that reference the line they correct; provider prices recorded
+  when the provider reports them.
+- **Size**: L. **Needs**: C-9 for AI usage.
+- **Done when**: a finished call has a line per component; replaying the final status
+  any number of times adds nothing; a later provider price produces an adjustment
+  line and the original line is unchanged.
+
+### D-2 (P1) Spend and budgets are read from a second, floating-point copy
+
+- **Now**: `rules.campaign_spend` sums `call_runs.cost_usd` (a float), not the
+  ledger. `finalize_call` writes a wall-clock estimate to the same column without a
+  lock while the status webhook writes the carrier's duration.
+- **Scenario**: on PostgreSQL the two interleave and the estimate overwrites the
+  better figure; the budget stop fires early or late.
+- **Fix**: spend is the sum of the ledger; `cost_usd` becomes a derived convenience
+  written only from the ledger.
+- **Size**: S. **Done when**: spend equals the ledger sum in a test with out-of-order
+  finalize and status events.
+
+### D-3 (P1) The budget can be exceeded by manual, inbound or multi-process calls
+
+- **Now**: the check lives in the dial loop only. `dial_one` and inbound calls skip
+  it. The check and the call's creation are separate transactions.
+- **Scenario**: an operator's manual dials, or a second server process, spend past
+  the budget; with a shared balance, two campaigns spend the same money.
+- **Fix**: reserve the worst-case cost of a call in the same transaction that
+  reserves the lead, against the campaign's budget (and later an organization
+  balance); release or settle when the call ends.
+- **Size**: M. **Needs**: D-2.
+- **Done when**: concurrent claims against a budget that covers one call create
+  exactly one call, including a manual dial.
+
+### D-4 (P1) Lists and reports load whole tables into memory
+
+- **Now**: the lead list loads every lead and every call of the campaign, then
+  filters and pages in Python (`intelligence/api.py`); the report and the coach load
+  every call (`report.py`); the timeline selects every transcript in the window; the
+  export loads every appointment of every campaign and queries once per lead; the
+  call list fetches each lead separately.
+- **Impact**: time and memory grow with the campaign; at tens of thousands of leads
+  a page takes seconds and a few users exhaust the server. Measured for reads in
+  `LOAD_TEST_RESULTS.md`.
+- **Fix**: filter, sort, count and page in SQL; select only the columns shown; one
+  joined query instead of one per row.
+- **Size**: M. **Done when**: the lead list, call list, timeline and export issue a
+  bounded number of queries regardless of row count (asserted by counting queries).
+
+### D-5 (P1) Migrations run at start-up, and a new database never runs them
+
+- **Now**: every process migrates on start in one transaction; a new database is
+  created from the models and stamped, so most tables have no migration; an index is
+  created without `CONCURRENTLY`; a unique constraint has a name in a migration and
+  none in the model; downgrades drop tables unguarded.
+- **Scenario**: a slow index build blocks writes during a deploy; a failed migration
+  stops every instance from starting; a schema built from migrations differs subtly
+  from one built from the models.
+- **Fix**: a test that the two schemas are identical; migration as an explicit
+  deploy step (`callagent db upgrade`) with start-up only verifying; large indexes
+  built concurrently on PostgreSQL.
+- **Size**: M. **Done when**: the schema-equality test passes on both databases and
+  a server started against an out-of-date database refuses with a clear message
+  when automatic migration is switched off.
+
+### D-6 (P1) One process does everything
+
+- **Now**: the web server, dial loops, job worker and reconciler share one process
+  and one event loop (carried over as A-1 of the earlier audit).
+- **Scenario**: starting a second instance for capacity runs two dial loops and two
+  reconcilers; one crash stops calling, jobs and the API together.
+- **Fix**: a leader lease in the database for the dial loop and the reconciler, so
+  any number of instances can run and exactly one dials; a worker-only mode so job
+  processing scales separately.
+- **Size**: M. **Done when**: two runners started against one database place each
+  call once, and stopping the leader hands over within the lease time.
+
+### D-7 (P1) A timed-out job keeps running
+
+Same root as C-11: handlers run in threads that cannot be cancelled. See there.
+
+### D-8 (P2) Schema integrity gaps
+
+- **Now**: status columns are free text with no CHECK constraint; `call_runs.
+  experiment_id`, `jobs.call_run_id` and the experiment's version numbers have no
+  foreign key; `appointments.starts_at` is a string; money other than the ledger is
+  floating point; no `ON DELETE` rule (nothing deletes these rows today).
+- **Fix**: CHECK constraints on status columns, the missing foreign keys, and
+  validation of the appointment time on write.
+- **Size**: M. **Done when**: inserting an unknown status fails on both databases.
+
+### D-9 (P2) Missing indexes and no pruning
+
+- **Now**: no index on `call_runs(campaign_id, started_at)`, used by the daily and
+  monthly limits on every dial tick; none for the reconciler's scan of active calls;
+  finished jobs, attempts and expired sessions are kept forever.
+- **Fix**: the two indexes; a periodic job that deletes finished jobs and expired
+  sessions past a retention period.
+- **Size**: S.
+
+### D-10 (P2) The job queue has no organization, priority, workload separation or limits
+
+- **Now**: four slots shared by every kind of job; `run_job_now` runs beyond them;
+  no priority; no per-kind or per-organization limit; no cancel; leases depend on
+  each host's clock.
+- **Scenario**: fifty call reviews queue up and a booking notification waits behind
+  them; one customer's backlog delays everyone's.
+- **Fix**: a queue name and a priority on each job; per-queue concurrency so slow
+  analysis cannot take the slots that call-related work needs; organization on the
+  job; fairness between organizations when claiming.
+- **Size**: M. **Done when**: with the analysis queue saturated, a high-priority job
+  is claimed immediately in a test.
+
+### D-11 (P2) Work that bypasses the durable queue
+
+- **Now**: document and website reading use FastAPI background tasks; the call
+  review runs inline at the end of the call with the queue only as a ten-minute
+  safety net; the coach and language phrasing block an HTTP request; lead import
+  runs in the request.
+- **Scenario**: a restart during document reading leaves it to a best-effort resume;
+  a coach run ties up a request for minutes.
+- **Fix**: document reading and the coach as durable jobs with their own queue.
+- **Size**: M. **Needs**: D-10.
+
+### D-12 (P2) Read-modify-write without row locks
+
+- **Now**: JSON merges (`run.summary = {**...}`), `failed_logins` and similar are
+  read, changed and written with no lock. SQLite's single writer hides it; the tests
+  default to SQLite.
+- **Fix**: `SELECT ... FOR UPDATE` on the row for these updates on PostgreSQL, and
+  the concurrency tests run against PostgreSQL in CI.
+- **Size**: S.
+
+---
+
+## E. Observability, security surface and deployment
+
+### E-1 (P1) Logging is not configured
+
+- **Now**: nothing configures logging. The root logger has no handler, so every
+  `log.info` in the engine is dropped and warnings print without time or context.
+  There is no request or call identifier in any line. Caller numbers appear in
+  messages and in access logs (the manual dial passes the number in the URL).
+- **Impact**: after an incident there is nothing to read; what is printed contains
+  personal data.
+- **Fix**: structured (JSON) logs with time, level, logger, request id, call id,
+  campaign and organization; phone numbers masked; a correlation id accepted from or
+  issued to every request and carried into jobs and calls.
+- **Size**: M. **Done when**: a request produces a log line with its id, the same id
+  is on the job it enqueued, and a test asserts no unmasked phone number is logged.
+
+### E-2 (P1) No metrics, a health check that checks nothing, no error reporting
+
+- **Now**: `/health` returns a constant and lists missing settings to anyone. There
+  is no metrics endpoint and no error reporting.
+- **Fix**: `/health/live` (process up) and `/health/ready` (database reachable,
+  migration current, worker running); a Prometheus `/metrics` endpoint with request
+  rate, errors and latency, active calls and outcomes, job queue depth and age,
+  database pool use, AI latency and tokens; alert rules shipped with the code.
+- **Size**: M. **Done when**: stopping the database turns readiness red, and the
+  metrics endpoint shows a request, a job and a call recorded by tests.
+
+### E-3 (P1) No audit trail
+
+See A-13. Rule and budget changes, approvals, retries and user changes leave no
+record of who did them.
+
+### E-4 (P1) Backups are manual, unencrypted and on the same disk
+
+- **Now**: `callagent db backup` covers the database and uploaded files, run by hand,
+  written next to the data, unencrypted; verification checks checksums only; restore
+  deletes live files before copying; recordings and the website's fallback file are
+  not covered.
+- **Fix**: encryption with a key from the environment, a retention policy, a
+  scheduled mode, restore into a temporary location followed by a swap, and a
+  restore drill that runs in CI.
+- **Size**: M. **Done when**: an encrypted backup restores into an empty database in
+  an automated test and the restored row counts match.
+
+### E-5 (P2) Container and compose
+
+- **Now**: runs as root, floating base image, no health check, build tools in the
+  final image, dependencies unpinned with no lock file, PostgreSQL driver not
+  installed, compose uses SQLite on a bind mount.
+- **Fix**: multi-stage build, non-root user, health check, a lock file, the
+  PostgreSQL extra, a compose file with PostgreSQL.
+- **Size**: S.
+
+### E-6 (P2) No continuous integration
+
+- **Now**: neither repository has a pipeline, lint or type-check configuration.
+- **Fix**: a pipeline that lints, type-checks, runs the tests on SQLite and
+  PostgreSQL, checks migrations and scans dependencies; the console's unit and
+  browser tests in the other repository.
+- **Size**: S.
+
+### E-7 (P2) No draining of live calls on shutdown
+
+- **Now**: on stop the dial loops are cancelled; live calls end with the process.
+- **Fix**: stop dialing, wait up to a limit for live calls to finish, then stop.
+- **Size**: S.
+
+### E-8 (P2) Console server: headers, rate limiting, body limits
+
+- **Now**: no Content-Security-Policy or other security headers; the rate limiter is
+  per process and keyed on the first `X-Forwarded-For` value, which a client can set;
+  JSON bodies through the proxy have no size limit; the engine's error text is
+  passed to the browser unchanged; when signing in with the engine token, that
+  non-expiring token is what the cookie holds.
+- **Fix**: security headers; trust the forwarded address only from a configured
+  proxy; a body limit; exchange the engine token for a session at sign-in.
+- **Size**: M.
+
+### E-9 (P2) Unbounded uploads on the engine
+
+- **Now**: the lead-sheet upload reads the whole body with no limit.
+- **Fix**: the same 25 MB limit as documents, enforced while reading.
+- **Size**: S.
