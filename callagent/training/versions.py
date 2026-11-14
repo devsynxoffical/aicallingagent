@@ -99,6 +99,10 @@ def record_active(s: Session, campaign: Campaign, playbook: dict[str, Any], *, s
     s.add(version)
     s.flush()
     _publish(s, campaign, version, approved_by=by)
+    from .. import events
+
+    events.emit(s, "PlaybookApproved", key=f"playbook:{campaign.id}:{version.version}:approved:{utcnow().isoformat()}", subject="playbook", subject_id=version.id,
+                organization_id=version.organization_id, campaign_id=campaign.id, payload={"version": version.version, "by": by, "source": version.source})
     return version
 
 

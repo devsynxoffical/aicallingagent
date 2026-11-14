@@ -19,14 +19,14 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
-from . import background, jobs
+from . import background, events, jobs
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
 from .apideps import acting_as, current_principal, organization_id, require_api_token
 from .intake import intake_router, requests_router
 from .config import Settings, get_settings
-from .db import ACTIVE_CALL_STATUSES, Appointment, get_engine, row_level_security, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
+from .db import ACTIVE_CALL_STATUSES, Appointment, get_engine, row_level_security, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow, run_blocking
 from .dialer import twilio_client
 from .dialer import rules as campaign_rules
 from .dialer.reconcile import reconcile_forever
@@ -356,7 +356,10 @@ async def list_jobs(request: Request, status: str | None = None, limit: int = 50
         query = select(jobs.Job).where(mine).order_by(jobs.Job.id.desc()).limit(max(1, min(limit, 200)))
         if status:
             query = query.where(jobs.Job.status == status)
-        return {"stats": jobs.stats(s, org, include_unowned=operator), "jobs": [jobs.describe(j) for j in s.execute(query).scalars()]}
+        out = {"stats": jobs.stats(s, org, include_unowned=operator), "jobs": [jobs.describe(j) for j in s.execute(query).scalars()]}
+        if operator:
+            out["queues"] = jobs.queue_stats(s)  # the deployment's load, for its operator only
+        return out
 
     return await run_db(_q)
 
@@ -375,6 +378,26 @@ async def retry_job(job_id: int, request: Request):
     if not await run_db(_retry):
         raise HTTPException(409, "only a dead job can be retried")
     return {"ok": True}
+
+
+@app.get("/api/events", dependencies=[Depends(require_api_token)])
+async def list_events(type: str | None = None, call_run_id: int | None = None, campaign: str | None = None, limit: int = 100, before_id: int | None = None):
+    """What happened, newest first: the caller's organization's durable event log.
+    ``call_run_id`` gives everything recorded about one call."""
+
+    def _q(s):
+        query = select(events.Event).where(events.Event.organization_id == organization_id())
+        if type:
+            query = query.where(events.Event.type == type)
+        if call_run_id is not None:
+            query = query.where(events.Event.call_run_id == call_run_id)
+        if campaign:
+            query = query.where(events.Event.campaign_id == _get_campaign(s, campaign).id)
+        if before_id is not None:
+            query = query.where(events.Event.id < before_id)
+        return [events.describe(e) for e in s.execute(query.order_by(events.Event.id.desc()).limit(max(1, min(limit, 500)))).scalars()]
+
+    return await run_db(_q)
 
 
 @app.get("/api/timeline", dependencies=[Depends(require_api_token)])
@@ -463,7 +486,7 @@ async def setup_status(settings: Settings = Depends(get_settings)):
         "languages": [{"code": code, "name": label} for code, label in LANGUAGE_NAMES.items()],
         "website_intake": bool(settings.intake_token),
         # Whether the database itself keeps organizations apart: enforced | bypassed | missing | unavailable.
-        "row_level_security": await asyncio.to_thread(row_level_security, get_engine()),
+        "row_level_security": await run_blocking(row_level_security, get_engine()),
         "default_timezone": settings.default_timezone,
     }
 
@@ -533,7 +556,7 @@ async def set_languages(name: str, body: LanguagesIn, request: Request, settings
         analyzer = PlaybookAnalyzer()
         for code in codes[1:]:
             if pb.localized_for(code) is None:
-                pb.localized.append(await asyncio.to_thread(analyzer.localize, pb, code))
+                pb.localized.append(await run_blocking(analyzer.localize, pb, code))
     who = acting_as(request, "api token")
 
     def _save(s):
@@ -558,7 +581,7 @@ async def upload_leads(name: str, file: UploadFile = File(...), settings: Settin
         tmp.write(await file.read())
         path = tmp.name
     try:
-        report = await run_db(lambda s: import_leads(s, _get_campaign(s, name), path, settings.default_phone_region))
+        report = await run_db(lambda s: import_leads(s, _get_campaign(s, name), path, settings.default_phone_region), slow=True)  # parsing a sheet can take a while
     finally:
         Path(path).unlink(missing_ok=True)
     return report.as_dict()
@@ -594,8 +617,14 @@ async def start_campaign(name: str, concurrency: int | None = None, force: bool 
 
 
 @app.post("/api/campaigns/{name}/pause", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
-async def pause_campaign(name: str):
-    cid = await run_db(lambda s: _get_campaign(s, name).id)
+async def pause_campaign(name: str, request: Request):
+    def _pause(s):
+        c = _get_campaign(s, name)
+        events.emit(s, "CampaignPaused", key=f"campaign:{c.id}:paused:{utcnow().isoformat()}", subject="campaign", subject_id=c.id,
+                    organization_id=c.organization_id, campaign_id=c.id, payload={"by": acting_as(request, "api token")})
+        return c.id
+
+    cid = await run_db(_pause)
     await _runner().stop(cid, status="paused")
     return await run_db(lambda s: _campaign_out(s, _get_campaign(s, name)))
 

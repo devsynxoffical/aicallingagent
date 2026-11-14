@@ -79,6 +79,7 @@ def add_file(s: Session, campaign: Campaign, filename: str, data: bytes, setting
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     document.storage_path = str(path)
+    _accepted(s, document)
     return document
 
 
@@ -98,7 +99,17 @@ def add_website(s: Session, campaign: Campaign, url: str, max_pages: int = 8, *,
     )
     s.add(document)
     s.flush()
+    _accepted(s, document)
     return document
+
+
+def _accepted(s: Session, document: TrainingDocument) -> None:
+    """A source was accepted: in the same transaction, queue its reading and record the fact."""
+    from .. import background, events
+
+    background.enqueue_document_read(s, document)
+    events.emit(s, "DocumentUploaded", key=f"document:{document.id}:uploaded", subject="document", subject_id=document.id, organization_id=document.organization_id,
+                campaign_id=document.campaign_id, payload={"kind": document.kind, "name": document.filename or document.source_url or ""})
 
 
 def _read(info: dict[str, Any], fetcher=None, resolver=None) -> tuple[list[Section], int]:
@@ -174,12 +185,17 @@ def process_document_sync(s: Session, document_id: int, *, fetcher=None, resolve
     for previous in older:
         previous.status = "superseded"
         s.execute(delete(KnowledgeChunk).where(KnowledgeChunk.document_id == previous.id))
+    from .. import events
+
+    events.emit(s, "DocumentProcessed", key=f"document:{document.id}:processed:{document.processed_at.isoformat()}", subject="document", subject_id=document.id,
+                organization_id=document.organization_id, campaign_id=document.campaign_id, payload={"passages": document.chunk_count, "language": document.language})
     return document
 
 
 async def process_document(document_id: int) -> None:
-    """Background entry point: reading files and websites never blocks the audio loop."""
-    await run_db(lambda s: process_document_sync(s, document_id))
+    """Background entry point: reading files and websites never blocks the audio loop,
+    and runs on the background threads, not the ones calls and webhooks use."""
+    await run_db(lambda s: process_document_sync(s, document_id), slow=True)
 
 
 async def resume_unfinished() -> int:
@@ -187,9 +203,9 @@ async def resume_unfinished() -> int:
     ids = await run_db(
         lambda s: [d.id for d in s.execute(select(TrainingDocument).where(TrainingDocument.status.in_(("pending", "processing")))).scalars()]
     )
-    for document_id in ids:
-        asyncio.create_task(process_document(document_id))
-    return len(ids)
+    from .. import background
+
+    return await background.queue_unread_documents() if ids else 0
 
 
 def remove_document(s: Session, campaign: Campaign, document_id: int) -> bool:

@@ -45,16 +45,27 @@ BACKOFF_BASE_SECONDS = 30
 BACKOFF_CAP_SECONDS = 3600
 LEASE_GRACE_SECONDS = 30  # beyond the timeout, before another worker may take the job
 
+# Worker slots per queue, in one process. Each queue has its own, so a backlog in one
+# cannot take the slots of another: fifty call reviews waiting on a slow model do not
+# delay a booking notification or the job that finishes an interrupted call.
+#   calls      what a call or its customer depends on: finishing interrupted calls, booking notifications
+#   analysis   call reviews and other model work about calls that are over
+#   knowledge  reading documents and websites, building drafts
+#   default    everything else
+QUEUES: dict[str, int] = {"calls": 4, "analysis": 2, "knowledge": 2, "default": 2}
+
 _handlers: dict[str, Handler] = {}
 _dead_hooks: dict[str, DeadHook] = {}
+_queue_of: dict[str, str] = {}
 
 
-def handler(kind: str, *, on_dead: DeadHook | None = None) -> Callable[[Handler], Handler]:
-    """Register the coroutine that does jobs of this kind. It receives the payload and
-    must be safe to run more than once for the same job."""
+def handler(kind: str, *, queue: str = "default", on_dead: DeadHook | None = None) -> Callable[[Handler], Handler]:
+    """Register the coroutine that does jobs of this kind, and the queue they wait in.
+    It receives the payload and must be safe to run more than once for the same job."""
 
     def register(fn: Handler) -> Handler:
         _handlers[kind] = fn
+        _queue_of[kind] = queue
         if on_dead is not None:
             _dead_hooks[kind] = on_dead
         return fn
@@ -80,6 +91,8 @@ def enqueue(
     timeout_seconds: int = 300,
     call_run_id: int | None = None,
     organization_id: int | None = None,
+    priority: int = 0,
+    queue: str | None = None,
 ) -> Job:
     """Add a job inside the caller's transaction. If a job with this key already exists
     it is returned unchanged: the same work is never queued twice.
@@ -94,6 +107,7 @@ def enqueue(
     job = Job(
         kind=kind, key=key[:200], payload=dict(payload or {}), run_at=utcnow() + timedelta(seconds=delay_seconds),
         max_attempts=max_attempts, timeout_seconds=timeout_seconds, call_run_id=call_run_id, organization_id=organization_id,
+        queue=queue or _queue_of.get(kind, "default"), priority=priority,
     )
     try:
         with s.begin_nested():  # a concurrent enqueue of the same key loses here, without undoing the caller's work
@@ -119,19 +133,37 @@ def _take(s: Session, candidate: Job, worker: str, now: datetime) -> dict[str, A
         _close_attempts(s, candidate.id, "abandoned", "the worker stopped before finishing")
     s.refresh(candidate)
     s.add(JobAttempt(job_id=candidate.id, attempt=candidate.attempts, worker=worker, started_at=now))
-    return {"id": candidate.id, "kind": candidate.kind, "key": candidate.key, "payload": dict(candidate.payload or {}),
+    return {"id": candidate.id, "kind": candidate.kind, "key": candidate.key, "queue": candidate.queue, "payload": dict(candidate.payload or {}),
             "attempt": candidate.attempts, "max_attempts": candidate.max_attempts, "timeout_seconds": candidate.timeout_seconds}
 
 
-def claim(s: Session, worker: str, now: datetime | None = None) -> dict[str, Any] | None:
+def _in_queue(queue: str | None):
+    """Jobs a pool of slots is responsible for. The default pool also takes jobs whose
+    queue no pool is configured for, so a job can never be stranded by a typo."""
+    if queue is None:
+        return ()
+    if queue == "default":
+        return (Job.queue.not_in([name for name in QUEUES if name != "default"]),)
+    return (Job.queue == queue,)
+
+
+def claim(s: Session, worker: str, now: datetime | None = None, *, queue: str | None = None) -> dict[str, Any] | None:
     """Take one job that is due, or whose worker stopped answering. Returns its details,
-    or None when there is nothing to do. Only one caller can take a given job."""
+    or None when there is nothing to do. Only one caller can take a given job.
+
+    Order: higher priority first; then the organization with the fewest jobs running
+    right now in this queue, so one customer's backlog cannot starve another's; then
+    the job that has waited longest."""
     now = now or utcnow()
     due = or_(
         (Job.status == "queued") & (Job.run_at <= now),
         (Job.status == "running") & (Job.locked_until < now),
     )
-    for candidate in s.execute(select(Job).where(due).order_by(Job.run_at, Job.id).limit(10)).scalars():
+    candidates = list(s.execute(select(Job).where(due, *_in_queue(queue)).order_by(Job.priority.desc(), Job.run_at, Job.id).limit(50)).scalars())
+    if len({c.organization_id for c in candidates}) > 1:
+        busy = dict(s.execute(select(Job.organization_id, func.count()).where(Job.status == "running", Job.locked_until >= now, *_in_queue(queue)).group_by(Job.organization_id)).all())
+        candidates.sort(key=lambda c: (-c.priority, busy.get(c.organization_id, 0), c.run_at, c.id))
+    for candidate in candidates:
         if candidate.status == "running" and candidate.attempts >= candidate.max_attempts:
             _close_attempts(s, candidate.id, "abandoned", "the worker stopped before finishing")
             candidate.status, candidate.finished_at, candidate.locked_by, candidate.locked_until = "dead", now, None, None
@@ -195,17 +227,42 @@ def stats(s: Session, organization_id: int | None = None, *, include_unowned: bo
     """Counts by state and the age of the oldest job still waiting, for health and
     metrics: for one organization, or for the whole deployment when none is given."""
     mine = _owned_by(organization_id, include_unowned)
+    now = utcnow()
     counts = dict(s.execute(select(Job.status, func.count()).where(*mine).group_by(Job.status)).all())
-    oldest = s.execute(select(func.min(Job.run_at)).where(Job.status == "queued", Job.run_at <= utcnow(), *mine)).scalar()
+    oldest = s.execute(select(func.min(Job.run_at)).where(Job.status == "queued", Job.run_at <= now, *mine)).scalar()
     return {
         "queued": counts.get("queued", 0), "running": counts.get("running", 0), "done": counts.get("done", 0), "dead": counts.get("dead", 0),
-        "oldest_due_seconds": round((utcnow() - oldest).total_seconds(), 1) if oldest else 0.0,
+        "oldest_due_seconds": round((now - oldest).total_seconds(), 1) if oldest else 0.0,
     }
+
+
+def queue_stats(s: Session) -> dict[str, dict[str, Any]]:
+    """For each queue: how many jobs are due and waiting, how many are running, how long
+    the oldest due one has waited, and its slots. This is what backpressure and alerts
+    look at: a growing wait in one queue is that queue falling behind."""
+    now = utcnow()
+    out = {name: {"waiting": 0, "running": 0, "oldest_due_seconds": 0.0, "slots": slots} for name, slots in QUEUES.items()}
+    rows = s.execute(
+        select(Job.queue, Job.status, func.count(), func.min(Job.run_at))
+        .where(or_((Job.status == "queued") & (Job.run_at <= now), Job.status == "running"))
+        .group_by(Job.queue, Job.status)
+    ).all()
+    for queue, status, n, oldest in rows:
+        entry = out.setdefault(queue, {"waiting": 0, "running": 0, "oldest_due_seconds": 0.0, "slots": 0})
+        if status == "running":
+            entry["running"] = n
+        else:
+            entry["waiting"] = n
+            if oldest is not None:
+                if oldest.tzinfo is None:
+                    oldest = oldest.replace(tzinfo=now.tzinfo)
+                entry["oldest_due_seconds"] = round(max(0.0, (now - oldest).total_seconds()), 1)
+    return out
 
 
 def describe(job: Job) -> dict[str, Any]:
     return {
-        "id": job.id, "kind": job.kind, "key": job.key, "status": job.status, "attempts": job.attempts, "max_attempts": job.max_attempts,
+        "id": job.id, "kind": job.kind, "key": job.key, "status": job.status, "queue": job.queue, "priority": job.priority, "attempts": job.attempts, "max_attempts": job.max_attempts,
         "run_at": job.run_at.isoformat() if job.run_at else None, "last_error": job.last_error, "call_run_id": job.call_run_id,
         "created_at": job.created_at.isoformat() if job.created_at else None, "finished_at": job.finished_at.isoformat() if job.finished_at else None,
     }
@@ -227,12 +284,16 @@ class Worker:
     """Runs due jobs inside the server process. Several processes may each run one: a job
     is only ever held by the worker whose lease it carries."""
 
-    def __init__(self, *, concurrency: int = 4, poll_seconds: float = 2.0, name: str | None = None):
+    def __init__(self, *, queues: dict[str, int] | None = None, poll_seconds: float = 2.0, name: str | None = None):
         self.name = name or f"{socket.gethostname()}:{os.getpid()}"
         self.poll_seconds = poll_seconds
-        self._slots = asyncio.Semaphore(concurrency)
+        self.queues = dict(queues or QUEUES)
+        self._slots = {queue: asyncio.Semaphore(max(1, slots)) for queue, slots in self.queues.items()}
         self._task: asyncio.Task | None = None
         self._running: set[asyncio.Task] = set()
+
+    def _pool(self, queue: str) -> asyncio.Semaphore:
+        return self._slots.get(queue) or self._slots.get("default") or next(iter(self._slots.values()))
 
     async def run_once(self) -> int:
         """Take and run every job that is due right now. Returns how many ran."""
@@ -246,11 +307,23 @@ class Worker:
 
     async def run_job_now(self, key: str) -> None:
         """Run one job immediately instead of waiting for the next poll, if it is still
-        waiting. Used right after enqueueing, so normal work is not delayed by the queue;
-        the queue remains the safety net if this process stops first."""
-        job = await run_db(lambda s: claim_key(s, self.name, key))
-        if job is not None:
-            await self._execute(job)
+        waiting and its queue has a free slot. Used right after enqueueing, so normal
+        work is not delayed by the queue; the queue remains the safety net if this
+        process stops first. When the queue's slots are all taken the job simply waits
+        its turn: starting it anyway is how a burst would overrun the limit."""
+        queue = await run_db(lambda s: s.execute(select(Job.queue).where(Job.key == key, Job.status == "queued")).scalar())
+        if queue is None:
+            return
+        pool = self._pool(queue)
+        if pool.locked():
+            return
+        await pool.acquire()
+        try:
+            job = await run_db(lambda s: claim_key(s, self.name, key))
+            if job is not None:
+                await self._execute(job)
+        finally:
+            pool.release()
 
     async def _execute(self, job: dict[str, Any]) -> None:
         fn = _handlers.get(job["kind"])
@@ -278,15 +351,17 @@ class Worker:
     async def _loop(self) -> None:
         while True:
             try:
-                while True:
-                    await self._slots.acquire()
-                    job = await run_db(lambda s: claim(s, self.name))
-                    if job is None:
-                        self._slots.release()
-                        break
-                    task = asyncio.create_task(self._execute(job))
-                    self._running.add(task)
-                    task.add_done_callback(lambda t: (self._running.discard(t), self._slots.release()))
+                for queue in self.queues:
+                    pool = self._pool(queue)
+                    while not pool.locked():  # never wait for a slot here: a full queue must not hold up the others
+                        await pool.acquire()
+                        job = await run_db(lambda s, q=queue: claim(s, self.name, queue=q))
+                        if job is None:
+                            pool.release()
+                            break
+                        task = asyncio.create_task(self._execute(job))
+                        self._running.add(task)
+                        task.add_done_callback(lambda t, p=pool: (self._running.discard(t), p.release()))
             except asyncio.CancelledError:
                 raise
             except Exception:

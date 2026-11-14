@@ -218,6 +218,10 @@ async def book_meeting(session: CallSession, params: FunctionCallParams) -> dict
             )
             s.add(appt)
             s.flush()
+            from .. import events
+
+            events.emit(s, "AppointmentBooked", key=f"appointment:{appt.id}:booked", subject="appointment", subject_id=appt.id, organization_id=appt.organization_id,
+                        campaign_id=session.campaign_id, call_run_id=session.call_run_id, payload={"starts_at": parsed.isoformat(), "lead_id": session.lead["id"]})
         lead = s.get(Lead, session.lead["id"])
         if lead:
             lead.last_disposition = "meeting_booked"

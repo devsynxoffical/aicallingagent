@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -457,6 +460,10 @@ class Job(Base):
     key: Mapped[str] = mapped_column(String(200))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(12), default="queued")  # queued | running | done | dead
+    # Which pool of worker slots runs it (see jobs.QUEUES): work that a call depends on
+    # never waits behind analysis or document reading. Within a queue, higher priority first.
+    queue: Mapped[str] = mapped_column(String(20), default="default")
+    priority: Mapped[int] = mapped_column(Integer, default=0)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=5)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=300)
@@ -474,8 +481,37 @@ class Job(Base):
     __table_args__ = (
         Index("uq_jobs_key", "key", unique=True),
         Index("ix_jobs_due", "status", "run_at"),
+        Index("ix_jobs_queue_due", "queue", "status", "run_at"),
         CheckConstraint("status IN ('queued', 'running', 'done', 'dead')", name="ck_jobs_status"),
     )
+
+
+class Event(Base):
+    """Something that happened, recorded in the same transaction as the change itself
+    (a transactional outbox). Events are facts for tracing and for consumers; the
+    tables remain the source of truth for current state.
+
+    ``key`` makes recording idempotent: the same fact reported twice (a repeated
+    webhook, a retried job) is one event. Consumers are jobs, one per subscriber, so
+    each has its own retries and dead letter and a failure in one never holds up another.
+    """
+
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), nullable=True, index=True)
+    type: Mapped[str] = mapped_column(String(60), index=True)  # CallAnswered, PlaybookApproved, ...
+    version: Mapped[int] = mapped_column(Integer, default=1)  # of this event type's payload
+    subject: Mapped[str] = mapped_column(String(30))  # call | campaign | appointment | document | playbook | usage
+    subject_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    campaign_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # The correlation id of everything about one call: its events, jobs, usage and AI requests carry it.
+    call_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    key: Mapped[str] = mapped_column(String(200))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    occurred_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+    __table_args__ = (Index("uq_events_key", "key", unique=True),)
 
 
 class JobAttempt(Base):
@@ -533,11 +569,32 @@ def _engine_options(url: str) -> dict[str, Any]:
 def _configure_sqlite(engine) -> None:
     @event.listens_for(engine, "connect")
     def _pragmas(dbapi_connection, _record):
+        # Python's sqlite3 module opens a transaction by itself, but only before an
+        # INSERT, UPDATE or DELETE, not before SAVEPOINT. A transaction whose first write
+        # was inside a savepoint therefore had no outer transaction, and releasing that
+        # savepoint committed it: the work survived even when the caller then rolled
+        # back. Jobs and events are written inside savepoints, so "saved together with
+        # the change or not at all" did not hold. The driver's own handling is switched
+        # off here and the transaction is begun explicitly (see _begin_before_first_write).
+        dbapi_connection.isolation_level = None
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")  # SQLite ignores foreign keys unless asked
         cursor.execute("PRAGMA journal_mode=WAL")  # readers do not block the writer (no effect on :memory:)
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _begin_before_first_write(_connection, cursor, statement, _parameters, _context, _executemany):
+        # Begun at the first statement that is not a read, savepoints included. Reads before
+        # it run outside a transaction, as they always did here: a transaction that began
+        # with a read cannot become a writer once another writer has committed, which
+        # under concurrency fails at once with "database is locked".
+        if not cursor.connection.in_transaction and not statement.lstrip().upper().startswith(_SQLITE_NO_BEGIN):
+            cursor.execute("BEGIN")
+
+
+# Statements that read, or that manage the transaction themselves.
+_SQLITE_NO_BEGIN = ("SELECT", "PRAGMA", "BEGIN", "COMMIT", "ROLLBACK", "EXPLAIN", "WITH")
 
 
 def get_engine(database_url: str | None = None):
@@ -700,13 +757,47 @@ def session_scope():
         session.close()
 
 
-async def run_db(fn: Callable[[Session], T], *, unrestricted: bool = False) -> T:
+_executors: dict[str, ThreadPoolExecutor] = {}
+_executors_lock = threading.Lock()
+
+
+def executor(kind: str) -> ThreadPoolExecutor:
+    """One of the two thread pools. "db": database work on the request and call path,
+    which has deadlines (a provider webhook must be answered within seconds, a caller
+    is waiting for a tool). "background": anything that can take long: model calls,
+    website crawls, document parsing, imports. They are separate so that the second
+    kind, however backed up, never takes a thread the first kind needs."""
+    with _executors_lock:
+        if kind not in _executors:
+            settings = get_settings()
+            size = settings.db_threads if kind == "db" else settings.background_threads
+            _executors[kind] = ThreadPoolExecutor(max_workers=max(1, size), thread_name_prefix=f"callagent-{kind}")
+        return _executors[kind]
+
+
+def reset_executors_for_tests() -> None:
+    with _executors_lock:
+        for pool in _executors.values():
+            pool.shutdown(wait=False, cancel_futures=True)
+        _executors.clear()
+
+
+async def run_blocking(fn: Callable[..., T], *args: Any) -> T:
+    """Run slow blocking work (a model call, a crawl, parsing a file) on the background
+    pool, keeping the caller's context."""
+    context = contextvars.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(executor("background"), lambda: context.run(fn, *args))
+
+
+async def run_db(fn: Callable[[Session], T], *, unrestricted: bool = False, slow: bool = False) -> T:
     """Run a blocking DB function in a worker thread so the audio loop never stalls.
 
     The thread inherits the request's organization, which confines the transaction to
     it. ``unrestricted`` is for the few operations that are about the deployment as a
     whole (managing organizations): it runs without an organization, and must only be
-    used on routes reserved for the deployment's operator."""
+    used on routes reserved for the deployment's operator. ``slow`` marks work that
+    may take long (it reads a website, parses a sheet, calls the AI model): it runs on
+    the background pool, so it cannot hold up calls and webhooks."""
 
     def _runner() -> T:
         if unrestricted:
@@ -714,7 +805,8 @@ async def run_db(fn: Callable[[Session], T], *, unrestricted: bool = False) -> T
         with session_scope() as s:
             return fn(s)
 
-    return await asyncio.to_thread(_runner)
+    context = contextvars.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(executor("background" if slow else "db"), lambda: context.run(_runner))
 
 
 # --------------------------------------------------------------------------- helpers
@@ -763,8 +855,10 @@ def dumps(obj: Any) -> str:
 # Every table whose rows belong to one organization. Row-level security covers exactly these.
 TENANT_TABLES = (
     "campaigns", "leads", "call_runs", "appointments", "do_not_call", "usage_records", "training_documents", "knowledge_chunks",
-    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs",
+    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events",
 )
+# Rows of these may belong to no organization (the deployment's own housekeeping and facts).
+_SHARED_WHEN_UNOWNED = ("jobs", "events")
 
 
 def ensure_row_level_security(connection) -> None:
@@ -781,9 +875,12 @@ def ensure_row_level_security(connection) -> None:
     if connection.dialect.name != "postgresql":
         return
     setting = "NULLIF(current_setting('app.organization_id', true), '')"
+    existing = set(inspect(connection).get_table_names())
     for table in TENANT_TABLES:
+        if table not in existing:
+            continue  # created by a later migration, which calls this again
         # A job may belong to no organization (housekeeping); such rows stay visible to the deployment's operator.
-        own = f"organization_id = {setting}::int" + (" OR organization_id IS NULL" if table == "jobs" else "")
+        own = f"organization_id = {setting}::int" + (" OR organization_id IS NULL" if table in _SHARED_WHEN_UNOWNED else "")
         rule = f"({setting} IS NULL OR {own})"
         connection.execute(text(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
         connection.execute(text(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"))

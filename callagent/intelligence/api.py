@@ -163,11 +163,11 @@ async def run_coach(name: str, settings: Settings = Depends(get_settings)):
 
     def _run(s):
         try:
-            return coach.propose_improvements(s, get_campaign(s, name), settings=settings)
+            return coach.propose_improvements(s, get_campaign(s, name), settings=settings)  # a model call: runs on the background threads
         except coach.CoachError as e:
             raise HTTPException(409, str(e)) from None
 
-    return await run_db(_run)
+    return await run_db(_run, slow=True)
 
 
 # ----------------------------------------------------------------------------- A/B tests

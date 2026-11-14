@@ -32,6 +32,7 @@ from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
+from .. import background, events
 from ..config import Settings, get_settings
 from datetime import timedelta
 
@@ -100,6 +101,11 @@ async def load_call_context(call_run_id: int) -> tuple[dict[str, Any], Playbook,
         }
         lifecycle.advance(run, "in-progress")
         run.stream_connected = True
+        # From here the call has a safety net: if this process stops, or the normal ending
+        # fails, the queue still gives the call an outcome and releases the lead.
+        background.enqueue_call_finalize(s, run, get_settings())
+        events.emit(s, "CallAnswered", key=f"call:{run.id}:answered", subject="call", subject_id=run.id, organization_id=run.organization_id,
+                    campaign_id=run.campaign_id, call_run_id=run.id, payload={"direction": run.direction or "outbound"})
         # Built once per call, for this organization and campaign only.
         knowledge = load_index(s, campaign_organization_id(s, campaign), campaign.id)
         return lead_dict, _playbook_for(s, campaign, run), campaign.id, run.twilio_call_sid, run.direction or "outbound", knowledge

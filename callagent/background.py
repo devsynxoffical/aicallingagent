@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from . import jobs
 from .config import get_settings
-from .db import CallRun, Campaign, Job, Lead, TrainingRun, run_db, utcnow
+from .db import CallRun, Campaign, Job, Lead, TrainingDocument, TrainingRun, run_blocking, run_db, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ async def _training_gave_up(payload: dict[str, Any], error: str) -> None:
     await run_db(_mark)
 
 
-@jobs.handler(TRAINING_RUN, on_dead=_training_gave_up)
+@jobs.handler(TRAINING_RUN, queue="knowledge", on_dead=_training_gave_up)
 async def run_training_job(payload: dict[str, Any]) -> None:
     """Build a draft playbook from the campaign's material. If the process stops halfway,
     the run is still marked running and this job is taken over and run again."""
@@ -118,7 +118,7 @@ def sign(secret: str, body: bytes) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
-@jobs.handler(BOOKING_WEBHOOK)
+@jobs.handler(BOOKING_WEBHOOK, queue="calls")
 async def deliver_booking_webhook(payload: dict[str, Any]) -> None:
     """Tell the customer's system about a booked meeting. Anything but a 2xx answer is a
     failure and is retried. The receiver can de-duplicate on X-Callagent-Delivery, which
@@ -147,7 +147,7 @@ def call_review_key(call_run_id: int) -> str:
     return f"{CALL_REVIEW}:call:{call_run_id}"
 
 
-@jobs.handler(CALL_REVIEW)
+@jobs.handler(CALL_REVIEW, queue="analysis")
 async def review_call_later(payload: dict[str, Any]) -> None:
     """Review a call whose review did not finish when the call ended (the model was
     unreachable, or the process stopped). Works from the stored transcript.
@@ -182,7 +182,7 @@ async def review_call_later(payload: dict[str, Any]) -> None:
         return
     playbook, text, tool_events, mode = loaded
     client = summarizer.make_client(settings)
-    review = await asyncio.to_thread(summarizer.review_call, client, playbook, text, tool_events, mode, settings)
+    review = await run_blocking(summarizer.review_call, client, playbook, text, tool_events, mode, settings)
 
     def _store(s):
         run = s.get(CallRun, call_run_id)
@@ -205,3 +205,99 @@ async def review_call_later(payload: dict[str, Any]) -> None:
             lead.notes = (lead.notes + "\n" if lead.notes else "") + f"[{run.started_at:%Y-%m-%d}] " + "; ".join(review.prospect_facts)
 
     await run_db(_store)
+
+
+# ----------------------------------------------------------------------------- reading documents and websites
+
+DOCUMENT_READ = "document_read"
+
+
+def document_read_key(document_id: int) -> str:
+    return f"{DOCUMENT_READ}:{document_id}"
+
+
+def enqueue_document_read(s, document: TrainingDocument):
+    """Queue the reading of a document in the transaction that stores it, so an upload
+    that was accepted is always read, whatever happens to this process."""
+    return jobs.enqueue(s, DOCUMENT_READ, document_read_key(document.id), {"document_id": document.id}, max_attempts=3, timeout_seconds=900, organization_id=document.organization_id)
+
+
+@jobs.handler(DOCUMENT_READ, queue="knowledge")
+async def read_document(payload: dict[str, Any]) -> None:
+    """Read one uploaded file or website and index its passages. A document that cannot
+    be read is marked failed with the reason (that is an answer, not a job failure); a
+    document that is already read, or was removed, is left alone."""
+    from .training import service
+
+    document_id = int(payload["document_id"])
+    if not await run_db(lambda s: getattr(s.get(TrainingDocument, document_id), "status", None) in ("pending", "processing")):
+        return
+    await service.process_document(document_id)
+
+
+async def queue_unread_documents() -> int:
+    """Documents waiting to be read that no job stands behind (uploaded under a release
+    that read them outside the queue): give each one its job."""
+
+    def _queue(s):
+        waiting = list(s.execute(select(TrainingDocument).where(TrainingDocument.status.in_(("pending", "processing")))).scalars())
+        for document in waiting:
+            enqueue_document_read(s, document)
+        return len(waiting)
+
+    return await run_db(_queue)
+
+
+# ----------------------------------------------------------------------------- finishing interrupted calls
+
+CALL_FINALIZE = "call_finalize"
+# How long after the longest a call can last the safety net looks at it.
+FINALIZE_MARGIN_SECONDS = 120
+# A call whose normal ending started this recently may still be finishing (its review can take a while).
+FINALIZE_IN_PROGRESS_SECONDS = 600
+
+
+def call_finalize_key(call_run_id: int) -> str:
+    return f"{CALL_FINALIZE}:call:{call_run_id}"
+
+
+def enqueue_call_finalize(s, run: CallRun, settings) -> None:
+    """Called when a call's audio stream connects, in that same transaction. If the
+    process then stops, or the normal end-of-call handling fails, this job gives the
+    call its outcome later from the transcript saved so far, and releases the lead.
+    The normal ending completes the job, so it usually never runs."""
+    jobs.enqueue(
+        s, CALL_FINALIZE, call_finalize_key(run.id), {"call_run_id": run.id},
+        delay_seconds=settings.call_time_limit_seconds + FINALIZE_MARGIN_SECONDS, max_attempts=6, timeout_seconds=420, call_run_id=run.id,
+    )
+
+
+@jobs.handler(CALL_FINALIZE, queue="calls")
+async def finalize_interrupted_call(payload: dict[str, Any]) -> None:
+    """Finish a call that connected but never got an outcome: the process stopped
+    during it, or its ending failed. Works whatever state its campaign is in."""
+    from .postcall import summarizer
+    from .voice.pipeline import _playbook_for
+
+    call_run_id = int(payload["call_run_id"])
+    settings = get_settings()
+
+    def _load(s):
+        run = s.get(CallRun, call_run_id)
+        if run is None or run.disposition is not None:
+            return None  # finished normally, or by an earlier attempt
+        if run.ended_at is not None and (utcnow() - run.ended_at).total_seconds() < FINALIZE_IN_PROGRESS_SECONDS:
+            return "wait"
+        campaign = s.get(Campaign, run.campaign_id)
+        if campaign is None or not campaign.playbook_json:
+            return None
+        return _playbook_for(s, campaign, run), list(run.transcript or []), list(run.tool_events or []), run.mode or "live", run.direction or "outbound"
+
+    loaded = await run_db(_load)
+    if loaded is None:
+        return
+    if loaded == "wait":
+        raise RuntimeError("the call's normal ending may still be in progress; looking again later")
+    playbook, transcript, tool_events, mode, direction = loaded
+    log.warning("call %s was interrupted before it was finalized; finishing it from the %s transcript lines saved", call_run_id, len(transcript))
+    await summarizer.finalize_call(call_run_id, playbook, transcript, tool_events, mode, None, settings, direction=direction)

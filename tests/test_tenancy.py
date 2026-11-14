@@ -171,7 +171,8 @@ def test_lists_hold_only_the_callers_organization(client, two):
     assert sum(day["calls"] for day in client.get("/api/timeline", headers=bolt).json()["days"]) == 0
     assert sum(day["calls"] for day in client.get("/api/timeline", headers=acme).json()["days"]) == 1
 
-    for path in ("/api/campaigns", "/api/users", "/api/jobs", "/api/requests", "/api/timeline", "/api/auth/me", "/api/status"):
+    assert client.get("/api/events", headers=acme).json() != [] and {e["type"] for e in client.get("/api/events", headers=bolt).json()} <= {"PlaybookApproved"}  # only its own
+    for path in ("/api/campaigns", "/api/users", "/api/jobs", "/api/requests", "/api/timeline", "/api/events", "/api/auth/me", "/api/status"):
         text = client.get(path, headers=bolt).text
         assert not any(marker in text for marker in ACME_MARKERS), path
 

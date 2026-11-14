@@ -49,7 +49,7 @@ async def upload_document(name: str, background: BackgroundTasks, file: UploadFi
             raise _bad_request(e) from None
 
     document = await run_db(_add)
-    background.add_task(service.process_document, document["id"])
+    background.add_task(work.run_now, work.document_read_key(document["id"]))  # read now if a slot is free; the queue holds it either way
     return document
 
 
@@ -64,7 +64,7 @@ async def add_website(name: str, body: WebsiteIn, background: BackgroundTasks):
             raise _bad_request(e) from None
 
     document = await run_db(_add)
-    background.add_task(service.process_document, document["id"])
+    background.add_task(work.run_now, work.document_read_key(document["id"]))
     return document
 
 

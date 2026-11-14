@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 from ..config import Settings, get_settings
 from sqlalchemy import select
 
-from ..db import Appointment, CallRun, Campaign, Lead, run_db
+from ..db import Appointment, CallRun, Campaign, Lead, run_blocking, run_db
+from ..dialer import lifecycle
 from ..dialer.rules import call_cost, campaign_settings
 from ..llm import make_client, parse_structured
 from ..playbook.schema import Playbook
@@ -188,6 +189,10 @@ async def finalize_call(
             run.summary = {**(run.summary or {}), "language": language}
             run.language = language.get("detected")
         run.ended_at = run.ended_at or now
+        # The audio stream is over, so the call is. If the provider's final report was lost
+        # (or never comes, as for an inbound number without a status callback) the call would
+        # otherwise count as live until the reaper finds it. The provider can still correct this.
+        lifecycle.advance(run, "completed", source=lifecycle.SYSTEM)
         if run.started_at and run.duration_seconds is None:
             run.duration_seconds = int((run.ended_at - run.started_at).total_seconds())
         if run.cost_usd is None:
@@ -211,9 +216,7 @@ async def finalize_call(
             who = {"user": "Prospect", "assistant": playbook.persona.agent_name}
             text = "\n".join(f"{who.get(t['role'], t['role'])}: {t['text']}" for t in transcript)
             client = make_client(settings)
-            review = await __import__("asyncio").to_thread(
-                review_call, client, playbook, text, tool_events, mode, settings
-            )
+            review = await run_blocking(review_call, client, playbook, text, tool_events, mode, settings)  # off the call path's threads
         except Exception as e:  # review is best-effort; the call record must still close
             review = None
             err = str(e)
@@ -238,11 +241,14 @@ async def finalize_call(
         if run is None or lead is None:
             return
         settings = campaign_settings(s, run.campaign_id, base_settings)
+        from .. import background, events, jobs
+
         run.disposition = disposition
+        jobs.complete_by_key(s, background.call_finalize_key(call_run_id))  # ended the normal way: its safety net is not needed
+        events.emit(s, "CallFinalized", key=f"call:{call_run_id}:finalized", subject="call", subject_id=call_run_id, organization_id=run.organization_id,
+                    campaign_id=run.campaign_id, call_run_id=call_run_id, payload={"disposition": disposition, "reviewed": review is not None, "direction": direction})
         if review:
             run.summary = {**(run.summary or {}), "review": review.model_dump()}
-            from .. import background, jobs
-
             jobs.complete_by_key(s, background.call_review_key(call_run_id))  # reviewed now: the safety net is not needed
         lead.last_disposition = disposition
         if lead.status == "dnc":

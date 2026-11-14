@@ -41,7 +41,8 @@ def downgrade() -> None:
         return
     from callagent.db import TENANT_TABLES
 
-    for table in TENANT_TABLES:
+    existing = set(sa.inspect(bind).get_table_names())
+    for table in (t for t in TENANT_TABLES if t in existing):
         bind.execute(sa.text(f"DROP POLICY IF EXISTS organization_isolation ON {table}"))
         bind.execute(sa.text(f"ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY"))
         bind.execute(sa.text(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"))

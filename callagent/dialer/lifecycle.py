@@ -76,6 +76,10 @@ def record_usage(s: Session, run: CallRun, seconds: int | None, amount_usd: floa
             log.warning("call %s: usage already recorded as %ss, a later report said %ss; kept the first", run.id, existing.quantity_seconds, seconds)
         return existing
     campaign = s.get(Campaign, run.campaign_id)
+    from .. import events
+
+    events.emit(s, "UsageRecorded", key=f"usage:call:{run.id}:call", subject="usage", subject_id=run.id, organization_id=run.organization_id,
+                campaign_id=run.campaign_id, call_run_id=run.id, payload={"kind": "call", "seconds": int(seconds or 0), "amount_usd": str(amount_usd)})
     record = UsageRecord(
         organization_id=campaign_organization_id(s, campaign) if campaign else None,
         campaign_id=run.campaign_id,

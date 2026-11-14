@@ -67,7 +67,16 @@ Kept current as work lands. A finding not listed here is open.
 | D-8 Schema integrity | Partly: CHECK constraints on the four status columns. Missing foreign keys and the appointment time: open | Same migration tests |
 | D-9 Missing indexes | Partly: the three indexes added. Pruning of old jobs and sessions: open | Index names asserted in the migration test |
 
-Found and fixed along the way (not in the audit, caught by the new tests): the
+| B-1 Live calls share one thread pool with analysis | Fixed | `test_background_work_that_fills_its_threads_does_not_delay_call_path_database_work` |
+| B-2 An interrupted call is never finalized | Fixed | `test_a_call_cut_off_by_a_restart_still_gets_an_outcome_and_frees_its_lead` (running and paused campaign), delivered twice, and with a normal ending in progress |
+| B-11 Ended calls linger as active | Fixed | Same test: status is `completed` after finalize |
+| D-10 Job queue: no organization, priority or separation | Fixed, except cancelling and a separate worker process | `test_a_saturated_analysis_queue_does_not_delay_call_related_work`, `test_higher_priority_goes_first_and_no_organization_is_starved` |
+| D-11 Work that bypasses the queue | Partly: document and website reading is on the queue. The coach, language phrasing and lead import still run in the request (on the background threads now) | `test_an_accepted_upload_is_always_read_even_if_the_process_stops_first` |
+| Event log (part 4 of the brief) | Added: durable, idempotent, with per-consumer jobs. See `EVENT_ARCHITECTURE.md` | `tests/test_events_and_queues.py` |
+
+Found and fixed along the way (not in the audit, caught by the new tests): on SQLite
+a job or event written as the first change of a transaction survived a rollback of
+that transaction (the driver does not open a transaction before a savepoint); the
 "start dialing" and "call one number" routes answered about provider configuration
 before checking whose campaign it was; the migration could not drop PostgreSQL's
 uniqueness constraint on campaign names, and could not add a referencing column on

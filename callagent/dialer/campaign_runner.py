@@ -75,6 +75,10 @@ def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: b
         s.flush()
     except IntegrityError:
         raise LeadNotDialable("another call to this lead was started at the same moment") from None
+    from .. import events
+
+    events.emit(s, "CallInitiated", key=f"call:{run.id}:initiated", subject="call", subject_id=run.id, organization_id=run.organization_id,
+                campaign_id=campaign_id, call_run_id=run.id, payload={"lead_id": lead.id, "manual": manual, "playbook_version": version})
     return run.id, lead.phone_e164
 
 
@@ -251,11 +255,16 @@ class CampaignRunner:
         self._tasks.pop(campaign_id, None)
 
         def _mark(s):
+            from .. import events
+
             c = s.get(Campaign, campaign_id)
             if c:
                 c.status = status
                 if reason:
                     c.stop_reason = reason[:300]
+                # One event per stop: the moment is part of the key, so a later stop is a new fact.
+                events.emit(s, "CampaignStopped", key=f"campaign:{c.id}:stopped:{utcnow().isoformat()}", subject="campaign", subject_id=c.id,
+                            organization_id=c.organization_id, campaign_id=c.id, payload={"status": status, "reason": reason or ""})
 
         await run_db(_mark)
 
@@ -404,6 +413,11 @@ def apply_twilio_status(s: Session, call_run_id: int, form: dict[str, Any], sett
         # once; a repeated report, even with different numbers, changes neither the
         # ledger nor the call.
         usage = lifecycle.record_usage(s, run, seconds, campaign_rules.call_cost(seconds, settings))
+        from .. import events
+
+        events.emit(s, "CallCompleted" if status == "completed" else "CallFailed", key=f"call:{run.id}:ended", subject="call", subject_id=run.id,
+                    organization_id=run.organization_id, campaign_id=run.campaign_id, call_run_id=run.id,
+                    payload={"status": status, "seconds": usage.quantity_seconds, "direction": run.direction or "outbound"})
         run.duration_seconds = usage.quantity_seconds if (seconds is not None or run.duration_seconds is not None) else None
         run.cost_usd = float(usage.amount_usd)
         lead = s.get(Lead, run.lead_id)
