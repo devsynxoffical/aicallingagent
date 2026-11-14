@@ -47,6 +47,13 @@ def _system_resolver(host: str) -> list[str]:
 
 def check_public_url(url: str, resolver: Resolver = _system_resolver) -> str:
     """Return the normalized URL, or raise IngestError when it must not be fetched."""
+    return _checked(url, resolver)[0]
+
+
+def _checked(url: str, resolver: Resolver = _system_resolver) -> tuple[str, str]:
+    """The normalized URL and one address it resolves to, all of which were checked to be
+    public. The fetch then connects to that address, not to whatever the name resolves
+    to a moment later."""
     url, _fragment = urldefrag(url.strip())
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
@@ -66,12 +73,27 @@ def check_public_url(url: str, resolver: Resolver = _system_resolver) -> str:
         if not ip.is_global or ip.is_multicast:
             # Loopback, private ranges, link-local (cloud metadata), reserved: never from our servers.
             raise IngestError(f"'{host}' is not a public website address")
-    return url
+    return url, sorted(addresses)[0]
 
 
-def _http_fetcher(url: str) -> tuple[int, dict[str, str], bytes]:
-    with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
-        with client.stream("GET", url) as response:
+def pinned_request(url: str, address: str) -> tuple[str, dict[str, str], dict[str, str]]:
+    """How to ask for ``url`` from one specific address: the address goes in the URL that
+    is connected to, the site's name in the Host header and in the TLS handshake (so the
+    certificate is still checked against the name). Without this, the name is looked up a
+    second time when connecting, and an attacker's DNS can answer the check with a public
+    address and the connection with an internal one (cloud metadata, a database)."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    literal = f"[{address}]" if ":" in address else address
+    netloc = literal + (f":{parts.port}" if parts.port else "")
+    target = parts._replace(netloc=netloc).geturl()
+    return target, {"Host": host + (f":{parts.port}" if parts.port else "")}, {"sni_hostname": host}
+
+
+def _http_fetcher(url: str, address: str | None = None, transport: httpx.BaseTransport | None = None) -> tuple[int, dict[str, str], bytes]:
+    target, headers, extensions = pinned_request(url, address) if address else (url, {}, {})
+    with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, headers={"User-Agent": USER_AGENT}, transport=transport) as client:
+        with client.stream("GET", target, headers=headers, extensions=extensions) as response:
             body = b""
             for block in response.iter_bytes():
                 body += block
@@ -83,9 +105,11 @@ def _http_fetcher(url: str) -> tuple[int, dict[str, str], bytes]:
 def safe_get(url: str, *, fetcher: Fetcher = _http_fetcher, resolver: Resolver = _system_resolver) -> tuple[str, dict[str, str], bytes]:
     """GET a public page, re-checking the address at every redirect. Returns (final_url, headers, body)."""
     for _hop in range(MAX_REDIRECTS + 1):
-        url = check_public_url(url, resolver)
+        url, address = _checked(url, resolver)
         try:
-            status, headers, body = fetcher(url)
+            # The real fetcher connects to the address that was just checked. A stand-in
+            # fetcher (tests) takes the URL alone.
+            status, headers, body = fetcher(url, address) if fetcher is _http_fetcher else fetcher(url)
         except httpx.HTTPError as e:
             raise IngestError(f"the page could not be loaded ({type(e).__name__})") from None
         if status in (301, 302, 303, 307, 308) and headers.get("location"):

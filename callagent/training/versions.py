@@ -155,11 +155,24 @@ def _lines(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _all_fields(base: dict[str, Any], other: dict[str, Any]) -> list[tuple[str, str]]:
+    """Every field either playbook has: the named ones in their reading order, then any
+    other, labelled from its name. A reviewer approves a version on the strength of this
+    list, so a field must never be able to change without appearing in it."""
+    named = dict(_DIFF_FIELDS)
+    rest = sorted((set(base) | set(other)) - set(named) - _NOT_CONTENT)
+    return list(_DIFF_FIELDS) + [(field, field.replace("_", " ").capitalize()) for field in rest]
+
+
+# Scores the system computes about a playbook, not something the agent says or does.
+_NOT_CONTENT = {"readiness_score", "readiness_notes"}
+
+
 def diff(base: dict[str, Any], other: dict[str, Any]) -> list[dict[str, Any]]:
     """What ``other`` changes compared with ``base``: one entry per changed field, with the
     lines removed and added. Unchanged fields are left out."""
     changes = []
-    for field, label in _DIFF_FIELDS:
+    for field, label in _all_fields(base, other):
         before, after = _lines(base.get(field)), _lines(other.get(field))
         if before == after:
             continue

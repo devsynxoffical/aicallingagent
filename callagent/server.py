@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Reques
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from pipecat.runner.utils import parse_telephony_websocket
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from . import background, events, jobs
@@ -246,7 +246,12 @@ async def media_stream(websocket: WebSocket):
     await websocket.accept()
     settings = get_settings()
     try:
-        transport_type, call_data = await parse_telephony_websocket(websocket)
+        # A connection that says nothing is dropped: it has not authenticated and must not hold a socket open.
+        transport_type, call_data = await asyncio.wait_for(parse_telephony_websocket(websocket), timeout=WS_HANDSHAKE_SECONDS)
+    except asyncio.TimeoutError:
+        log.warning("websocket closed: no handshake within %s seconds", WS_HANDSHAKE_SECONDS)
+        await websocket.close(code=4008)
+        return
     except ValueError as e:
         log.warning("websocket handshake failed: %s", e)
         await websocket.close()
@@ -267,6 +272,9 @@ async def media_stream(websocket: WebSocket):
         log.exception("call session crashed")
 
 
+WS_HANDSHAKE_SECONDS = 10
+
+
 def authorize_stream(s, body: dict, call_sid: str | None) -> str | None:
     """The WebSocket is public. Only Twilio, carrying the per-call token from our own TwiML
     for a call that is live and not yet streamed, gets a pipeline. Returns a rejection reason."""
@@ -280,12 +288,15 @@ def authorize_stream(s, body: dict, call_sid: str | None) -> str | None:
     token = str(body.get("stream_token", ""))
     if not run.stream_token or not token or not _secrets.compare_digest(token, run.stream_token):
         return "bad stream token"
-    if run.stream_connected:
-        return "stream already connected for this call"
     if run.status in TERMINAL_CALL_STATUSES:
         return "call already ended"
     if run.twilio_call_sid and call_sid and call_sid != run.twilio_call_sid:
         return "call sid mismatch"
+    # Claimed in one statement: of two sockets presenting the same valid token at the
+    # same moment, exactly one gets the call.
+    claimed = s.execute(update(CallRun).where(CallRun.id == call_run_id, CallRun.stream_connected.is_not(True)).values(stream_connected=True)).rowcount
+    if claimed != 1:
+        return "stream already connected for this call"
     return None
 
 

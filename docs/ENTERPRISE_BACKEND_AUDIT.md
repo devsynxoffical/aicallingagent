@@ -74,6 +74,21 @@ Kept current as work lands. A finding not listed here is open.
 | D-11 Work that bypasses the queue | Partly: document and website reading is on the queue. The coach, language phrasing and lead import still run in the request (on the background threads now) | `test_an_accepted_upload_is_always_read_even_if_the_process_stops_first` |
 | Event log (part 4 of the brief) | Added: durable, idempotent, with per-consumer jobs. See `EVENT_ARCHITECTURE.md` | `tests/test_events_and_queues.py` |
 
+| B-3 A failed transfer recorded as successful | Fixed: recorded, and announced as an event, only after the provider accepted it | `test_a_transfer_the_provider_refuses_is_not_recorded_as_done` |
+| B-4 Same person rung by two campaigns at once | Fixed within an organization | `test_two_campaigns_cannot_ring_the_same_person_at_the_same_time` |
+| B-5 No stop when a provider is failing | Fixed: five answered calls in a row with no agent speech, or failing during the call, stop the campaign with the reason. Provider health checks before dialing: open | `test_a_run_of_answered_calls_with_no_agent_speech_stops_the_campaign` and the two tests after it |
+| B-6 No explicit timeouts on the live path | Partly: the media socket handshake has a deadline; provider calls from tools run off the event loop. Timeouts on the live model and speech streams: open | `test_a_socket_that_says_nothing_is_dropped` |
+| B-9 One bad call stalls reconciliation | Fixed | `test_one_call_that_cannot_be_reconciled_does_not_stop_the_rest`, `test_a_provider_call_that_belongs_to_another_record_is_not_adopted` |
+| B-10 Media socket claim not atomic | Fixed | `test_of_many_sockets_presenting_the_same_valid_token_exactly_one_gets_the_call` |
+| B-12 Opt-out depends on the model's tool choice | Fixed: an opt-out found by the review also reaches the do-not-call list | `test_an_opt_out_reaches_the_do_not_call_list_however_it_was_noticed` |
+| C-1 Document text reaches an agent with tools, unmarked | Fixed: passages come back as marked reference material; a link from a document cannot be sent | `test_what_a_document_says_comes_back_marked_as_reference_material_and_cannot_send_a_link` |
+| C-2 Every tool on every call, thin validation | Fixed: tools follow the campaign's capabilities and are refused otherwise; times, counts and link hosts are checked | `test_a_campaign_is_offered_only_the_tools_it_enabled` and the four tests after it |
+| C-3 What a prospect says can become instructions | Partly: lead details and transcripts are marked as data in the call prompt and the review prompt. A draft still needs a person's approval, as before | `test_the_prompt_treats_lead_details_and_retrieved_text_as_data` |
+| C-4 The "what changes" view omits fields | Fixed | `test_every_field_of_a_playbook_shows_up_in_the_diff_when_it_changes` |
+| C-5 Website fetching and DNS | Fixed: the connection goes to the address that was checked | `test_a_page_is_fetched_from_the_address_that_was_checked` |
+| C-12 Structured answers not range-checked | Fixed for scores and retry delays | `test_scores_and_retry_delays_from_the_review_are_kept_in_range` |
+| C-14 Document ingestion limits | Partly: wrongly decoded files fixed. Page, size and archive limits: open | `test_a_windows_encoded_french_file_is_read_as_french_not_as_utf16` |
+
 Found and fixed along the way (not in the audit, caught by the new tests): on SQLite
 a job or event written as the first change of a transaction survived a rollback of
 that transaction (the driver does not open a transaction before a savepoint); the

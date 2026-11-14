@@ -50,7 +50,7 @@ from .latency import LatencyMonitor, record_response_latency, summarize
 from .llm_service import LowLatencyAnthropicLLMService
 from .session import CallSession
 from .speech_filter import SpeechSanitizer
-from .tools import build_tools_schema, register_tool_handlers
+from .tools import allowed_tools, build_tools_schema, register_tool_handlers
 from .transcript import TranscriptCollector, TranscriptSaver
 
 log = logging.getLogger(__name__)
@@ -220,6 +220,8 @@ async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, le
 
     # ---- memory & turn-taking
     capabilities = {c.key for c in playbook.required_capabilities}
+    # What the model is offered and what the server will carry out are the same set.
+    session.allowed_tools = allowed_tools(capabilities, human_transfer, knowledge_available=has_knowledge)
     context = LLMContext(tools=build_tools_schema(capabilities, human_transfer, knowledge_available=has_knowledge))
     user_params = LLMUserAggregatorParams(
         vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.7, start_secs=0.2, stop_secs=0.25, min_volume=0.5)),

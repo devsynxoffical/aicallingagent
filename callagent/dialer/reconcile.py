@@ -80,6 +80,12 @@ def _apply(s: Session, candidate: dict[str, Any], found: dict[str, Any] | None, 
         _release_lead(s, run, settings)
         return "no record"
     if run.twilio_call_sid is None:
+        owner = s.execute(select(CallRun.id).where(CallRun.twilio_call_sid == found["sid"], CallRun.id != run.id)).scalar()
+        if owner is not None:
+            # The provider's newest call to this number belongs to another of our records
+            # (the same person in another campaign). It says nothing about this one.
+            log.warning("call %s: the provider call found by number belongs to call %s; left unchanged", run.id, owner)
+            return "belongs to another call"
         run.twilio_call_sid = found["sid"]  # the call we could not confirm does exist: it is ours
     status = str(found.get("status") or "").lower()
     if status in TERMINAL_CALL_STATUSES:
@@ -109,7 +115,12 @@ async def reconcile_calls(settings: Settings | None = None, provider=twilio_clie
             log.warning("call %s: the provider could not be asked (%s); left unchanged", candidate["id"], type(e).__name__)
             counts["provider unreachable"] = counts.get("provider unreachable", 0) + 1
             continue
-        outcome = await run_db(lambda s: _apply(s, candidate, found, settings))
+        try:
+            outcome = await run_db(lambda s: _apply(s, candidate, found, settings))
+        except Exception:
+            # One call that cannot be resolved must not stop the pass: the others still are.
+            log.exception("call %s: reconciliation failed; continuing with the rest", candidate["id"])
+            outcome = "failed to apply"
         counts[outcome] = counts.get(outcome, 0) + 1
     if counts:
         log.info("call reconciliation: %s", counts)

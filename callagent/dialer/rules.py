@@ -160,6 +160,47 @@ def _calls_since(s: Session, campaign_id: int, since_utc: datetime) -> int:
     )
 
 
+# This many answered calls in a row without a word from the agent stop the campaign.
+FAILING_CALLS_TO_STOP = 5
+# What a call is recorded as when nobody, or only the person called, said anything.
+NO_CONVERSATION_OUTCOMES = frozenset({None, "no_answer", "busy", "other"})
+
+
+def provider_failure(s: Session, campaign: Campaign) -> str | None:
+    """A circuit breaker. When the speech or AI provider is down (an outage, a revoked
+    key), every answered call is silent: the person hears nothing and hangs up, the call
+    looks like "no answer", and the lead is tried again. Left alone, a campaign would
+    ring through its whole list like that, several times each.
+
+    If the last answered calls since the campaign was (re)started all ended with no
+    agent speech at all, or with a pipeline error, the campaign stops and says why.
+
+    A call that ended with an outcome only a conversation produces (a meeting, "not
+    interested", an opt-out) is proof the agent worked, whatever its transcript holds."""
+    since = campaign.updated_at  # starting a campaign updates it: earlier calls do not count against a fresh start
+    query = select(CallRun.error, CallRun.transcript, CallRun.disposition).where(
+        CallRun.campaign_id == campaign.id, CallRun.direction == "outbound", CallRun.stream_connected.is_(True), CallRun.ended_at.is_not(None)
+    )
+    if since is not None:
+        query = query.where(CallRun.started_at >= since)
+    recent = s.execute(query.order_by(CallRun.id.desc()).limit(FAILING_CALLS_TO_STOP)).all()
+    if len(recent) < FAILING_CALLS_TO_STOP:
+        return None
+
+    def silent(error: str | None, transcript: list | None, disposition: str | None) -> bool:
+        spoke = any((line or {}).get("role") == "assistant" for line in transcript or [])
+        conversed = disposition not in NO_CONVERSATION_OUTCOMES
+        failed = bool(error) and not str(error).startswith("review failed")  # a failed review is after the call, not during it
+        return failed or not (spoke or conversed)
+
+    if all(silent(*row) for row in recent):
+        return (
+            f"the last {FAILING_CALLS_TO_STOP} answered calls had no agent speech or failed during the call: "
+            "the speech or AI provider is probably not working. Check Setup, then start the campaign again"
+        )
+    return None
+
+
 def check_limits(s: Session, campaign: Campaign, settings: Settings, active_calls: int, now: datetime | None = None) -> Verdict:
     """May this campaign place one more call right now?
 
@@ -197,6 +238,10 @@ def check_limits(s: Session, campaign: Campaign, settings: Settings, active_call
             )
             if opted_out / answered > rules.max_opt_out_rate:
                 return Verdict("stop", f"{opted_out} of {answered} answered calls asked not to be called again, above the {rules.max_opt_out_rate:.0%} limit")
+
+    failing = provider_failure(s, campaign)
+    if failing:
+        return Verdict("stop", failing)
 
     if rules.budget_usd is not None:
         spent = campaign_spend(s, campaign.id)

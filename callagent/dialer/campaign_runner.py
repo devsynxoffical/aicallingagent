@@ -54,6 +54,16 @@ def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: b
             lead.status = "dnc"
             s.commit()  # the suppression is kept even though the dial is refused
         raise LeadNotDialable(f"{lead.phone_e164} is on the do-not-call list")
+    elsewhere = s.execute(
+        select(CallRun.id)
+        .join(Lead, Lead.id == CallRun.lead_id)
+        .where(Lead.organization_id == lead.organization_id, Lead.phone_e164 == lead.phone_e164, Lead.id != lead.id, CallRun.status.in_(ACTIVE_CALL_STATUSES))
+        .limit(1)
+    ).first()
+    if elsewhere is not None:
+        # The same person is a lead in another campaign of this organization and is on a
+        # call from it right now. Ringing them a second time helps nobody; the lead stays due.
+        raise LeadNotDialable(f"{lead.phone_e164} is on a call from another campaign right now")
     allowed = Lead.status.not_in(NEVER_DIALABLE) if manual else Lead.status.in_(AUTO_DIALABLE)
     claimed = s.execute(
         update(Lead).where(Lead.id == lead_id, Lead.campaign_id == campaign_id, allowed).values(status="calling", attempts=Lead.attempts + 1)

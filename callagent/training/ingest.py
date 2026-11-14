@@ -85,7 +85,11 @@ def validate_upload(filename: str, data: bytes) -> str:
 
 
 def _decode(data: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-16", "cp1256", "cp1252"):
+    # UTF-16 only when the file says so with a byte order mark. Without one, any file of
+    # even length "decodes" as UTF-16, and a French or Arabic Windows file became
+    # unreadable text that was stored and searched as if it were content.
+    utf16 = ("utf-16",) if data[:2] in (b"\xff\xfe", b"\xfe\xff") else ()
+    for encoding in ("utf-8-sig", *utf16, "cp1256", "cp1252"):
         try:
             return data.decode(encoding)
         except (UnicodeDecodeError, UnicodeError):
