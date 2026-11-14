@@ -46,6 +46,33 @@ the speech providers behave during an outage and reconnect; the phone provider's
 exact status values and timing; the AI provider's actual rate limits; audio latency
 under concurrent calls.
 
+## Status
+
+Kept current as work lands. A finding not listed here is open.
+
+| Finding | Status | Shown by |
+| --- | --- | --- |
+| A-1 Requests carry no organization | Fixed | `tests/test_tenancy.py`: every addressable route called as another organization answers 404, nothing changes |
+| A-2 Campaigns looked up globally | Fixed | Same sweep; two organizations each hold a campaign of the same name |
+| A-3 `POST /api/campaigns` overwrites by global name | Fixed | Same sweep; snapshot of the other organization's playbook unchanged |
+| A-4 Rows fetched by id without an ownership check | Fixed | Same sweep covers calls, jobs, users, requests, documents, leads |
+| A-5 Lists span every organization | Fixed | `test_lists_hold_only_the_callers_organization` |
+| A-6 Accounts always in the default organization | Fixed | `POST /api/organizations`, `callagent orgs add`; `test_only_the_operator_manages_organizations...` |
+| A-7 Tables without an organization | Fixed | Migration 0007; `test_a_database_of_the_previous_release_gets_an_organization_on_every_row` on SQLite and PostgreSQL |
+| A-8 Shared do-not-call list | Fixed | `test_an_opt_out_belongs_to_the_organization_that_was_asked` |
+| A-9 Inbound number conflict names the owner | Fixed (the disclosure); ownership of numbers still open with A-11 | `test_every_new_row_is_filed_under_its_campaigns_organization` |
+| A-10 One all-powerful API token | Partly: it is now the operator's credential (creates organizations, names the one to act in). Per-organization API keys: open | `test_the_organization_comes_from_the_account_never_from_the_request` |
+| Defence in depth (asked for in the brief) | Added: PostgreSQL row-level security on all 14 tenant tables, migration 0008 | `tests/test_row_level_security.py` runs unfiltered queries as an ordinary role; the whole isolation suite also runs on PostgreSQL with the policies enforced |
+| D-5 Migrations and new databases differ | Partly: an upgraded PostgreSQL database and a new one are compared column by column; rollback of 0007 tested. Migration at start-up and concurrent index builds: open | `test_an_upgraded_database_and_a_new_one_have_the_same_schema`, `test_the_upgrade_can_be_rolled_back_and_applied_again` |
+| D-8 Schema integrity | Partly: CHECK constraints on the four status columns. Missing foreign keys and the appointment time: open | Same migration tests |
+| D-9 Missing indexes | Partly: the three indexes added. Pruning of old jobs and sessions: open | Index names asserted in the migration test |
+
+Found and fixed along the way (not in the audit, caught by the new tests): the
+"start dialing" and "call one number" routes answered about provider configuration
+before checking whose campaign it was; the migration could not drop PostgreSQL's
+uniqueness constraint on campaign names, and could not add a referencing column on
+SQLite; a new database never received what only a migration creates.
+
 ## Order of work
 
 | Phase | Findings | Why this order |

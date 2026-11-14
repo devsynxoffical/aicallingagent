@@ -49,7 +49,7 @@ def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: b
     lead = s.get(Lead, lead_id)
     if lead is None or lead.campaign_id != campaign_id:
         raise LeadNotDialable("lead not found in this campaign")
-    if is_dnc(s, lead.phone_e164) or lead.status == "dnc":
+    if is_dnc(s, lead.phone_e164, lead.organization_id) or lead.status == "dnc":
         if lead.status != "dnc":
             lead.status = "dnc"
             s.commit()  # the suppression is kept even though the dial is refused
@@ -134,7 +134,7 @@ def pick_next_lead(s: Session, campaign_id: int, settings: Settings) -> Lead | N
         .all()
     )
     for lead in candidates:
-        if is_dnc(s, lead.phone_e164):
+        if is_dnc(s, lead.phone_e164, lead.organization_id):
             lead.status = "dnc"
             continue
         if in_calling_window(now, lead.timezone, settings.calling_window_start, settings.calling_window_end, settings.default_timezone, days):

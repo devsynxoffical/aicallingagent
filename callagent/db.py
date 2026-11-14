@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -89,10 +91,10 @@ class Campaign(Base):
     __tablename__ = "campaigns"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    # Filled for every row at startup (see bootstrap_organizations); nullable only so
-    # databases created before organizations existed can be upgraded in place.
-    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), nullable=True, index=True)
-    name: Mapped[str] = mapped_column(String(200), unique=True)
+    # The customer this campaign belongs to. Set by the route that creates it; a campaign
+    # created without one (command line, older code) gets the default organization.
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200))  # unique within its organization
     script_text: Mapped[str] = mapped_column(Text, default="")
     playbook_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="draft")  # draft|ready|running|paused|done
@@ -111,6 +113,9 @@ class Campaign(Base):
     __table_args__ = (
         # One number is answered by one campaign.
         Index("uq_campaigns_inbound_number", "inbound_number", unique=True),
+        # Two customers may each have a campaign called "Q4"; one customer may not have two.
+        Index("uq_campaigns_org_name", "organization_id", "name", unique=True),
+        CheckConstraint("status IN ('draft', 'ready', 'running', 'paused', 'done')", name="ck_campaigns_status"),
     )
 
 
@@ -118,6 +123,9 @@ class Lead(Base):
     __tablename__ = "leads"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Always the campaign's organization; kept on the row so that organization-wide
+    # queries and database policies do not need a join. Filled when the row is created.
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
     phone_e164: Mapped[str] = mapped_column(String(32), index=True)
     raw_phone: Mapped[str] = mapped_column(String(64), default="")
@@ -148,6 +156,7 @@ class Lead(Base):
         Index("uq_leads_campaign_phone", "campaign_id", "phone_e164", unique=True),
         # The dialer's "who is due next" query.
         Index("ix_leads_due", "campaign_id", "status", "next_attempt_at"),
+        CheckConstraint("status IN ('pending', 'queued', 'calling', 'completed', 'callback', 'failed', 'dnc')", name="ck_leads_status"),
     )
 
     @property
@@ -159,6 +168,7 @@ class CallRun(Base):
     __tablename__ = "call_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)  # the campaign's; see Lead
     lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"), index=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
     twilio_call_sid: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
@@ -207,6 +217,15 @@ class CallRun(Base):
         ),
         Index("ix_call_runs_campaign_status", "campaign_id", "status"),
         Index("ix_call_runs_lead_latest", "lead_id", "id"),
+        # Daily and monthly limits (every dial tick) and the calls-per-day chart.
+        Index("ix_call_runs_campaign_started", "campaign_id", "started_at"),
+        Index("ix_call_runs_org_started", "organization_id", "started_at"),
+        # The reconciler's scan for calls that may still be live: a small index over the few active rows.
+        Index("ix_call_runs_active", "started_at", sqlite_where=text(_ACTIVE_SQL), postgresql_where=text(_ACTIVE_SQL)),
+        CheckConstraint(
+            "status IN ('created', 'queued', 'initiated', 'ringing', 'in-progress', 'completed', 'busy', 'no-answer', 'failed', 'canceled')",
+            name="ck_call_runs_status",
+        ),
     )
 
 
@@ -214,6 +233,7 @@ class Appointment(Base):
     __tablename__ = "appointments"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)  # the lead's
     lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"), index=True)
     call_run_id: Mapped[int | None] = mapped_column(ForeignKey("call_runs.id"), nullable=True)
     starts_at: Mapped[str] = mapped_column(String(64))  # ISO 8601 as spoken/confirmed
@@ -356,7 +376,7 @@ class UsageRecord(Base):
     __tablename__ = "usage_records"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), nullable=True, index=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
     call_run_id: Mapped[int] = mapped_column(ForeignKey("call_runs.id"))
     kind: Mapped[str] = mapped_column(String(20), default="call")
@@ -431,6 +451,8 @@ class Job(Base):
     __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Whose work this is. None only for the deployment's own housekeeping.
+    organization_id: Mapped[int | None] = mapped_column(ForeignKey("organizations.id"), nullable=True, index=True)
     kind: Mapped[str] = mapped_column(String(60), index=True)
     key: Mapped[str] = mapped_column(String(200))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -452,6 +474,7 @@ class Job(Base):
     __table_args__ = (
         Index("uq_jobs_key", "key", unique=True),
         Index("ix_jobs_due", "status", "run_at"),
+        CheckConstraint("status IN ('queued', 'running', 'done', 'dead')", name="ck_jobs_status"),
     )
 
 
@@ -471,12 +494,19 @@ class JobAttempt(Base):
 
 
 class DoNotCall(Base):
+    """Numbers an organization must never call. An opt-out is owed to the business that
+    was asked, so each organization has its own list: one customer's opt-outs are neither
+    visible to nor binding on another."""
+
     __tablename__ = "do_not_call"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    phone_e164: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    phone_e164: Mapped[str] = mapped_column(String(32))
     reason: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+    __table_args__ = (Index("uq_do_not_call_org_phone", "organization_id", "phone_e164", unique=True),)
 
 
 # --------------------------------------------------------------------------- engine
@@ -541,6 +571,58 @@ def bootstrap_organizations(engine) -> int:
         return org.id
 
 
+# The organization of the request being served, set once the caller is authenticated.
+# `run_db` runs in a worker thread that inherits it. None outside a request (webhooks,
+# jobs, the dial loop, the command line): those paths work from row ids, never from names.
+current_organization: ContextVar[int | None] = ContextVar("callagent_organization", default=None)
+
+
+@event.listens_for(Session, "before_flush")
+def _fill_organization(session: Session, _flush_context, _instances) -> None:
+    """Give every new customer-owned row its organization, in one place.
+
+    A lead, call, appointment or usage record always belongs to the organization of
+    the campaign (or lead) it hangs from. Code that creates one does not have to
+    remember to copy it, and cannot copy the wrong one. A campaign created without an
+    organization belongs to the default one.
+    """
+    pending = [o for o in session.new if isinstance(o, (Campaign, Lead, CallRun, Appointment, UsageRecord)) and o.organization_id is None]
+    if not pending:
+        return
+    pending.sort(key=lambda o: not isinstance(o, Campaign))  # campaigns first: their leads may be in the same flush
+    with session.no_autoflush:
+        default: int | None = None
+        campaigns: dict[int, int | None] = {}
+
+        def of_campaign(campaign_id: int | None) -> int | None:
+            if campaign_id is None:
+                return None
+            if campaign_id not in campaigns:
+                campaigns[campaign_id] = session.execute(select(Campaign.organization_id).where(Campaign.id == campaign_id)).scalar_one_or_none()
+            return campaigns[campaign_id]
+
+        for o in pending:
+            if isinstance(o, Campaign):
+                default = default if default is not None else _default_organization_id_in_flush(session)
+                o.organization_id = default
+            elif isinstance(o, Appointment):
+                o.organization_id = session.execute(select(Lead.organization_id).where(Lead.id == o.lead_id)).scalar_one_or_none()
+            elif isinstance(o, Lead) and o.campaign_id is None and o.campaign is not None:
+                o.organization_id = o.campaign.organization_id
+            else:
+                o.organization_id = of_campaign(o.campaign_id)
+
+
+def _default_organization_id_in_flush(session: Session) -> int:
+    """The default organization's id from inside a flush, where the session cannot flush again."""
+    query = select(Organization.id).where(Organization.name == DEFAULT_ORGANIZATION)
+    found = session.execute(query).scalar_one_or_none()
+    if found is None:
+        session.execute(Organization.__table__.insert().values(name=DEFAULT_ORGANIZATION, created_at=utcnow().replace(tzinfo=None)))
+        found = session.execute(query).scalar_one()
+    return found
+
+
 def default_organization_id(s: Session) -> int:
     org = s.execute(select(Organization).where(Organization.name == DEFAULT_ORGANIZATION)).scalar_one_or_none()
     if org is None:
@@ -600,10 +682,15 @@ def reset_engine_for_tests(database_url: str) -> None:
 
 @contextmanager
 def session_scope():
-    get_engine()
+    engine = get_engine()
     assert _SessionLocal is not None
     session = _SessionLocal()
     try:
+        organization = current_organization.get()
+        if organization is not None and engine.dialect.name == "postgresql":
+            # Row-level security (migration 0008) reads this: for the length of this
+            # transaction the database itself returns only this organization's rows.
+            session.execute(text("SELECT set_config('app.organization_id', :org, true)"), {"org": str(int(organization))})
         yield session
         session.commit()
     except Exception:
@@ -613,10 +700,17 @@ def session_scope():
         session.close()
 
 
-async def run_db(fn: Callable[[Session], T]) -> T:
-    """Run a blocking DB function in a worker thread so the audio loop never stalls."""
+async def run_db(fn: Callable[[Session], T], *, unrestricted: bool = False) -> T:
+    """Run a blocking DB function in a worker thread so the audio loop never stalls.
+
+    The thread inherits the request's organization, which confines the transaction to
+    it. ``unrestricted`` is for the few operations that are about the deployment as a
+    whole (managing organizations): it runs without an organization, and must only be
+    used on routes reserved for the deployment's operator."""
 
     def _runner() -> T:
+        if unrestricted:
+            current_organization.set(None)  # in this thread's copy of the context only
         with session_scope() as s:
             return fn(s)
 
@@ -626,12 +720,25 @@ async def run_db(fn: Callable[[Session], T]) -> T:
 # --------------------------------------------------------------------------- helpers
 
 
-def get_campaign_by_name(s: Session, name: str) -> Campaign | None:
-    return s.execute(select(Campaign).where(Campaign.name == name)).scalar_one_or_none()
+def get_campaign_by_name(s: Session, name: str, organization_id: int | None = None) -> Campaign | None:
+    """A campaign of one organization. Without an organization: the default one, which
+    is what the command line and a single-customer deployment mean."""
+    org = organization_id if organization_id is not None else default_organization_id(s)
+    return s.execute(select(Campaign).where(Campaign.organization_id == org, Campaign.name == name)).scalar_one_or_none()
 
 
-def is_dnc(s: Session, phone_e164: str) -> bool:
-    return s.execute(select(DoNotCall).where(DoNotCall.phone_e164 == phone_e164)).scalar_one_or_none() is not None
+def is_dnc(s: Session, phone_e164: str, organization_id: int) -> bool:
+    """Whether this organization must not call this number."""
+    return s.execute(select(DoNotCall.id).where(DoNotCall.organization_id == organization_id, DoNotCall.phone_e164 == phone_e164)).first() is not None
+
+
+def add_dnc(s: Session, phone_e164: str, organization_id: int, reason: str = "") -> bool:
+    """Put a number on an organization's do-not-call list. Returns False if it was already there."""
+    if is_dnc(s, phone_e164, organization_id):
+        return False
+    s.add(DoNotCall(organization_id=organization_id, phone_e164=phone_e164, reason=reason[:200]))
+    s.flush()
+    return True
 
 
 def campaign_stats(s: Session, campaign_id: int) -> dict[str, int]:
@@ -651,3 +758,51 @@ def campaign_stats(s: Session, campaign_id: int) -> dict[str, int]:
 
 def dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+
+
+# Every table whose rows belong to one organization. Row-level security covers exactly these.
+TENANT_TABLES = (
+    "campaigns", "leads", "call_runs", "appointments", "do_not_call", "usage_records", "training_documents", "knowledge_chunks",
+    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs",
+)
+
+
+def ensure_row_level_security(connection) -> None:
+    """Create (or recreate) the isolation policy on every tenant table. PostgreSQL only.
+
+    With `app.organization_id` set for the transaction, a row is visible and writable
+    only if its organization matches. With it unset nothing is restricted: provider
+    webhooks, the dial loop, background jobs and migrations serve every organization
+    and address rows by id. The policies bind the table owner too (FORCE).
+
+    Called by migration 0008 for existing databases and when a new database is
+    created, so both end up the same.
+    """
+    if connection.dialect.name != "postgresql":
+        return
+    setting = "NULLIF(current_setting('app.organization_id', true), '')"
+    for table in TENANT_TABLES:
+        # A job may belong to no organization (housekeeping); such rows stay visible to the deployment's operator.
+        own = f"organization_id = {setting}::int" + (" OR organization_id IS NULL" if table == "jobs" else "")
+        rule = f"({setting} IS NULL OR {own})"
+        connection.execute(text(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
+        connection.execute(text(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"))
+        connection.execute(text(f"DROP POLICY IF EXISTS organization_isolation ON {table}"))
+        connection.execute(text(f"CREATE POLICY organization_isolation ON {table} USING {rule} WITH CHECK {rule}"))
+
+
+def row_level_security(engine) -> str:
+    """Whether the database itself confines a request to its organization.
+
+    "enforced": PostgreSQL, policies in place, and this database role is bound by them.
+    "bypassed": the policies exist but the role is a superuser or has BYPASSRLS, so
+    only the application's own filters protect the data. "unavailable": SQLite.
+    """
+    if engine.dialect.name != "postgresql":
+        return "unavailable"
+    with engine.connect() as c:
+        exempt = c.execute(text("SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user")).scalar()
+        covered = c.execute(text("SELECT COUNT(*) FROM pg_class WHERE relname = ANY(:tables) AND relrowsecurity AND relforcerowsecurity"), {"tables": list(TENANT_TABLES)}).scalar()
+    if covered < len(TENANT_TABLES):
+        return "missing"
+    return "bypassed" if exempt else "enforced"

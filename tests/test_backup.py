@@ -47,7 +47,7 @@ def _fill(settings, sample_playbook) -> None:
             s.flush()
             s.add(db.CallRun(lead_id=lead.id, campaign_id=c.id, status="completed", twilio_call_sid=f"CA{i}", cost_usd=0.42,
                              transcript=[{"role": "user", "text": "bonjour, مرحبا"}], summary={"review": {"summary": "ok"}}))
-        s.add(db.DoNotCall(phone_e164="+14155559999", reason="asked"))
+        db.add_dnc(s, "+14155559999", db.default_organization_id(s), "asked")
     upload = settings.data_dir / "uploads" / "1" / "1" / "7.pdf"
     upload.parent.mkdir(parents=True)
     upload.write_bytes(b"%PDF-1.4 the pricing document")
@@ -81,7 +81,7 @@ def test_restore_drill_brings_back_every_row_and_file(settings, sample_playbook,
         run = s.query(db.CallRun).filter_by(twilio_call_sid="CA7").one()
         assert run.transcript == [{"role": "user", "text": "bonjour, مرحبا"}] and run.cost_usd == pytest.approx(0.42)
         assert s.query(db.PlaybookVersion).filter_by(status="active").count() == 1
-        assert db.is_dnc(s, "+14155559999")  # the suppression list survives: nobody who opted out is called after a restore
+        assert db.is_dnc(s, "+14155559999", db.default_organization_id(s))  # the suppression list survives: nobody who opted out is called after a restore
     assert (settings.data_dir / "uploads" / "1" / "1" / "7.pdf").read_bytes() == b"%PDF-1.4 the pricing document"
 
 

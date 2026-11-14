@@ -5,15 +5,20 @@ test against a real provider were performed. Status reflects the code on this br
 
 ## Summary
 
-The service is safe to run for **one organization** behind TLS with its API token kept
-secret. People now sign in with their own accounts and one of three roles, checked on
-every route (see "People and roles" in the README, and `tests/test_accounts.py`, which
-calls every route as every role). It is still **not** safe to put two customers on one
-deployment: every account belongs to the one organization and no request is scoped by
-organization. That is the most important open item
-and it blocks the acceptance criterion "no cross-organization data access in security
-tests": those tests do not exist yet because the isolation they would test does not
-exist yet.
+Several customer organizations can now share one deployment on PostgreSQL. Each
+request is confined to the organization of the account that makes it, by the
+application on every route and again by PostgreSQL row-level security; a test calls
+every addressable route as another organization and gets 404 each time with nothing
+changed (`tests/test_tenancy.py`, run on SQLite and on PostgreSQL as an ordinary
+role), and another runs deliberately unfiltered queries against the policies
+(`tests/test_row_level_security.py`). People sign in with their own accounts and one
+of three roles, checked on every route (`tests/test_accounts.py`).
+
+What still stands between this and selling to a second customer is listed in
+`ENTERPRISE_BACKEND_AUDIT.md`: telephony, booking webhook, transfer number and cost
+rates are still one set per deployment (A-11), so a second organization would dial
+from the first one's number and post bookings to the first one's webhook; the engine
+API token is a single all-powerful secret (A-10); there is no audit trail (A-13).
 
 ## Review by area
 

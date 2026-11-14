@@ -191,7 +191,7 @@ def import_leads(session: Session, campaign: Campaign, source: str | Path, defau
         if r["phone_e164"] in existing:
             report.duplicates += 1
             continue
-        if is_dnc(session, r["phone_e164"]):
+        if is_dnc(session, r["phone_e164"], campaign.organization_id):
             report.dnc += 1
             continue
         session.add(Lead(campaign_id=campaign.id, **r))

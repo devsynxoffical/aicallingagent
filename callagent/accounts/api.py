@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from .. import accounts
 from ..apideps import current_principal, require_api_token
-from ..db import User, run_db
+from ..db import Organization, User, run_db
 
 public = APIRouter(prefix="/api/auth", tags=["accounts"])
 router = APIRouter(prefix="/api", dependencies=[Depends(require_api_token)], tags=["accounts"])
@@ -37,8 +37,20 @@ class UserPatch(BaseModel):
     password: str | None = Field(default=None, max_length=accounts.MAX_PASSWORD_LENGTH)
 
 
-def _describe_principal(p: accounts.Principal) -> dict:
-    return {"kind": p.kind, "id": p.user_id, "email": p.email, "name": p.name, "role": p.role}
+class OrganizationIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    admin_email: str = Field(max_length=254)
+    admin_name: str = Field(default="", max_length=200)
+    admin_password: str = Field(max_length=accounts.MAX_PASSWORD_LENGTH)
+
+
+def _describe_principal(p: accounts.Principal, organization: str) -> dict:
+    return {
+        "kind": p.kind, "id": p.user_id, "email": p.email, "name": p.name, "role": p.role,
+        "organization": {"id": p.organization_id, "name": organization},
+        # True for the deployment's operator, who can create organizations.
+        "platform": p.platform,
+    }
 
 
 @public.post("/login")
@@ -53,7 +65,9 @@ async def login(body: LoginIn):
 
 @router.get("/auth/me")
 async def me(request: Request):
-    return _describe_principal(current_principal(request))
+    principal = current_principal(request)
+    name = await run_db(lambda s: getattr(s.get(Organization, principal.organization_id), "name", ""))
+    return _describe_principal(principal, name)
 
 
 @router.post("/auth/logout")
@@ -87,15 +101,20 @@ async def change_password(body: PasswordIn, request: Request):
 
 
 @router.get("/users")
-async def list_users():
-    return await run_db(lambda s: [accounts.describe(u) for u in accounts.list_users(s)])
+async def list_users(request: Request):
+    """The people of the caller's organization."""
+    org = current_principal(request).organization_id
+    return await run_db(lambda s: [accounts.describe(u) for u in accounts.list_users(s, org)])
 
 
 @router.post("/users", status_code=201)
-async def create_user(body: UserIn):
+async def create_user(body: UserIn, request: Request):
+    """Add a person to the caller's organization. Which organization is never taken from the request."""
+    org = current_principal(request).organization_id
+
     def _create(s):
         try:
-            return accounts.describe(accounts.create_user(s, body.email, body.password, name=body.name, role=body.role))
+            return accounts.describe(accounts.create_user(s, body.email, body.password, name=body.name, role=body.role, organization_id=org))
         except accounts.AccountError as e:
             raise HTTPException(409 if "already has an account" in str(e) else 400, str(e)) from None
 
@@ -109,7 +128,7 @@ async def update_user(user_id: int, body: UserPatch, request: Request):
     principal = current_principal(request)
 
     def _update(s):
-        user = s.get(User, user_id)
+        user = accounts.get_user(s, user_id, principal.organization_id)
         if user is None:
             raise HTTPException(404, "user not found")
         try:
@@ -118,3 +137,25 @@ async def update_user(user_id: int, body: UserPatch, request: Request):
             raise HTTPException(400, str(e)) from None
 
     return await run_db(_update)
+
+
+# ----------------------------------------------------------------------------- organizations (the deployment's operator only)
+
+
+@router.get("/organizations")
+async def list_organizations():
+    return await run_db(lambda s: [accounts.describe_organization(s, o) for o in accounts.list_organizations(s)], unrestricted=True)
+
+
+@router.post("/organizations", status_code=201)
+async def create_organization(body: OrganizationIn):
+    """A new customer organization and its first admin. The admin then adds everyone else."""
+
+    def _create(s):
+        try:
+            org, admin = accounts.create_organization(s, body.name, admin_email=body.admin_email, admin_password=body.admin_password, admin_name=body.admin_name)
+        except accounts.AccountError as e:
+            raise HTTPException(409 if "already" in str(e) else 400, str(e)) from None
+        return {**accounts.describe_organization(s, org), "admin": accounts.describe(admin)}
+
+    return await run_db(_create, unrestricted=True)

@@ -401,6 +401,24 @@ route that changes something is admin-only unless it is listed for operators in
 admin with `callagent users add you@example.com --role admin`, or sign in to the
 console with the API token and add people under Team.
 
+### Organizations
+
+Each customer is an organization with its own campaigns, leads, calls, documents,
+do-not-call list and people. A request can only see and change the organization of
+the account that makes it. The deployment's operator creates them:
+
+```bash
+callagent orgs add "Acme Ltd" --admin-email owner@acme.example
+callagent orgs list
+```
+
+or `POST /api/organizations` with the engine API token, or the Organizations screen
+of the console when signed in with that token. The first admin then adds everyone
+else. The API token works in the default organization unless the request names
+another with the `X-DevyTalk-Organization` header. More than one organization needs
+PostgreSQL, with the engine connecting as an ordinary role so that row-level security
+binds it (`GET /api/status` says whether it does). Details: `docs/DATABASE_DESIGN.md`.
+
 ### Other credentials
 
 - `INTAKE_TOKEN` lets the website hand over what visitors send through its forms

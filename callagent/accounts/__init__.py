@@ -23,12 +23,15 @@ from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..db import User, UserSession, default_organization_id, utcnow
+from ..db import Organization, User, UserSession, default_organization_id, utcnow
 
 ROLES = ("viewer", "operator", "admin")
 RANK = {role: rank for rank, role in enumerate(ROLES)}
+# Not a role: what a route needs when only the deployment's operator may use it.
+PLATFORM = "platform"
 
 SESSION_HOURS = 12
 MAX_FAILED_LOGINS = 5
@@ -77,6 +80,8 @@ def required_role(method: str, route: str) -> str:
       calling rules and budgets, creates campaigns and manages users
     """
     method = method.upper()
+    if route.startswith("/api/organizations"):
+        return PLATFORM
     if route.startswith("/api/users"):
         return "admin"
     if route.startswith("/api/auth/"):
@@ -88,20 +93,32 @@ def required_role(method: str, route: str) -> str:
     return "admin"
 
 
-def allows(role: str, needed: str) -> bool:
-    return RANK.get(role, -1) >= RANK[needed]
+def allows(principal: "Principal", needed: str) -> bool:
+    """Whether this caller may use a route that needs ``needed``. Managing
+    organizations needs the platform operator, which no role inside an organization is."""
+    if needed == PLATFORM:
+        return principal.platform
+    return RANK.get(principal.role, -1) >= RANK[needed]
 
 
 @dataclass(frozen=True)
 class Principal:
-    """Who is making a request."""
+    """Who is making a request, and for which organization.
+
+    ``organization_id`` is the only organization whose data the request may see or
+    change. It comes from the caller's own account, never from the request body or
+    path. ``platform`` marks the deployment's operator (the engine API token), who
+    creates organizations and may name the one to act in.
+    """
 
     kind: str  # "token" (the engine's API token) | "user"
     role: str
+    organization_id: int
     user_id: int | None = None
     email: str = ""
     name: str = ""
     session_id: int | None = None
+    platform: bool = False
 
     @property
     def label(self) -> str:
@@ -109,7 +126,9 @@ class Principal:
         return self.email if self.kind == "user" else "api token"
 
 
-API_TOKEN_PRINCIPAL = Principal(kind="token", role="admin", name="API token")
+def operator_principal(organization_id: int) -> Principal:
+    """The deployment's operator, acting in one organization."""
+    return Principal(kind="token", role="admin", organization_id=organization_id, name="API token", platform=True)
 
 
 # ----------------------------------------------------------------------------- passwords
@@ -178,20 +197,33 @@ def get_user_by_email(s: Session, email: str) -> User | None:
     return s.execute(select(User).where(User.email == (email or "").strip().lower())).scalar_one_or_none()
 
 
-def list_users(s: Session) -> list[User]:
-    return list(s.execute(select(User).order_by(User.active.desc(), User.email)).scalars())
+def list_users(s: Session, organization_id: int) -> list[User]:
+    return list(s.execute(select(User).where(User.organization_id == organization_id).order_by(User.active.desc(), User.email)).scalars())
 
 
-def create_user(s: Session, email: str, password: str, *, name: str = "", role: str = "viewer") -> User:
+def get_user(s: Session, user_id: int, organization_id: int) -> User | None:
+    """A person of this organization. Someone else's account does not exist as far as the caller can tell."""
+    user = s.get(User, user_id)
+    return user if user is not None and user.organization_id == organization_id else None
+
+
+def create_user(s: Session, email: str, password: str, *, name: str = "", role: str = "viewer", organization_id: int | None = None) -> User:
     email = normalize_email(email)
     if role not in ROLES:
         raise AccountError(f"role must be one of: {', '.join(ROLES)}")
     check_password_rules(password, email)
     if get_user_by_email(s, email) is not None:
         raise AccountError(f"{email} already has an account")
-    user = User(organization_id=default_organization_id(s), email=email, name=name.strip()[:200], role=role, password_hash=hash_password(password))
-    s.add(user)
-    s.flush()
+    org = organization_id if organization_id is not None else default_organization_id(s)
+    user = User(organization_id=org, email=email, name=name.strip()[:200], role=role, password_hash=hash_password(password))
+    try:
+        with s.begin_nested():
+            s.add(user)
+            s.flush()
+    except IntegrityError:
+        # The email is taken by an account this transaction cannot see: another
+        # organization's, hidden by row-level security. An email signs in to one account.
+        raise AccountError(f"{email} already has an account") from None
     return user
 
 
@@ -298,9 +330,52 @@ def principal_for_session(s: Session, token: str) -> Principal | None:
     if row is None:
         return None
     session, user = row
-    return Principal(kind="user", role=user.role if user.role in ROLES else "viewer", user_id=user.id, email=user.email, name=user.name, session_id=session.id)
+    return Principal(
+        kind="user", role=user.role if user.role in ROLES else "viewer", organization_id=user.organization_id,
+        user_id=user.id, email=user.email, name=user.name, session_id=session.id,
+    )
 
 
 def logout(s: Session, principal: Principal) -> None:
     if principal.session_id is not None:
         s.execute(update(UserSession).where(UserSession.id == principal.session_id, UserSession.revoked_at.is_(None)).values(revoked_at=utcnow()))
+
+
+# ----------------------------------------------------------------------------- organizations
+
+
+def describe_organization(s: Session, org: Organization) -> dict[str, Any]:
+    people = s.execute(select(User.active).where(User.organization_id == org.id)).scalars().all()
+    return {
+        "id": org.id,
+        "name": org.name,
+        "created_at": org.created_at.isoformat() if org.created_at else None,
+        "users": len(people),
+        "active_users": sum(1 for active in people if active),
+    }
+
+
+def list_organizations(s: Session) -> list[Organization]:
+    return list(s.execute(select(Organization).order_by(Organization.id)).scalars())
+
+
+def find_organization(s: Session, ref: str) -> Organization | None:
+    """By id or by exact name."""
+    ref = (ref or "").strip()
+    if ref.isdigit():
+        return s.get(Organization, int(ref))
+    return s.execute(select(Organization).where(Organization.name == ref)).scalar_one_or_none()
+
+
+def create_organization(s: Session, name: str, *, admin_email: str, admin_password: str, admin_name: str = "") -> tuple[Organization, User]:
+    """A new customer, with the person who will administer it. Both or neither."""
+    name = (name or "").strip()
+    if not name or len(name) > 200:
+        raise AccountError("give the organization a name of at most 200 characters")
+    if s.execute(select(Organization.id).where(Organization.name == name)).first() is not None:
+        raise AccountError(f"an organization named '{name}' already exists")
+    org = Organization(name=name)
+    s.add(org)
+    s.flush()
+    admin = create_user(s, admin_email, admin_password, name=admin_name, role="admin", organization_id=org.id)
+    return org, admin

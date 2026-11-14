@@ -7,6 +7,8 @@ run the same tests on PostgreSQL, where concurrent transactions really overlap.
 import asyncio
 import os
 import threading
+from datetime import datetime
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
@@ -207,7 +209,7 @@ def test_many_simultaneous_dial_attempts_for_one_lead_place_exactly_one_call(cam
 def test_a_number_suppressed_after_the_lead_was_picked_is_not_called(campaign):
     lead_id = _lead(campaign)
     with db.session_scope() as s:
-        s.add(db.DoNotCall(phone_e164="+14155550100", reason="asked on another call"))
+        db.add_dnc(s, "+14155550100", db.default_organization_id(s), "asked on another call")
     for manual in (False, True):
         with pytest.raises(LeadNotDialable, match="do-not-call"):
             _claim(campaign, lead_id, manual=manual)
@@ -301,3 +303,187 @@ def test_a_restart_does_not_pause_running_campaigns(campaign):
     asyncio.run(pause())
     with db.session_scope() as s:
         assert s.get(db.Campaign, campaign).status == "paused"
+
+
+# ----------------------------------------------------------------------------- organization isolation (migration 0007)
+
+LEGACY = Path(__file__).parent / "legacy_schemas"
+
+
+def _insert(connection, table_name: str, **values):
+    """One row in a reflected table, with something valid in every required column the
+    caller did not name (the previous release set those in Python, not in the schema)."""
+    from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, MetaData, Numeric, Table
+
+    table = Table(table_name, MetaData(), autoload_with=connection)
+    row = dict(values)
+    for column in table.columns:
+        if column.name in row or column.nullable or column.primary_key:
+            continue
+        kind = column.type
+        row[column.name] = (
+            datetime(2026, 1, 1) if isinstance(kind, DateTime) else False if isinstance(kind, Boolean) else 0 if isinstance(kind, (Integer, Float, Numeric))
+            else {} if isinstance(kind, JSON) else ""
+        )
+    connection.execute(table.insert().values(**row))
+
+
+def _make_release_0006_database(url: str, campaign_status: str = "running") -> None:
+    """A database exactly as the release before organization isolation left it, with data."""
+    engine = create_engine(url)
+    dialect = "postgresql" if url.startswith("postgresql") else "sqlite"
+    statements = [s.strip() for s in (LEGACY / f"0006_{dialect}.sql").read_text().split(";\n") if s.strip()]
+    with engine.begin() as c:
+        for statement in statements:
+            body = "\n".join(line for line in statement.splitlines() if not line.startswith("--")).strip()
+            if body:
+                c.execute(text(body))
+        c.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
+        c.execute(text("INSERT INTO alembic_version VALUES ('0006')"))
+        _insert(c, "organizations", name="default")
+        _insert(c, "campaigns", name="old one", status="paused", organization_id=None)  # from before campaigns had an organization
+        _insert(c, "campaigns", name="newer", status=campaign_status, organization_id=1)
+        _insert(c, "leads", campaign_id=1, phone_e164="+14155550101", status="pending")
+        _insert(c, "leads", campaign_id=2, phone_e164="+14155550102", status="completed")
+        _insert(c, "call_runs", lead_id=2, campaign_id=2, status="completed", twilio_call_sid="CA1")
+        _insert(c, "appointments", lead_id=2, call_run_id=1, starts_at="2027-01-05T10:00:00+00:00")
+        _insert(c, "usage_records", campaign_id=2, call_run_id=1, kind="call", quantity_seconds=60, amount_usd=0.12, organization_id=None)
+        _insert(c, "jobs", kind="call_review", key="call-review:1", status="done", call_run_id=1)
+        _insert(c, "jobs", kind="housekeeping", key="housekeeping:1", status="done")
+        _insert(c, "do_not_call", phone_e164="+14155550199", reason="asked")
+        _insert(c, "users", organization_id=1, email="boss@example.com", role="admin", password_hash="x", active=True)
+    engine.dispose()
+
+
+def test_a_database_of_the_previous_release_gets_an_organization_on_every_row(database_url):
+    _make_release_0006_database(database_url)
+    db.reset_engine_for_tests(database_url)  # starting the new release upgrades it
+    engine = db.get_engine()
+    postgres = engine.dialect.name == "postgresql"
+
+    with engine.connect() as c:
+        assert migrate.current_revision(c) == migrate.head_revision()
+        for table in ("campaigns", "leads", "call_runs", "appointments", "usage_records", "do_not_call"):
+            assert c.execute(text(f"SELECT organization_id FROM {table}")).scalars().all() == [1] * c.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar(), table
+        assert c.execute(text("SELECT organization_id FROM jobs ORDER BY id")).scalars().all() == [1, None]  # housekeeping belongs to nobody
+        # Nothing was lost on the way.
+        assert [c.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() for t in ("campaigns", "leads", "call_runs", "appointments", "usage_records", "jobs", "do_not_call", "users")] == [2, 2, 1, 1, 1, 2, 1, 1]
+    assert {"uq_campaigns_org_name", "uq_do_not_call_org_phone", "ix_call_runs_campaign_started", "ix_call_runs_org_started", "ix_call_runs_active", "ix_leads_organization_id"} <= _indexes(engine)
+    assert migrate.upgrade(engine) == "current"
+
+    with db.session_scope() as s:
+        second = db.Organization(name="second")
+        s.add(second)
+        s.flush()
+        second_id = second.id
+        # An opt-out is per organization now: the same number can be on two lists, once each.
+        assert db.is_dnc(s, "+14155550199", 1) and not db.is_dnc(s, "+14155550199", second_id)
+        assert db.add_dnc(s, "+14155550199", second_id) is True and db.add_dnc(s, "+14155550199", second_id) is False
+        # New rows are filed under their campaign's organization by the application.
+        lead = db.Lead(campaign_id=2, phone_e164="+14155550103")
+        s.add(lead)
+        s.flush()
+        assert lead.organization_id == 1
+
+    def same_name_elsewhere():
+        with db.session_scope() as s:
+            s.add(db.Campaign(organization_id=second_id, name="newer", status="draft"))
+
+    if postgres:
+        same_name_elsewhere()  # two customers, one campaign name each
+        with pytest.raises(IntegrityError):  # the database itself now refuses a row without an organization...
+            with engine.begin() as c:
+                c.execute(text("INSERT INTO do_not_call (phone_e164, reason, created_at) VALUES ('+14155550111', '', now())"))
+        with pytest.raises(IntegrityError):  # ...and a status nobody defined
+            with engine.begin() as c:
+                c.execute(text("UPDATE campaigns SET status = 'whatever' WHERE id = 1"))
+    else:
+        # The documented limit of upgrading SQLite in place: the old deployment-wide
+        # uniqueness of campaign names cannot be removed. More than one organization needs PostgreSQL.
+        with pytest.raises(IntegrityError):
+            same_name_elsewhere()
+
+
+def test_the_upgrade_can_be_rolled_back_and_applied_again(database_url):
+    from alembic import command
+
+    _make_release_0006_database(database_url)
+    db.reset_engine_for_tests(database_url)
+    engine = db.get_engine()
+    with engine.begin() as c:
+        command.downgrade(migrate._config(c), "0006")
+    with engine.connect() as c:
+        assert migrate.current_revision(c) == "0006"
+        assert c.execute(text("SELECT COUNT(*) FROM leads")).scalar() == 2  # rolling back loses no rows
+        # The previous release's rule is back: one do-not-call entry per number.
+        with pytest.raises(IntegrityError):
+            c.execute(text("INSERT INTO do_not_call (phone_e164, reason, created_at) VALUES ('+14155550199', '', CURRENT_TIMESTAMP)"))
+    if engine.dialect.name == "postgresql":
+        assert "organization_id" not in {col["name"] for col in inspect(engine).get_columns("leads")}
+    assert migrate.upgrade(engine) == "upgraded"
+    with engine.connect() as c:
+        assert c.execute(text("SELECT organization_id FROM leads")).scalars().all() == [1, 1]
+
+
+def test_rolling_back_is_refused_once_two_organizations_hold_campaigns(database_url):
+    from alembic import command
+
+    db.reset_engine_for_tests(database_url)
+    with db.session_scope() as s:
+        other = db.Organization(name="second")
+        s.add(other)
+        s.flush()
+        s.add_all([db.Campaign(name="q4", status="draft"), db.Campaign(organization_id=other.id, name="q4", status="draft")])
+    engine = db.get_engine()
+    with pytest.raises(RuntimeError, match="more than one organization"):
+        with engine.begin() as c:
+            command.downgrade(migrate._config(c), "0006")
+    with engine.connect() as c:
+        assert migrate.current_revision(c) == migrate.head_revision()  # still on this release, untouched
+
+
+@pytest.mark.skipif(not POSTGRES_URL, reason="CHECK constraints are added to an existing database on PostgreSQL only")
+def test_the_upgrade_stops_before_changing_anything_when_a_status_is_unknown():
+    _wipe_postgres()
+    _make_release_0006_database(POSTGRES_URL, campaign_status="archived")  # a status this release does not define
+    engine = create_engine(POSTGRES_URL)
+    with pytest.raises(RuntimeError, match=r"campaigns holds rows with a status this release does not know: \['archived'\]"):
+        migrate.upgrade(engine)
+    with engine.connect() as c:
+        assert migrate.current_revision(c) == "0006"
+        assert "organization_id" not in {col["name"] for col in inspect(c).get_columns("leads")}
+    engine.dispose()
+
+
+def _shape(engine) -> dict:
+    """What a schema requires, without the names PostgreSQL makes up for constraints."""
+    inspector = inspect(engine)
+    shape = {}
+    for table in sorted(inspector.get_table_names()):
+        if table == "alembic_version":
+            continue
+        shape[table] = {
+            "columns": sorted((c["name"], bool(c["nullable"])) for c in inspector.get_columns(table)),
+            "unique": sorted(sorted(i["column_names"]) for i in inspector.get_indexes(table) if i.get("unique")),
+            "indexes": sorted(sorted(i["column_names"]) for i in inspector.get_indexes(table) if not i.get("unique")),
+            "foreign_keys": sorted((tuple(f["constrained_columns"]), f["referred_table"]) for f in inspector.get_foreign_keys(table)),
+            "checks": sorted(c["name"] for c in inspector.get_check_constraints(table)),
+        }
+    return shape
+
+
+@pytest.mark.skipif(not POSTGRES_URL, reason="an upgraded SQLite database keeps documented differences; PostgreSQL must have none")
+def test_an_upgraded_database_and_a_new_one_have_the_same_schema():
+    _wipe_postgres()
+    _make_release_0006_database(POSTGRES_URL)
+    db.reset_engine_for_tests(POSTGRES_URL)
+    upgraded, upgraded_policies = _shape(db.get_engine()), db.row_level_security(db.get_engine())
+    db.reset_engine_for_tests("sqlite://")
+    _wipe_postgres()
+    db.reset_engine_for_tests(POSTGRES_URL)
+    created = _shape(db.get_engine())
+
+    differences = {table: (upgraded.get(table), created.get(table)) for table in set(upgraded) | set(created) if upgraded.get(table) != created.get(table)}
+    assert differences == {}
+    # Row-level security is in place either way (reported as bypassed here only because the test connects as a superuser).
+    assert upgraded_policies == db.row_level_security(db.get_engine()) == "bypassed"

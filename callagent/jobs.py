@@ -34,7 +34,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .db import Job, JobAttempt, run_db, utcnow
+from .db import CallRun, Job, JobAttempt, run_db, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -79,15 +79,21 @@ def enqueue(
     max_attempts: int = 5,
     timeout_seconds: int = 300,
     call_run_id: int | None = None,
+    organization_id: int | None = None,
 ) -> Job:
     """Add a job inside the caller's transaction. If a job with this key already exists
-    it is returned unchanged: the same work is never queued twice."""
+    it is returned unchanged: the same work is never queued twice.
+
+    The job belongs to ``organization_id``, or to the organization of the call it is
+    about. Only the deployment's own housekeeping has neither."""
     existing = s.execute(select(Job).where(Job.key == key)).scalars().first()
     if existing is not None:
         return existing
+    if organization_id is None and call_run_id is not None:
+        organization_id = s.execute(select(CallRun.organization_id).where(CallRun.id == call_run_id)).scalar_one_or_none()
     job = Job(
         kind=kind, key=key[:200], payload=dict(payload or {}), run_at=utcnow() + timedelta(seconds=delay_seconds),
-        max_attempts=max_attempts, timeout_seconds=timeout_seconds, call_run_id=call_run_id,
+        max_attempts=max_attempts, timeout_seconds=timeout_seconds, call_run_id=call_run_id, organization_id=organization_id,
     )
     try:
         with s.begin_nested():  # a concurrent enqueue of the same key loses here, without undoing the caller's work
@@ -177,10 +183,20 @@ def complete_by_key(s: Session, key: str) -> bool:
     return True
 
 
-def stats(s: Session) -> dict[str, Any]:
-    """Counts by state and the age of the oldest job still waiting, for health and metrics."""
-    counts = dict(s.execute(select(Job.status, func.count()).group_by(Job.status)).all())
-    oldest = s.execute(select(func.min(Job.run_at)).where(Job.status == "queued", Job.run_at <= utcnow())).scalar()
+def _owned_by(organization_id: int | None, include_unowned: bool) -> tuple:
+    if organization_id is None:
+        return ()
+    if include_unowned:
+        return (or_(Job.organization_id == organization_id, Job.organization_id.is_(None)),)
+    return (Job.organization_id == organization_id,)
+
+
+def stats(s: Session, organization_id: int | None = None, *, include_unowned: bool = False) -> dict[str, Any]:
+    """Counts by state and the age of the oldest job still waiting, for health and
+    metrics: for one organization, or for the whole deployment when none is given."""
+    mine = _owned_by(organization_id, include_unowned)
+    counts = dict(s.execute(select(Job.status, func.count()).where(*mine).group_by(Job.status)).all())
+    oldest = s.execute(select(func.min(Job.run_at)).where(Job.status == "queued", Job.run_at <= utcnow(), *mine)).scalar()
     return {
         "queued": counts.get("queued", 0), "running": counts.get("running", 0), "done": counts.get("done", 0), "dead": counts.get("dead", 0),
         "oldest_due_seconds": round((utcnow() - oldest).total_seconds(), 1) if oldest else 0.0,
@@ -195,10 +211,13 @@ def describe(job: Job) -> dict[str, Any]:
     }
 
 
-def retry_dead(s: Session, job_id: int) -> bool:
-    """A person looked at a dead job, fixed the cause, and wants it run again."""
+def retry_dead(s: Session, job_id: int, organization_id: int | None = None, *, include_unowned: bool = False) -> bool:
+    """A person looked at a dead job, fixed the cause, and wants it run again. With an
+    organization given, only that organization's job can be retried (and, for the
+    deployment's operator, housekeeping jobs that belong to none)."""
     job = s.get(Job, job_id)
-    if job is None or job.status != "dead":
+    theirs = organization_id is None or job is None or job.organization_id == organization_id or (include_unowned and job.organization_id is None)
+    if job is None or job.status != "dead" or not theirs:
         return False
     job.status, job.attempts, job.run_at, job.finished_at = "queued", 0, utcnow(), None
     return True

@@ -16,17 +16,17 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Reques
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from pipecat.runner.utils import parse_telephony_websocket
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from . import background, jobs
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
-from .apideps import acting_as, require_api_token
+from .apideps import acting_as, current_principal, organization_id, require_api_token
 from .intake import intake_router, requests_router
 from .config import Settings, get_settings
-from .db import ACTIVE_CALL_STATUSES, Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
+from .db import ACTIVE_CALL_STATUSES, Appointment, get_engine, row_level_security, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
 from .dialer import twilio_client
 from .dialer import rules as campaign_rules
 from .dialer.reconcile import reconcile_forever
@@ -345,22 +345,34 @@ async def health(settings: Settings = Depends(get_settings)):
 
 
 @app.get("/api/jobs", dependencies=[Depends(require_api_token)])
-async def list_jobs(status: str | None = None, limit: int = 50):
-    """Background work: counts by state, and the most recent jobs (``status=dead`` for failures that gave up)."""
+async def list_jobs(request: Request, status: str | None = None, limit: int = 50):
+    """Background work of the caller's organization: counts by state, and the most recent
+    jobs (``status=dead`` for failures that gave up). The deployment's operator also sees
+    housekeeping jobs that belong to no organization."""
+    org, operator = organization_id(), current_principal(request).platform
 
     def _q(s):
-        query = select(jobs.Job).order_by(jobs.Job.id.desc()).limit(max(1, min(limit, 200)))
+        mine = or_(jobs.Job.organization_id == org, jobs.Job.organization_id.is_(None)) if operator else jobs.Job.organization_id == org
+        query = select(jobs.Job).where(mine).order_by(jobs.Job.id.desc()).limit(max(1, min(limit, 200)))
         if status:
             query = query.where(jobs.Job.status == status)
-        return {"stats": jobs.stats(s), "jobs": [jobs.describe(j) for j in s.execute(query).scalars()]}
+        return {"stats": jobs.stats(s, org, include_unowned=operator), "jobs": [jobs.describe(j) for j in s.execute(query).scalars()]}
 
     return await run_db(_q)
 
 
 @app.post("/api/jobs/{job_id}/retry", dependencies=[Depends(require_api_token)])
-async def retry_job(job_id: int):
+async def retry_job(job_id: int, request: Request):
     """Run a dead job again, after its cause was fixed."""
-    if not await run_db(lambda s: jobs.retry_dead(s, job_id)):
+    org, operator = organization_id(), current_principal(request).platform
+
+    def _retry(s):
+        job = s.get(jobs.Job, job_id)
+        if job is None or not (job.organization_id == org or (operator and job.organization_id is None)):
+            raise HTTPException(404, "job not found")  # someone else's job does not exist as far as the caller can tell
+        return jobs.retry_dead(s, job_id)
+
+    if not await run_db(_retry):
         raise HTTPException(409, "only a dead job can be retried")
     return {"ok": True}
 
@@ -386,7 +398,9 @@ async def timeline(days: int = 14, settings: Settings = Depends(get_settings)):
     def _q(s):
         buckets = {first + timedelta(days=i): {"calls": 0, "answered": 0, "conversions": 0} for i in range(span)}
         since = utcnow() - timedelta(days=span + 1)
-        rows = s.execute(select(CallRun.started_at, CallRun.stream_connected, CallRun.transcript, CallRun.disposition).where(CallRun.started_at >= since))
+        rows = s.execute(
+            select(CallRun.started_at, CallRun.stream_connected, CallRun.transcript, CallRun.disposition).where(CallRun.organization_id == organization_id(), CallRun.started_at >= since)
+        )
         for started_at, connected, transcript, disposition in rows:
             bucket = buckets.get(started_at.astimezone(tz).date())
             if bucket is None:
@@ -401,15 +415,16 @@ async def timeline(days: int = 14, settings: Settings = Depends(get_settings)):
 
 @app.get("/api/campaigns", response_model=list[CampaignOut], dependencies=[Depends(require_api_token)])
 async def list_campaigns():
-    return await run_db(lambda s: [_campaign_out(s, c) for c in s.execute(select(Campaign)).scalars()])
+    return await run_db(lambda s: [_campaign_out(s, c) for c in s.execute(select(Campaign).where(Campaign.organization_id == organization_id()).order_by(Campaign.id)).scalars()])
 
 
 @app.post("/api/campaigns", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def create_campaign(body: CampaignIn):
     def _create(s):
-        c = get_campaign_by_name(s, body.name)
+        org = organization_id()
+        c = get_campaign_by_name(s, body.name, org)
         if c is None:
-            c = Campaign(name=body.name, status="draft")
+            c = Campaign(organization_id=org, name=body.name, status="draft")
             s.add(c)
         c.script_text = body.script_text or c.script_text or ""
         s.flush()
@@ -447,6 +462,8 @@ async def setup_status(settings: Settings = Depends(get_settings)):
         "inbound_webhook": f"{base}/twilio/inbound" if base else None,
         "languages": [{"code": code, "name": label} for code, label in LANGUAGE_NAMES.items()],
         "website_intake": bool(settings.intake_token),
+        # Whether the database itself keeps organizations apart: enforced | bypassed | missing | unavailable.
+        "row_level_security": await asyncio.to_thread(row_level_security, get_engine()),
         "default_timezone": settings.default_timezone,
     }
 
@@ -458,9 +475,10 @@ async def create_campaign_from_brief(body: CampaignBrief, request: Request):
     playbook = playbook_from_brief(body)
 
     def _create(s):
-        if get_campaign_by_name(s, body.name) is not None:
+        org = organization_id()
+        if get_campaign_by_name(s, body.name, org) is not None:
             raise HTTPException(409, f"a campaign named '{body.name}' already exists")
-        c = Campaign(name=body.name, status="draft", script_text=body.script_text.strip())
+        c = Campaign(organization_id=org, name=body.name, status="draft", script_text=body.script_text.strip())
         s.add(c)
         s.flush()
         versions.record_active(s, c, playbook.model_dump(), source="brief", by=acting_as(request, "api token"))
@@ -548,6 +566,7 @@ async def upload_leads(name: str, file: UploadFile = File(...), settings: Settin
 
 @app.post("/api/campaigns/{name}/start", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def start_campaign(name: str, concurrency: int | None = None, force: bool = False, settings: Settings = Depends(get_settings)):
+    await run_db(lambda s: _get_campaign(s, name).id)  # whose it is comes first: 404 before anything about configuration
     missing = settings.missing_for_calls()
     if missing:
         raise HTTPException(400, f"cannot place calls, missing settings: {', '.join(missing)}")
@@ -630,12 +649,18 @@ async def set_inbound_number(name: str, number: str | None = None, settings: Set
         if e164:
             taken = s.execute(select(Campaign).where(Campaign.inbound_number == e164, Campaign.id != c.id)).scalars().first()
             if taken is not None:
-                raise HTTPException(409, f"{e164} is already answered by campaign '{taken.name}'")
+                # Another organization's campaign is never named.
+                owner = f"campaign '{taken.name}'" if taken.organization_id == c.organization_id else "another campaign"
+                raise HTTPException(409, f"{e164} is already answered by {owner}")
             problems = _speech_problems(Playbook.model_validate(c.playbook_json), settings)
             if problems:
                 raise HTTPException(400, "cannot run this campaign's languages with the configured providers: " + "; ".join(problems))
         c.inbound_number = e164
-        s.flush()
+        try:
+            s.flush()
+        except IntegrityError:
+            # Taken by a campaign this transaction cannot see (another organization's).
+            raise HTTPException(409, f"{e164} is already answered by another campaign") from None
         return _campaign_out(s, c)
 
     return await run_db(_set)
@@ -644,6 +669,7 @@ async def set_inbound_number(name: str, number: str | None = None, settings: Set
 @app.post("/api/campaigns/{name}/dial", dependencies=[Depends(require_api_token)])
 async def dial_one(name: str, phone: str, first_name: str = "", settings: Settings = Depends(get_settings)):
     """Place a single test call to one number (added to the campaign as a lead)."""
+    await run_db(lambda s: _get_campaign(s, name).id)  # whose it is comes first
     missing = settings.missing_for_calls()
     if missing:
         raise HTTPException(400, f"cannot place calls, missing settings: {', '.join(missing)}")
@@ -656,7 +682,7 @@ async def dial_one(name: str, phone: str, first_name: str = "", settings: Settin
         problems = _speech_problems(Playbook.model_validate(c.playbook_json), settings)
         if problems:
             raise HTTPException(400, "cannot run this campaign's languages with the configured providers: " + "; ".join(problems))
-        if is_dnc(s, e164):
+        if is_dnc(s, e164, c.organization_id):
             raise HTTPException(400, f"{e164} is on the do-not-call list")
         lead = s.execute(select(Lead).where(Lead.campaign_id == c.id, Lead.phone_e164 == e164)).scalar_one_or_none()
         if lead is None:
@@ -711,7 +737,7 @@ async def list_calls(name: str, limit: int = 50, direction: str | None = None):
 async def get_call(call_run_id: int):
     def _q(s):
         r = s.get(CallRun, call_run_id)
-        if r is None:
+        if r is None or r.organization_id != organization_id():
             raise HTTPException(404, "call not found")
         return {
             "call_run_id": r.id,

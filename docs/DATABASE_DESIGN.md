@@ -112,3 +112,59 @@ Commands: `callagent db status`, `callagent db upgrade`, `callagent db check`.
 | Costs as `NUMERIC` instead of floating point; a usage ledger | D-5, B-1 |
 | Lead list and report filtering in SQL | D-6 |
 | Website crawl outside the write transaction | J-3 |
+
+
+## Organizations (migrations 0007 and 0008)
+
+Every customer-owned row carries `organization_id`: campaigns, leads, calls,
+appointments, usage records, documents, passages, playbook versions, experiments,
+training runs, users, website requests, do-not-call entries, and jobs (a job with no
+organization is the deployment's own housekeeping).
+
+**Where the organization comes from.** A request's organization is the caller's
+account's, set once by the authentication dependency (`apideps.require_api_token`)
+and never read from a path, query or body. The deployment's operator (the engine API
+token) works in the default organization unless it names another in the
+`X-DevyTalk-Organization` header, which is ignored from anyone else. A new lead,
+call, appointment or usage record takes the organization of the campaign (or lead) it
+hangs from in one place, a `before_flush` listener in `db.py`, so no code path can
+forget it or copy the wrong one.
+
+**Two locks.**
+
+1. The application: `apideps.get_campaign` resolves a campaign by `(organization,
+   name)`, and every list or fetch by id filters by the caller's organization.
+   Another organization's row answers exactly like a missing one (404). A lookup made
+   outside an authenticated request raises instead of returning anything.
+2. PostgreSQL row-level security: `db.session_scope` sets `app.organization_id` for
+   the transaction, and a policy on each tenant table (FORCE, so it binds the table
+   owner) makes the database return and accept only that organization's rows. With
+   the setting absent nothing is restricted; that is how provider webhooks, the dial
+   loop, background jobs and migrations work, and they address rows by id. A
+   superuser or a role with BYPASSRLS is never bound: **run the engine as an ordinary
+   role.** `GET /api/status` reports `row_level_security` as `enforced`, `bypassed`,
+   `missing` or `unavailable` (SQLite), and the console shows it under Setup.
+
+**Uniqueness.** Campaign names are unique per organization
+(`uq_campaigns_org_name`); a do-not-call number once per organization
+(`uq_do_not_call_org_phone`); an inbound number and a user's email stay unique across
+the deployment (a phone number is answered by one campaign; an email signs in to one
+account).
+
+**Constraints and indexes added.** CHECK constraints on `campaigns.status`,
+`leads.status`, `call_runs.status` and `jobs.status`. Indexes
+`call_runs(campaign_id, started_at)` for the daily and monthly limits,
+`call_runs(organization_id, started_at)` for the calls-per-day chart, and a partial
+index over active calls for the reconciler.
+
+**SQLite.** An existing SQLite database is upgraded in place with the columns added
+and filled, but SQLite cannot alter a column or drop a constraint without rebuilding
+the table, so there the new columns stay nullable in the schema, campaign names stay
+unique across the deployment, and no CHECK constraints are added. A new SQLite
+database gets the full schema. There is no row-level security on SQLite. **More than
+one organization requires PostgreSQL.**
+
+**Rollback.** `0007` can be rolled back while one organization holds campaigns (it
+refuses otherwise, because names and do-not-call numbers could then collide), and
+applied again; both directions are tested on SQLite and PostgreSQL. On PostgreSQL an
+upgraded database and a newly created one are compared column by column in a test.

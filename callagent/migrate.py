@@ -52,7 +52,7 @@ def current_revision(connection: Connection) -> str | None:
 
 def upgrade(engine: Engine) -> str:
     """Returns what was done: "created", "adopted" (a pre-migration database), "upgraded" or "current"."""
-    from .db import Base, add_missing_columns
+    from .db import Base, add_missing_columns, ensure_row_level_security
 
     with engine.begin() as connection:
         if connection.dialect.name == "postgresql":
@@ -62,6 +62,7 @@ def upgrade(engine: Engine) -> str:
         config = _config(connection)
         if "alembic_version" not in tables and "campaigns" not in tables:
             Base.metadata.create_all(connection)
+            ensure_row_level_security(connection)  # what the models cannot express; migration 0008 does the same for existing databases
             command.stamp(config, "head")
             return "created"
         outcome = "upgraded"

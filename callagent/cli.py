@@ -38,6 +38,8 @@ db_app = typer.Typer(help="Database schema: status, upgrade, integrity check.")
 app.add_typer(db_app, name="db")
 users_app = typer.Typer(help="People who sign in to the console, and their roles.")
 app.add_typer(users_app, name="users")
+orgs_app = typer.Typer(help="Customer organizations on this deployment.")
+app.add_typer(orgs_app, name="orgs")
 
 console = Console()
 
@@ -790,18 +792,32 @@ if __name__ == "__main__":
 # ----------------------------------------------------------------------------- users
 
 
-def _user_or_exit(s, email: str):
+def _org_id(s, ref: str = "") -> int:
+    """The organization a command works in: the one named, else the default one."""
+    from . import accounts
+    from .db import default_organization_id
+
+    if not ref:
+        return default_organization_id(s)
+    org = accounts.find_organization(s, ref)
+    if org is None:
+        raise typer.BadParameter(f"no organization '{ref}'. See `callagent orgs list`.")
+    return org.id
+
+
+def _user_or_exit(s, email: str, org: str = ""):
     from . import accounts
 
     user = accounts.get_user_by_email(s, email)
-    if user is None:
-        raise typer.BadParameter(f"no account for {email}")
+    if user is None or user.organization_id != _org_id(s, org):
+        raise typer.BadParameter(f"no account for {email}" + (f" in organization '{org}'" if org else " in the default organization (use --org)"))
     return user
 
 
 @users_app.command("add")
 def users_add(
     email: str,
+    org: str = typer.Option("", "--org", help="Organization name or id. Default: the default organization."),
     name: str = typer.Option("", help="The person's name."),
     role: str = typer.Option("viewer", help="viewer (reads), operator (runs campaigns) or admin (also approves, sets rules, manages users)."),
     password: str = typer.Option(..., prompt=True, hide_input=True, confirmation_prompt=True, help="At least 10 characters. Asked for when not given."),
@@ -811,19 +827,19 @@ def users_add(
 
     with session_scope() as s:
         try:
-            user = accounts.describe(accounts.create_user(s, email, password, name=name, role=role))
+            user = accounts.describe(accounts.create_user(s, email, password, name=name, role=role, organization_id=_org_id(s, org)))
         except accounts.AccountError as e:
             raise typer.BadParameter(str(e)) from None
     console.print(f"[green]Created[/green] {user['email']} with the {user['role']} role.")
 
 
 @users_app.command("list")
-def users_list():
+def users_list(org: str = typer.Option("", "--org", help="Organization name or id. Default: the default organization.")):
     """Everyone who has an account."""
     from . import accounts
 
     with session_scope() as s:
-        rows = [accounts.describe(u) for u in accounts.list_users(s)]
+        rows = [accounts.describe(u) for u in accounts.list_users(s, _org_id(s, org))]
     table = Table("Email", "Name", "Role", "State", "Last sign-in")
     for u in rows:
         table.add_row(u["email"], u["name"], u["role"], "active" if u["active"] else "deactivated", (u["last_login_at"] or "never")[:16])
@@ -831,35 +847,35 @@ def users_list():
 
 
 @users_app.command("role")
-def users_role(email: str, role: str):
+def users_role(email: str, role: str, org: str = typer.Option("", "--org", help="Organization the account belongs to. Default: the default organization.")):
     """Change a person's role."""
     from . import accounts
 
     with session_scope() as s:
         try:
-            accounts.update_user(s, _user_or_exit(s, email), actor=accounts.API_TOKEN_PRINCIPAL, role=role)
+            accounts.update_user(s, _user_or_exit(s, email, org), actor=accounts.operator_principal(_org_id(s, org)), role=role)
         except accounts.AccountError as e:
             raise typer.BadParameter(str(e)) from None
     console.print(f"{email} now has the {role} role.")
 
 
 @users_app.command("deactivate")
-def users_deactivate(email: str):
+def users_deactivate(email: str, org: str = typer.Option("", "--org", help="Organization the account belongs to. Default: the default organization.")):
     """Stop a person signing in and end their sessions. Their history is kept."""
     from . import accounts
 
     with session_scope() as s:
-        accounts.update_user(s, _user_or_exit(s, email), actor=accounts.API_TOKEN_PRINCIPAL, active=False)
+        accounts.update_user(s, _user_or_exit(s, email, org), actor=accounts.operator_principal(_org_id(s, org)), active=False)
     console.print(f"{email} can no longer sign in.")
 
 
 @users_app.command("activate")
-def users_activate(email: str):
+def users_activate(email: str, org: str = typer.Option("", "--org", help="Organization the account belongs to. Default: the default organization.")):
     """Let a deactivated person sign in again."""
     from . import accounts
 
     with session_scope() as s:
-        accounts.update_user(s, _user_or_exit(s, email), actor=accounts.API_TOKEN_PRINCIPAL, active=True)
+        accounts.update_user(s, _user_or_exit(s, email, org), actor=accounts.operator_principal(_org_id(s, org)), active=True)
     console.print(f"{email} can sign in again.")
 
 
@@ -874,3 +890,38 @@ def users_password(email: str, password: str = typer.Option(..., prompt=True, hi
         except accounts.AccountError as e:
             raise typer.BadParameter(str(e)) from None
     console.print(f"New password set for {email}.")
+
+
+# ----------------------------------------------------------------------------- organizations
+
+
+@orgs_app.command("add")
+def orgs_add(
+    name: str,
+    admin_email: str = typer.Option(..., help="Email of the organization's first admin."),
+    admin_name: str = typer.Option("", help="Their name."),
+    admin_password: str = typer.Option(..., prompt=True, hide_input=True, confirmation_prompt=True, help="At least 10 characters. Asked for when not given."),
+):
+    """Create a customer organization and its first admin, who then adds everyone else."""
+    from . import accounts
+
+    with session_scope() as s:
+        try:
+            org, admin = accounts.create_organization(s, name, admin_email=admin_email, admin_password=admin_password, admin_name=admin_name)
+        except accounts.AccountError as e:
+            raise typer.BadParameter(str(e)) from None
+        created = (org.id, org.name, admin.email)
+    console.print(f"[green]Created[/green] organization {created[1]} (id {created[0]}) with admin {created[2]}.")
+
+
+@orgs_app.command("list")
+def orgs_list():
+    """Every organization on this deployment."""
+    from . import accounts
+
+    with session_scope() as s:
+        rows = [accounts.describe_organization(s, o) for o in accounts.list_organizations(s)]
+    table = Table("Id", "Name", "People", "Active", "Created")
+    for o in rows:
+        table.add_row(str(o["id"]), o["name"], str(o["users"]), str(o["active_users"]), (o["created_at"] or "")[:10])
+    console.print(table)

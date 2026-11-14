@@ -17,7 +17,7 @@ def test_pick_next_lead_and_no_answer_retry(tmp_path):
         s.add(c)
         s.flush()
         # The DNC lead comes first so the picker must skip over it.
-        s.add(db.DoNotCall(phone_e164="+14155550199"))
+        db.add_dnc(s, "+14155550199", db.default_organization_id(s))
         s.add(db.Lead(campaign_id=c.id, phone_e164="+14155550199", timezone="UTC"))
         s.flush()
         s.add(db.Lead(campaign_id=c.id, phone_e164="+14155550100", timezone="UTC"))

@@ -72,7 +72,7 @@ def test_signing_in_opens_a_session_whose_token_is_not_stored(client):
     assert "password" not in str(response.json()).lower()
 
     me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
-    assert me == {"kind": "user", "id": me["id"], "email": "ada@example.com", "name": "Ada", "role": "operator"}
+    assert me == {"kind": "user", "id": me["id"], "email": "ada@example.com", "name": "Ada", "role": "operator", "organization": {"id": me["organization"]["id"], "name": "default"}, "platform": False}
     with session_scope() as s:
         stored = s.execute(select(UserSession.token_hash)).scalar_one()
         assert stored != token and token not in stored
@@ -183,9 +183,13 @@ def test_each_role_can_do_what_it_is_for_and_nothing_more(client):
 
     changes = {(m, p) for m, p in routes if m != "GET" and not p.startswith(("/api/auth/", "/api/users"))}
     users = {(m, p) for m, p in routes if p.startswith("/api/users")}
-    assert refused["admin"] == set()
-    assert refused["operator"] == (changes - accounts.OPERATOR_ROUTES) | users
-    assert refused["viewer"] == changes | users
+    # Organizations are managed by the deployment's operator, which no role inside an organization is.
+    platform = {(m, p) for m, p in routes if p.startswith("/api/organizations")}
+    assert platform == {("GET", "/api/organizations"), ("POST", "/api/organizations")}
+    changes -= platform
+    assert refused["admin"] == platform
+    assert refused["operator"] == (changes - accounts.OPERATOR_ROUTES) | users | platform
+    assert refused["viewer"] == changes | users | platform
     # What only an admin decides: what goes live, what it may cost, and who has access.
     for admin_only in [
         ("POST", "/api/campaigns/{name}/versions/{number}/approve"),
@@ -206,7 +210,8 @@ def test_a_refusal_says_which_role_is_needed(client):
 
 
 def test_the_api_token_keeps_working_and_is_an_admin(client):
-    assert client.get("/api/auth/me").json() == {"kind": "token", "id": None, "email": "", "name": "API token", "role": "admin"}
+    me = client.get("/api/auth/me").json()
+    assert me == {"kind": "token", "id": None, "email": "", "name": "API token", "role": "admin", "organization": {"id": me["organization"]["id"], "name": "default"}, "platform": True}
     assert client.get("/api/users").status_code == 200
     assert client.post("/api/auth/logout").json() == {"ok": True}  # nothing to end
     assert client.get("/api/campaigns").status_code == 200

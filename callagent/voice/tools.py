@@ -13,7 +13,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import EndWorkerFrame
 from pipecat.services.llm_service import FunctionCallParams, FunctionCallResultProperties
 
-from ..db import Appointment, CallRun, DoNotCall, Lead, run_db
+from ..db import Appointment, CallRun, Lead, add_dnc, run_db
 from ..dialer import twilio_client
 from .session import CallSession
 
@@ -289,10 +289,9 @@ async def mark_do_not_call(session: CallSession, params: FunctionCallParams) -> 
     def _save(s):
         from sqlalchemy import select
 
-        if not s.execute(select(DoNotCall).where(DoNotCall.phone_e164 == phone)).scalar_one_or_none():
-            s.add(DoNotCall(phone_e164=phone, reason=reason))
         lead = s.get(Lead, session.lead["id"])
         if lead:
+            add_dnc(s, phone, lead.organization_id, reason)  # on this organization's list only
             lead.status = "dnc"
             lead.last_disposition = "do_not_call"
 

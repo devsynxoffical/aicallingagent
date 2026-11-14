@@ -14,3 +14,26 @@ from fixtures import make_sample_playbook  # noqa: E402
 @pytest.fixture
 def sample_playbook():
     return make_sample_playbook()
+
+
+# ----------------------------------------------------------------------------- PostgreSQL as an ordinary role
+
+POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
+APP_ROLE = "callagent_app_test"
+
+
+def postgres_app_url() -> str:
+    """An empty PostgreSQL database owned by an ordinary role (no superuser, no BYPASSRLS),
+    which is how the application must run for row-level security to bind it. The
+    superuser in TEST_POSTGRES_URL is used only to prepare it."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+
+    admin = create_engine(POSTGRES_URL, isolation_level="AUTOCOMMIT")
+    with admin.connect() as c:
+        if not c.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": APP_ROLE}).scalar():
+            c.execute(text(f"CREATE ROLE {APP_ROLE} LOGIN NOSUPERUSER NOBYPASSRLS"))
+        c.execute(text("DROP SCHEMA public CASCADE"))
+        c.execute(text(f"CREATE SCHEMA public AUTHORIZATION {APP_ROLE}"))
+    admin.dispose()
+    return make_url(POSTGRES_URL).set(username=APP_ROLE, password=None).render_as_string(hide_password=False)

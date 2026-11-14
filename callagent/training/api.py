@@ -128,7 +128,7 @@ async def start_training(name: str, background: BackgroundTasks, settings: Setti
         s.flush()
         # Saved with the run: a restart in the middle of training no longer leaves the
         # run "in progress" forever, the queue runs it again.
-        jobs.enqueue(s, work.TRAINING_RUN, work.training_run_key(run.id), {"run_id": run.id}, max_attempts=2, timeout_seconds=900)
+        jobs.enqueue(s, work.TRAINING_RUN, work.training_run_key(run.id), {"run_id": run.id}, max_attempts=2, timeout_seconds=900, organization_id=run.organization_id)
         return _describe_run(run)
 
     run = await run_db(_start)

@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from .apideps import acting_as, require_api_token
+from .apideps import acting_as, organization_id, require_api_token
 from .config import Settings, get_settings
 from .db import WebsiteRequest, default_organization_id, run_db, utcnow
 
@@ -88,13 +88,14 @@ async def receive_request(body: RequestIn):
 @requests_router.get("")
 async def list_requests(status: str | None = None, kind: str | None = None, limit: int = 50, offset: int = 0):
     def _q(s):
-        query = select(WebsiteRequest)
+        org = organization_id()
+        query = select(WebsiteRequest).where(WebsiteRequest.organization_id == org)
         if status in ("new", "handled"):
             query = query.where(WebsiteRequest.status == status)
         if kind in KINDS:
             query = query.where(WebsiteRequest.kind == kind)
         total = s.execute(select(func.count()).select_from(query.subquery())).scalar_one()
-        waiting = s.execute(select(func.count()).select_from(WebsiteRequest).where(WebsiteRequest.status == "new")).scalar_one()
+        waiting = s.execute(select(func.count()).select_from(WebsiteRequest).where(WebsiteRequest.organization_id == org, WebsiteRequest.status == "new")).scalar_one()
         rows = s.execute(query.order_by(WebsiteRequest.id.desc()).limit(max(1, min(limit, 200))).offset(max(0, offset))).scalars()
         return {"total": total, "new": waiting, "requests": [describe(r) for r in rows]}
 
@@ -109,7 +110,7 @@ async def mark_handled(request_id: int, request: Request, body: HandledIn | None
 
     def _mark(s):
         row = s.get(WebsiteRequest, request_id)
-        if row is None:
+        if row is None or row.organization_id != organization_id():
             raise HTTPException(404, "request not found")
         row.status = "handled" if handled else "new"
         row.handled_by = who if handled else None

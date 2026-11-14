@@ -116,7 +116,7 @@ def test_do_not_call_caller_is_answered_but_stays_on_the_list(client):
     with db.session_scope() as s:
         c = db.get_campaign_by_name(s, "front-desk")
         s.add(db.Lead(campaign_id=c.id, phone_e164=CALLER, status="dnc"))
-        s.add(db.DoNotCall(phone_e164=CALLER))
+        db.add_dnc(s, CALLER, db.default_organization_id(s))
     assert "<Stream" in _ring(client).text
     with db.session_scope() as s:
         assert s.query(db.Lead).one().status == "dnc"
