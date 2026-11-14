@@ -14,7 +14,7 @@ import secrets as _secrets
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -23,7 +23,7 @@ from . import background, jobs
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
-from .apideps import require_api_token
+from .apideps import acting_as, require_api_token
 from .intake import intake_router, requests_router
 from .config import Settings, get_settings
 from .db import ACTIVE_CALL_STATUSES, Appointment, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow
@@ -33,8 +33,10 @@ from .dialer.reconcile import reconcile_forever
 from .dialer.campaign_runner import TERMINAL_CALL_STATUSES, CampaignRunner, LeadNotDialable, apply_twilio_status
 from .leads.importer import import_leads
 from .leads.importer import normalize_phone
+from .languages import LANGUAGE_NAMES, base_language
+from .playbook.brief import CampaignBrief, playbook_from_brief
 from .playbook.schema import Playbook
-from .providers import SpeechPlan, speech_plan_problems
+from .providers import SpeechPlan, get_stt, get_tts, speech_plan_problems
 from .intelligence.api import router as intelligence_router
 from .training import versions
 from .training.api import router as training_router
@@ -220,6 +222,11 @@ def open_inbound_call(s, form: dict[str, str], settings: Settings) -> tuple[int,
 async def twilio_inbound(request: Request, settings: Settings = Depends(get_settings)):
     """Point a Twilio number's "A call comes in" webhook here to have the agent answer it."""
     form = await _twilio_form(request, settings)
+    if not settings.public_base_url:
+        # Without it the call's audio cannot be streamed here. Say so to the caller and
+        # open no call, instead of failing after a record was created.
+        log.error("inbound call to %s cannot be answered: PUBLIC_BASE_URL is not set", form.get("To"))
+        return Response(content=twilio_client.say_and_hangup_twiml(NO_AGENT_MESSAGE), media_type="application/xml")
     try:
         opened = await run_db(lambda s: open_inbound_call(s, form, settings))
     except IntegrityError:
@@ -414,6 +421,113 @@ async def create_campaign(body: CampaignIn):
     return await run_db(_create)
 
 
+@app.get("/api/status", dependencies=[Depends(require_api_token)])
+async def setup_status(settings: Settings = Depends(get_settings)):
+    """What is connected and what is still missing before real calls can be placed or
+    answered. Names of settings only: no value of any key is ever returned."""
+    stt, tts = get_stt(settings), get_tts(settings)
+
+    def check(key: str, label: str, purpose: str, required: dict) -> dict:
+        missing = [name for name, value in required.items() if not value]
+        return {"key": key, "label": label, "purpose": purpose, "ok": not missing, "missing": missing}
+
+    checks = [
+        check("model", "AI model (Anthropic)", "Holds the conversation, reviews calls, coaches and builds playbooks.", {"ANTHROPIC_API_KEY": settings.anthropic_api_key}),
+        check("telephony", "Phone provider (Twilio)", "Places and receives the phone calls.", {"TWILIO_ACCOUNT_SID": settings.twilio_account_sid, "TWILIO_AUTH_TOKEN": settings.twilio_auth_token, "TWILIO_FROM_NUMBER": settings.twilio_from_number}),
+        check("stt", f"Speech recognition ({stt.name.title()})", "Turns what the prospect says into text.", stt.required_settings(settings)),
+        check("tts", f"Voice ({tts.name.title()})", "Speaks the agent's replies.", tts.required_settings(settings)),
+        check("public_url", "Public address of this engine", "Where the phone provider reaches the engine during a call.", {"PUBLIC_BASE_URL": settings.public_base_url}),
+    ]
+    base = settings.public_base_url or None
+    return {
+        "ready_for_calls": all(c["ok"] for c in checks),
+        "checks": checks,
+        "from_number": settings.twilio_from_number or None,
+        # Paste into the phone number's "A call comes in" setting at the phone provider to have the agent answer it.
+        "inbound_webhook": f"{base}/twilio/inbound" if base else None,
+        "languages": [{"code": code, "name": label} for code, label in LANGUAGE_NAMES.items()],
+        "website_intake": bool(settings.intake_token),
+        "default_timezone": settings.default_timezone,
+    }
+
+
+@app.post("/api/campaign-briefs", response_model=CampaignOut, status_code=201, dependencies=[Depends(require_api_token)])
+async def create_campaign_from_brief(body: CampaignBrief, request: Request):
+    """Create a campaign from the short form: a working playbook without the AI model.
+    Refused if a campaign with this name exists (use the playbook screens to change one)."""
+    playbook = playbook_from_brief(body)
+
+    def _create(s):
+        if get_campaign_by_name(s, body.name) is not None:
+            raise HTTPException(409, f"a campaign named '{body.name}' already exists")
+        c = Campaign(name=body.name, status="draft", script_text=body.script_text.strip())
+        s.add(c)
+        s.flush()
+        versions.record_active(s, c, playbook.model_dump(), source="brief", by=acting_as(request, "api token"))
+        s.flush()
+        return _campaign_out(s, c)
+
+    return await run_db(_create)
+
+
+def _language_state(c: Campaign, settings: Settings) -> dict:
+    pb = Playbook.model_validate(c.playbook_json)
+    return {
+        "languages": pb.languages,
+        # Languages with phrasing written for them. The others are spoken from the main language's playbook.
+        "localized": [code for code in pb.languages[1:] if pb.localized_for(code) is not None],
+        "supported": [{"code": code, "name": label} for code, label in LANGUAGE_NAMES.items()],
+        "provider_gaps": _speech_problems(pb, settings),
+        "can_localize": bool(settings.anthropic_api_key),
+    }
+
+
+@app.get("/api/campaigns/{name}/languages", dependencies=[Depends(require_api_token)])
+async def get_languages(name: str, settings: Settings = Depends(get_settings)):
+    return await run_db(lambda s: _language_state(_get_campaign(s, name), settings))
+
+
+class LanguagesIn(BaseModel):
+    languages: list[str] = Field(min_length=1, max_length=5, description="Opening language first.")
+    localize: bool = Field(default=False, description="Have the AI model write native phrasing for each added language.")
+
+
+@app.put("/api/campaigns/{name}/languages", dependencies=[Depends(require_api_token)])
+async def set_languages(name: str, body: LanguagesIn, request: Request, settings: Settings = Depends(get_settings)):
+    """Set the languages a campaign speaks, opening language first. With more than one,
+    the agent follows the language the prospect speaks."""
+    codes = list(dict.fromkeys(base_language(code) for code in body.languages if base_language(code)))
+    unknown = [code for code in codes if code not in LANGUAGE_NAMES]
+    if unknown or not codes:
+        raise HTTPException(400, f"unsupported language(s): {', '.join(unknown) or 'none given'}. Supported: {', '.join(LANGUAGE_NAMES)}")
+    if body.localize and not settings.anthropic_api_key:
+        raise HTTPException(400, "cannot write native phrasing: ANTHROPIC_API_KEY is not set")
+
+    current = await run_db(lambda s: Playbook.model_validate(_get_campaign(s, name).playbook_json))
+    pb = current.model_copy(deep=True)
+    if base_language(pb.persona.language) != codes[0]:
+        pb.persona.language = codes[0]
+    pb.additional_languages = codes[1:]
+    pb.localized = [phrasing for phrasing in pb.localized if base_language(phrasing.language) in codes[1:]]
+    if body.localize:
+        from .playbook.analyzer import PlaybookAnalyzer
+
+        analyzer = PlaybookAnalyzer()
+        for code in codes[1:]:
+            if pb.localized_for(code) is None:
+                pb.localized.append(await asyncio.to_thread(analyzer.localize, pb, code))
+    who = acting_as(request, "api token")
+
+    def _save(s):
+        c = _get_campaign(s, name)
+        # The admin is changing the playbook directly: recorded as a new version and made active.
+        versions.record_active(s, c, pb.model_dump(), source="languages", by=who)
+        s.flush()
+        return _language_state(c, settings)
+
+    return await run_db(_save)
+
+
 @app.get("/api/campaigns/{name}", response_model=CampaignOut, dependencies=[Depends(require_api_token)])
 async def get_campaign(name: str):
     return await run_db(lambda s: _campaign_out(s, _get_campaign(s, name)))
@@ -560,10 +674,13 @@ async def dial_one(name: str, phone: str, first_name: str = "", settings: Settin
 
 
 @app.get("/api/campaigns/{name}/calls", dependencies=[Depends(require_api_token)])
-async def list_calls(name: str, limit: int = 50):
+async def list_calls(name: str, limit: int = 50, direction: str | None = None):
     def _q(s):
         c = _get_campaign(s, name)
-        rows = s.execute(select(CallRun).where(CallRun.campaign_id == c.id).order_by(CallRun.id.desc()).limit(limit)).scalars()
+        query = select(CallRun).where(CallRun.campaign_id == c.id)
+        if direction in ("outbound", "inbound"):
+            query = query.where(CallRun.direction == direction)
+        rows = s.execute(query.order_by(CallRun.id.desc()).limit(max(1, min(limit, 500)))).scalars()
         out = []
         for r in rows:
             lead = s.get(Lead, r.lead_id)

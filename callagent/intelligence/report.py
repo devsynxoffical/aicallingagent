@@ -48,6 +48,7 @@ def campaign_report(s: Session, campaign: Campaign) -> dict[str, Any]:
     objections: dict[str, dict[str, Any]] = defaultdict(lambda: {"raised": 0, "handled": 0, "calls": 0, "converted_calls": 0, "examples": []})
     by_version: dict[str, dict[str, Any]] = defaultdict(_group)
     by_language: dict[str, dict[str, Any]] = defaultdict(_group)
+    by_direction: dict[str, dict[str, Any]] = defaultdict(_group)
     missed: Counter[str] = Counter()
     unsupported: list[dict[str, Any]] = []
     answered = conversions = reviewed = 0
@@ -60,7 +61,7 @@ def campaign_report(s: Session, campaign: Campaign) -> dict[str, Any]:
             dispositions[run.disposition] += 1
         answered += was_answered
         conversions += converted
-        for key, bucket in ((str(run.playbook_version or "unknown"), by_version), (run.language or "unknown", by_language)):
+        for key, bucket in ((str(run.playbook_version or "unknown"), by_version), (run.language or "unknown", by_language), (run.direction or "outbound", by_direction)):
             group = bucket[key]
             group["calls"] += 1
             group["answered"] += was_answered
@@ -141,5 +142,7 @@ def campaign_report(s: Session, campaign: Campaign) -> dict[str, Any]:
         # Named only when at least two versions each have enough answered calls to compare.
         "best_version": best,
         "by_language": {key: _close(group) for key, group in sorted(by_language.items())},
+        # Calls the agent placed (outbound) and calls it answered (inbound).
+        "by_direction": {key: _close(by_direction[key]) for key in ("outbound", "inbound") if key in by_direction},
         "leads": {"total": len(leads), **{c: lead_categories.get(c, 0) for c in ("hot", "warm", "cold", "unscored")}},
     }
