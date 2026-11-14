@@ -87,7 +87,7 @@ def required_role(method: str, route: str) -> str:
         return PLATFORM
     if route.startswith("/api/usage/") and method not in ("GET", "HEAD", "OPTIONS"):
         return PLATFORM  # correcting the ledger is for whoever bills, not for the organization billed
-    if route.startswith(("/api/users", "/api/audit", "/api/keys", "/api/webhooks")):
+    if route.startswith(("/api/users", "/api/audit", "/api/keys", "/api/webhooks", "/api/invitations")):
         return "admin"
     if route.startswith("/api/auth/"):
         return "viewer"
@@ -323,13 +323,20 @@ def login(s: Session, email: str, password: str) -> LoginResult:
     if not user.active:
         noted("sign_in_refused_deactivated", 401)
         return LoginResult(ok=False, status=401, error=_WRONG)
+    noted("sign_in", 200)
+    return open_session(s, user)
+
+
+def open_session(s: Session, user: User) -> LoginResult:
+    """Sign a person in whose right to it was just established (a password, or a
+    one-time link). The token is returned this once; only its hash is stored."""
+    now = utcnow()
     token = "dts_" + secrets.token_urlsafe(32)
     expires = now + timedelta(hours=SESSION_HOURS)
     s.add(UserSession(user_id=user.id, token_hash=_token_hash(token), expires_at=expires))
     user.failed_logins = 0
     user.locked_until = None
     user.last_login_at = now
-    noted("sign_in", 200)
     s.flush()
     return LoginResult(ok=True, token=token, expires_at=expires.isoformat(), user=describe(user))
 
@@ -385,8 +392,8 @@ def find_organization(s: Session, ref: str) -> Organization | None:
     return s.execute(select(Organization).where(Organization.name == ref)).scalar_one_or_none()
 
 
-def create_organization(s: Session, name: str, *, admin_email: str, admin_password: str, admin_name: str = "") -> tuple[Organization, User]:
-    """A new customer, with the person who will administer it. Both or neither."""
+def create_empty_organization(s: Session, name: str) -> Organization:
+    """A new customer with nobody in it yet. The caller adds or invites its first admin in the same transaction."""
     name = (name or "").strip()
     if not name or len(name) > 200:
         raise AccountError("give the organization a name of at most 200 characters")
@@ -395,6 +402,12 @@ def create_organization(s: Session, name: str, *, admin_email: str, admin_passwo
     org = Organization(name=name)
     s.add(org)
     s.flush()
+    return org
+
+
+def create_organization(s: Session, name: str, *, admin_email: str, admin_password: str, admin_name: str = "") -> tuple[Organization, User]:
+    """A new customer, with the person who will administer it. Both or neither."""
+    org = create_empty_organization(s, name)
     admin = create_user(s, admin_email, admin_password, name=admin_name, role="admin", organization_id=org.id)
     return org, admin
 
@@ -405,7 +418,7 @@ KEY_PREFIX = "dtk_"
 # What a key may never do, whatever its role: make more keys, manage people, change a
 # password, or have the organization's events sent to an address of its choosing. A key
 # that leaks must not be able to keep itself alive, let someone in, or open a tap.
-KEY_FORBIDDEN_ROUTES = ("/api/keys", "/api/users", "/api/auth/password", "/api/webhooks")
+KEY_FORBIDDEN_ROUTES = ("/api/keys", "/api/users", "/api/invitations", "/api/auth/password", "/api/webhooks")
 
 
 def create_api_key(s: Session, organization_id: int, name: str, role: str, by: str) -> tuple[ApiKey, str]:

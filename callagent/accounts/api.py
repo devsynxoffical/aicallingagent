@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .. import accounts
-from ..apideps import current_principal, require_api_token
+from ..apideps import acting_as, current_principal, require_api_token
+from . import invitations
 from .. import orgsettings
 from ..config import get_settings
 from ..db import Organization, User, run_db
@@ -43,7 +44,19 @@ class OrganizationIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     admin_email: str = Field(max_length=254)
     admin_name: str = Field(default="", max_length=200)
-    admin_password: str = Field(max_length=accounts.MAX_PASSWORD_LENGTH)
+    admin_password: str | None = Field(default=None, max_length=accounts.MAX_PASSWORD_LENGTH,
+                                       description="Leave out to get an invitation link instead: the admin then chooses their own password.")
+
+
+class InvitationIn(BaseModel):
+    email: str = Field(max_length=254)
+    name: str = Field(default="", max_length=200)
+    role: str = "viewer"
+
+
+class AcceptIn(BaseModel):
+    password: str = Field(max_length=accounts.MAX_PASSWORD_LENGTH)
+    name: str | None = Field(default=None, max_length=200)
 
 
 def _describe_principal(p: accounts.Principal, organization: str) -> dict:
@@ -141,6 +154,87 @@ async def update_user(user_id: int, body: UserPatch, request: Request):
     return await run_db(_update)
 
 
+@router.post("/users/{user_id}/reset-link", status_code=201)
+async def create_reset_link(user_id: int, request: Request):
+    """A one-time link by which this person chooses a new password. The answer carries
+    its token, this once; hand it to them yourself. It works for a day."""
+    principal = current_principal(request)
+
+    def _link(s):
+        user = accounts.get_user(s, user_id, principal.organization_id)
+        if user is None:
+            raise HTTPException(404, "user not found")
+        try:
+            invitation, token = invitations.reset_link(s, user, by=acting_as(request, "api token"))
+        except accounts.AccountError as e:
+            raise HTTPException(400, str(e)) from None
+        return {**invitations.describe(invitation), "token": token}
+
+    return await run_db(_link)
+
+
+# ----------------------------------------------------------------------------- invitations
+
+
+@router.get("/invitations")
+async def list_invitations(request: Request):
+    """Invitations to join the caller's organization, newest first. Tokens are never listed."""
+    org = current_principal(request).organization_id
+    return await run_db(lambda s: [invitations.describe(i) for i in invitations.list_invitations(s, org)])
+
+
+@router.post("/invitations", status_code=201)
+async def create_invitation(body: InvitationIn, request: Request):
+    """Invite a person to the caller's organization. The answer carries the link's token,
+    this once: hand the link to them yourself. They choose their own password. It works for a week."""
+    org = current_principal(request).organization_id
+
+    def _invite(s):
+        try:
+            invitation, token = invitations.invite(s, org, body.email, name=body.name, role=body.role, by=acting_as(request, "api token"))
+        except accounts.AccountError as e:
+            raise HTTPException(409 if "already has an account" in str(e) else 400, str(e)) from None
+        return {**invitations.describe(invitation), "token": token}
+
+    return await run_db(_invite)
+
+
+@router.delete("/invitations/{invitation_id}")
+async def withdraw_invitation(invitation_id: int, request: Request):
+    """Withdraw an invitation nobody has accepted yet. Its link stops working at once."""
+    org = current_principal(request).organization_id
+
+    def _withdraw(s):
+        try:
+            invitation = invitations.withdraw(s, org, invitation_id)
+        except accounts.AccountError as e:
+            raise HTTPException(400, str(e)) from None
+        if invitation is None:
+            raise HTTPException(404, "no such invitation")
+        return invitations.describe(invitation)
+
+    return await run_db(_withdraw)
+
+
+@public.get("/invitations/{token}")
+async def read_invitation(token: str):
+    """What a one-time link is for, shown to whoever holds it before they choose a
+    password. An unknown, used, withdrawn or expired link is simply not found."""
+    found = await run_db(lambda s: invitations.preview(s, token), unrestricted=True)
+    if found is None:
+        raise HTTPException(404, invitations.GONE)
+    return found
+
+
+@public.post("/invitations/{token}")
+async def accept_invitation(token: str, body: AcceptIn):
+    """Use a one-time link: choose a password, and be signed in. The link stops working."""
+    result = await run_db(lambda s: invitations.accept(s, token, body.password, name=body.name), unrestricted=True)
+    if not result.ok:
+        raise HTTPException(result.status, result.error)
+    return {"token": result.token, "expires_at": result.expires_at, "user": result.user}
+
+
 # ----------------------------------------------------------------------------- organizations (the deployment's operator only)
 
 
@@ -150,11 +244,17 @@ async def list_organizations():
 
 
 @router.post("/organizations", status_code=201)
-async def create_organization(body: OrganizationIn):
-    """A new customer organization and its first admin. The admin then adds everyone else."""
+async def create_organization(body: OrganizationIn, request: Request):
+    """A new customer organization and its first admin, who is created with the password
+    given, or, without one, invited by a link. The admin then adds everyone else."""
 
     def _create(s):
         try:
+            if body.admin_password is None:
+                # Nobody but the admin ever knows their password: they get a link and choose it.
+                org = accounts.create_empty_organization(s, body.name)
+                invitation, token = invitations.invite(s, org.id, body.admin_email, name=body.admin_name, role="admin", by=acting_as(request, "api token"))
+                return {**accounts.describe_organization(s, org), "admin": None, "invitation": {**invitations.describe(invitation), "token": token}}
             org, admin = accounts.create_organization(s, body.name, admin_email=body.admin_email, admin_password=body.admin_password, admin_name=body.admin_name)
         except accounts.AccountError as e:
             raise HTTPException(409 if "already" in str(e) else 400, str(e)) from None

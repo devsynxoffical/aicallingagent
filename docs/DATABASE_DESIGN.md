@@ -254,3 +254,10 @@ not at its version.
 
 Both are tenant tables. See `WEBHOOKS.md`.
 
+## Invitations (migration 0017)
+
+- `invitations`: organization, purpose (CHECK: join, reset), email, name, role
+  (CHECK), the account a reset is for, a SHA-256 of the link's token (unique), who
+  made it, when it expires, when it was used or withdrawn. A tenant table. The token
+  is never stored.
+

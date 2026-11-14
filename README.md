@@ -548,6 +548,12 @@ number and booking webhook (`PUT /api/organization/settings`) and creates API ke
 for their own systems (`POST /api/keys`): a key has a role, is shown once, and is
 sent as `Authorization: Bearer dtk_…`.
 
+People join by invitation: an admin makes a one-time link (`POST /api/invitations`,
+or the Team screen), hands it over, and the person chooses their own password. The
+same kind of link resets a forgotten password (`POST /api/users/{id}/reset-link`).
+This engine sends no email: the admin passes the link on. A new organization can be
+created without a password for its admin, who then gets such a link.
+
 To be told what happens instead of asking, an admin registers webhook endpoints
 (`POST /api/webhooks`): signed deliveries for calls, bookings, campaigns and
 playbooks, retried for about an hour. `docs/WEBHOOKS.md` has the events, the body

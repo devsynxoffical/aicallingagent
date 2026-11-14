@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from callagent import accounts, db, jobs, webhooks
+from callagent.accounts import invitations
 from callagent.config import get_settings, resolve_api_token
 from callagent.db import Appointment, CallRun, Campaign, Job, Lead, UsageRecord, User, WebsiteRequest, session_scope
 from callagent.dialer import lifecycle
@@ -92,7 +93,9 @@ def two(client):
         delivery = db.WebhookDelivery(organization_id=acme_id, endpoint_id=endpoint.id, event_id=None, event_type="ping", status="failed")
         s.add(delivery)
         s.flush()
-        ids = {"endpoint_id": endpoint.id, "delivery_id": delivery.id, "call_run_id": call.id, "job_id": dead.id, "user_id": member["id"], "request_id": request.id, "document_id": document.json()["id"],
+        invitation, _token = invitations.invite(s, acme_id, "newcomer@acme.example", role="viewer", by="boss@acme.example")
+        # A one-time link is opened by whoever holds its token, signed in or not: it names nothing by id.
+        ids = {"invitation_id": invitation.id, "token": "dti_not-a-link-anyone-was-given", "endpoint_id": endpoint.id, "delivery_id": delivery.id, "call_run_id": call.id, "job_id": dead.id, "user_id": member["id"], "request_id": request.id, "document_id": document.json()["id"],
                "lead_id": lead.id, "number": draft.version, "experiment_id": 1, "name": "Acme only", "key_id": key.id, "entry_id": suppressed.id}
     return {"acme": acme, "bolt": bolt, "acme_id": acme_id, "bolt_id": bolt_id, "ids": ids}
 
@@ -113,6 +116,7 @@ def snapshot(acme_id):
             "campaigns": s.execute(select(func.count()).select_from(Campaign).where(Campaign.organization_id == acme_id)).scalar_one(),
             "keys": [(k.id, k.revoked_at) for k in accounts.list_api_keys(s, acme_id)],
             "endpoints": [(e.id, e.url, e.secret, e.active, tuple(e.events)) for e in webhooks.list_endpoints(s, acme_id)],
+            "invitations": [(i.id, i.revoked_at, i.used_at) for i in invitations.list_invitations(s, acme_id)],
             "deliveries": [(d.id, d.status, d.attempts) for d in s.execute(select(db.WebhookDelivery).where(db.WebhookDelivery.organization_id == acme_id)).scalars()],
             "do_not_call": sorted(s.execute(select(db.DoNotCall.phone_e164).where(db.DoNotCall.organization_id == acme_id)).scalars()),
             "settings": dict(s.get(db.Organization, acme_id).settings_json or {}),
@@ -132,6 +136,7 @@ VALID = {
     ("POST", "/api/campaigns/{name}/inbound"): {"params": {"number": "+14155550188"}},
     ("PATCH", "/api/users/{user_id}"): {"json": {"role": "admin", "active": False, "name": "Taken over", "password": "a new long password"}},
     ("POST", "/api/requests/{request_id}/handled"): {"json": {"handled": True}},
+    ("POST", "/api/auth/invitations/{token}"): {"json": {"password": "a new long password"}},
     ("PATCH", "/api/webhooks/{endpoint_id}"): {"json": {"url": "https://tap.bolt.example/acme", "events": ["*"], "active": False}},
 }
 ACME_MARKERS = ["Acme only", "acme.example", "Acme secret", "Acme confidential", "Acme job error", "Acme inbound message", "acme-customer", "Acme draft", "Acme Member", "49 dollars"]
@@ -164,7 +169,8 @@ def test_every_route_refuses_another_organizations_identifiers(client, two):
             continue
         url = re.sub(r"\{(\w+)\}", lambda m: str(two["ids"][m.group(1)]), path)
         own[path] = client.get(url, headers=two["acme"], **VALID.get((method, path), {})).status_code
-    assert {path: status for path, status in own.items() if status != 200} == {"/api/campaigns/{name}/experiments/{experiment_id}": 404, "/api/campaigns/{name}/train": 404}
+    assert {path: status for path, status in own.items() if status != 200} == {"/api/campaigns/{name}/experiments/{experiment_id}": 404, "/api/campaigns/{name}/train": 404,
+                                                                                "/api/auth/invitations/{token}": 404}
 
 
 def test_lists_hold_only_the_callers_organization(client, two):

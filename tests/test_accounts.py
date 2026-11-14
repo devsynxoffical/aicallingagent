@@ -163,7 +163,8 @@ def test_every_api_route_needs_a_sign_in_except_signing_in_itself(client):
         if response.status_code != 401:
             public.append((method, path))
     # Signing in takes a password instead; the website's intake takes its own token and refuses everything else (see test_intake).
-    assert public == [("POST", "/api/auth/login")]
+    # A one-time link is opened and used with its own token, by someone who has no account yet (see test_invitations).
+    assert sorted(public) == [("GET", "/api/auth/invitations/{token}"), ("POST", "/api/auth/invitations/{token}"), ("POST", "/api/auth/login")]
 
 
 def test_each_role_can_do_what_it_is_for_and_nothing_more(client):
@@ -184,7 +185,7 @@ def test_each_role_can_do_what_it_is_for_and_nothing_more(client):
     changes = {(m, p) for m, p in routes if m != "GET" and not p.startswith(("/api/auth/", "/api/users"))}
     # Who has access, and the record of who did what: for admins, reading included.
     # So is where the organization's events are sent.
-    users = {(m, p) for m, p in routes if p.startswith(("/api/users", "/api/audit", "/api/keys", "/api/webhooks"))}
+    users = {(m, p) for m, p in routes if p.startswith(("/api/users", "/api/audit", "/api/keys", "/api/webhooks", "/api/invitations"))}
     assert ("GET", "/api/audit") in users
     # Organizations are managed by the deployment's operator, which no role inside an organization is.
     # So is correcting the usage ledger: that is for whoever bills, not for the organization billed.

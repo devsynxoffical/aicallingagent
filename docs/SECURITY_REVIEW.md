@@ -17,7 +17,9 @@ numbers or email addresses. Backups can be encrypted.
 
 What still stands between this and selling to a second customer:
 
-1. **No password reset by email and no second factor** (A-13).
+1. **No second factor, and no email.** Someone who forgot their password asks an
+   admin for a one-time reset link; an organization whose only admin is locked out
+   asks the deployment's operator (A-13).
 2. **No legal review.** Consent, do-not-call lists, erasure and retention are
    mechanisms an organization configures (`COMPLIANCE.md`); whether a configuration
    satisfies the law of a market has not been checked by anyone qualified.
@@ -31,9 +33,10 @@ What still stands between this and selling to a second customer:
 | Area | State | Evidence or detail |
 | --- | --- | --- |
 | Authentication | Built | Passwords hashed with scrypt and a per-password salt; session tokens are random, stored only as a SHA-256, expire after 12 hours, and end at sign-out or deactivation; the same answer for an unknown email, a wrong password and a deactivated account. `tests/test_accounts.py` |
+| Joining and resetting | Built | A person joins by a one-time link an admin makes and hands over; they choose their own password, so no admin knows another person's. The same kind of link resets a password, and using it ends every sign-in of that account. 256 random bits, stored as a SHA-256; works once; a week to join, a day to reset; withdrawn by an admin, by a newer link for the same person, or by deactivating the account. An unknown, used, withdrawn and expired link get the same answer. A key cannot make one. The link is a bearer credential while it lasts: whoever is handed it gets the account. `tests/test_invitations.py` |
 | Brute force | Partly | An account locks for 15 minutes after 5 wrong passwords. The console limits sign-in attempts per address, keyed on the address its own proxy reports, not one the client can choose. The engine has no limit per address (A-12), so someone can lock a known account out repeatedly |
 | Roles | Built | viewer, operator, admin, decided on the server from the declared route; the console's hiding of buttons is a convenience only. A test calls every route as every role |
-| Organization isolation | Built, two layers | Application: every lookup goes through the caller's organization; another organization's object answers 404. Database: row-level security on 20 tables, forced on the owner too, set per transaction. `tests/test_tenancy.py` calls every addressable route as another organization, on SQLite and on PostgreSQL as an ordinary role; `tests/test_row_level_security.py` runs unfiltered queries against the policies |
+| Organization isolation | Built, two layers | Application: every lookup goes through the caller's organization; another organization's object answers 404. Database: row-level security on 21 tables, forced on the owner too, set per transaction. `tests/test_tenancy.py` calls every addressable route as another organization, on SQLite and on PostgreSQL as an ordinary role; `tests/test_row_level_security.py` runs unfiltered queries against the policies |
 | Row-level security in a deployment | **Depends on the database role** | A superuser or a role with BYPASSRLS is not bound by the policies. `/api/status` reports `enforced`, `bypassed` or `missing`; run the engine as an ordinary role |
 | The operator's token | By design | One static secret for the deployment's operator, compared in constant time. It creates organizations, assigns caller numbers and rates, corrects the ledger, reads metrics, and acts in any organization it names. Set it explicitly, keep it in a secret store, rotate by changing it and restarting |
 | API keys | Built | Per organization, with a role; only a SHA-256 is stored and the key is shown once; revocable at once. A key cannot create keys, manage people or change a password, whatever its role, so a leaked key cannot keep itself alive. What a key does is in the audit trail under its name |
@@ -83,6 +86,8 @@ What still stands between this and selling to a second customer:
 | The ledger is corrected only by the operator, and not across organizations | `test_the_ledger_is_read_by_its_organization_and_corrected_only_by_the_operator` |
 | The limiter's key cannot be chosen by the client; headers are set | console `src/lib/rate-limit.test.ts` |
 | A name that resolves inside the network is never connected to; a public one is connected to at the address that was checked | `test_a_name_that_resolves_inside_the_network_is_never_connected_to`, `test_a_public_name_is_connected_to_at_the_address_that_was_checked` |
+| A link works once; a reset ends every sign-in; a withdrawn, replaced or expired link opens nothing | `tests/test_invitations.py` |
+| The routes open without signing in are exactly: sign-in, and opening and using a one-time link | `test_every_api_route_needs_a_sign_in_except_signing_in_itself` |
 | An event goes only to endpoints of its own organization, signed with that endpoint's secret | `test_an_event_goes_once_signed_to_the_endpoints_of_its_organization_that_asked_for_it` |
 
 ## Before a second customer
@@ -94,7 +99,7 @@ What still stands between this and selling to a second customer:
 
 ## Smaller items
 
-A limit on sign-in attempts per address on the engine (A-12); password reset and a
-second factor (A-13); the API description behind sign-in; a lock file and the scan
+A limit on sign-in attempts per address on the engine (A-12); a
+second factor and a reset the person can start themselves, by email (A-13); the API description behind sign-in; a lock file and the scan
 as a gate; database permissions that forbid changing audit and ledger rows; a
 session for the engine token instead of the token itself in the console's cookie.

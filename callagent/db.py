@@ -453,6 +453,33 @@ class ApiKey(Base):
     __table_args__ = (CheckConstraint("role IN ('admin', 'operator', 'viewer')", name="ck_api_keys_role"),)
 
 
+class Invitation(Base):
+    """A one-time link by which a person sets their own password: to join an
+    organization (``join``) or to get back into their account (``reset``). Only a hash
+    of the link's token is stored, so the table cannot be used to get in."""
+
+    __tablename__ = "invitations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    purpose: Mapped[str] = mapped_column(String(8), default="join")  # join | reset
+    email: Mapped[str] = mapped_column(String(254))
+    name: Mapped[str] = mapped_column(String(200), default="")
+    role: Mapped[str] = mapped_column(String(12), default="viewer")
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)  # whose password a reset link sets
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_by: Mapped[str] = mapped_column(String(254), default="")
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(TZDateTime)
+    used_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("role IN ('admin', 'operator', 'viewer')", name="ck_invitations_role"),
+        CheckConstraint("purpose IN ('join', 'reset')", name="ck_invitations_purpose"),
+    )
+
+
 class WebhookEndpoint(Base):
     """An address of an organization's own system that is told about what happens:
     a call ended, a meeting was booked. Each has its own signing secret."""
@@ -1068,7 +1095,7 @@ def dumps(obj: Any) -> str:
 TENANT_TABLES = (
     "campaigns", "leads", "call_runs", "appointments", "do_not_call", "usage_records", "training_documents", "knowledge_chunks",
     "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events", "ai_usage", "audit_log", "api_keys",
-    "webhook_endpoints", "webhook_deliveries",
+    "webhook_endpoints", "webhook_deliveries", "invitations",
 )
 # Rows of these may belong to no organization (the deployment's own housekeeping and facts).
 _SHARED_WHEN_UNOWNED = ("jobs", "events")
