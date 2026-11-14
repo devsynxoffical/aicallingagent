@@ -24,8 +24,44 @@ still open are carried over here under their original ids (for example C-8, A-1)
 
 ## Summary
 
+69 findings: 9 at P0, 29 at P1, 28 at P2, 3 at P3.
+
 | Area | P0 | P1 | P2 | P3 |
 | --- | --- | --- | --- | --- |
+| A. Organization isolation and access | 6 | 5 | 3 | 1 |
+| B. Calling engine | 2 | 6 | 8 | 1 |
+| C. AI orchestration and knowledge | 0 | 8 | 7 | 1 |
+| D. Database, background jobs and billing | 1 | 6 | 5 | 0 |
+| E. Observability, security surface and deployment | 0 | 4 | 5 | 0 |
+
+The nine P0 findings, in the order they are worked:
+
+1. A-1 to A-6: nothing separates one customer's data from another's.
+2. B-1: slow analysis work can stop live calling.
+3. B-2: a call interrupted by a restart is never finished.
+4. D-1: the usage ledger holds estimates, and only for telephony.
+
+What could not be judged from code alone, and needs real provider credentials: how
+the speech providers behave during an outage and reconnect; the phone provider's
+exact status values and timing; the AI provider's actual rate limits; audio latency
+under concurrent calls.
+
+## Order of work
+
+| Phase | Findings | Why this order |
+| --- | --- | --- |
+| 2. Organization isolation and database integrity | A-1 to A-10, A-14 (part), D-8, D-9 | Everything else attributes work and cost to an organization |
+| 3. Events and background processing | D-10, D-11, C-11/D-7, B-2 | Calling and analysis must not share fate |
+| 4. Calling engine | B-1, B-3 to B-6, B-9 to B-12, B-16 | Reliability of the core |
+| 5. AI orchestration and knowledge | C-1 to C-14 | Safety and cost of the AI workflows |
+| 6. Observability | E-1 to E-3, B-14, C-15 | See failures before customers do |
+| 7. Billing | D-1 to D-3 | Needs organizations (2) and AI usage (5) |
+| 8. Performance | D-4, D-6, C-8 | Measured after the structural fixes |
+| 9. Recovery | E-4 | |
+| 10. Delivery | E-5, E-6, E-7, E-8, E-9, D-5 | |
+| Later, needs decisions or providers | A-11, A-13 (reset, second factor), B-13, B-15, C-13 (embeddings) | |
+
+--- | --- | --- | --- | --- |
 | A. Organization isolation and access | 6 | 5 | 3 | 1 |
 | C. AI orchestration and knowledge | 0 | 8 | 7 | 1 |
 | D. Database, background jobs and billing | 1 | 6 | 5 | 0 |
@@ -245,6 +281,204 @@ belongs to, so nothing is filtered by it.
 - **Fix**: serve the API description to signed-in callers only; keep `/health` to
   "ok" and move detail to the authenticated status route.
 - **Size**: S.
+
+---
+
+## B. Calling engine
+
+Verified as sound and left alone: the call state machine only moves forward, end
+states are final except that the provider's report overrides one the engine
+inferred, and duplicate, late and out-of-order reports are ignored; a lead is
+reserved with a conditional update and a partial unique index, safe across
+processes; a timeout or server error from the phone provider keeps the lead
+reserved (only a clear refusal releases it), the provider client does not retry on
+its own, and reconciliation changes nothing while the provider is unreachable; the
+provider's call id is unique and a repeated inbound webhook reuses the same call;
+all three provider webhooks check the signature; the media socket needs the
+per-call token, a live call and the matching call id; a disconnect cancels the
+pipeline and finalizes the call; idle and session timeouts exist; a failing tool
+never crashes a call; the transcript is saved during the call and never shortened;
+language gaps block campaign start, test dials and inbound assignment.
+
+### B-1 (P0) Live calls share one small thread pool with slow analysis work
+
+- **Now**: every database operation of a live call (socket authorization, tool
+  handlers, transcript saves) and of a provider webhook runs through `run_db` on
+  the default executor, `min(32, CPUs + 4)` threads. The same pool runs the
+  post-call review's model call, website crawls, the coach and language phrasing,
+  some of them while holding a database session, with a ten-minute default timeout.
+- **Weakness / cause**: one pool for work with millisecond deadlines and work that
+  takes minutes. (The earlier audit rated this P2; with the measurements in
+  `LOAD_TEST_RESULTS.md` and the missing timeouts it is P0.)
+- **Scenario**: several calls end while the AI model is slow. Their reviews hold
+  every thread. The provider's "call answered" webhook waits, exceeds the
+  provider's 15 seconds and the call fails; tools and transcript saves on every
+  other live call stall.
+- **Impact**: an analysis slowdown becomes an outage of live calling.
+- **Fix**: a dedicated executor for call-path and webhook database work, a separate
+  bounded one for background work, no model call inside a database session,
+  explicit model timeouts (C-6), and the review moved to the job queue.
+- **Size**: M. **Needs**: nothing.
+- **Done when**: with the background executor completely blocked in a test, a
+  call-path database operation completes in its normal time.
+
+### B-2 (P0) A call cut off by a restart, crash or failed finalize is never finalized
+
+- **Now**: `finalize_call` runs only at the end of the media-socket coroutine, and
+  the review job is enqueued only inside it. The reaper for stale calls skips calls
+  that connected, and runs only from the tick of a running campaign.
+- **Scenario**: a deploy during live calls. Those calls have no outcome and no
+  review; their leads are redialed after the retry delay whatever was said,
+  including people who asked not to be called. In a paused or inbound-only campaign
+  the lead stays "calling" forever and cannot be dialed even manually.
+- **Impact**: lost outcomes, repeat calls to people who already answered, stuck leads.
+- **Fix**: when the stream connects, enqueue a durable "finish this call" job that
+  becomes due after the call's maximum length; normal finalize completes it; if the
+  process died, the job finalizes from the transcript saved so far. The reconciler
+  finalizes ended, connected calls that have no outcome, whatever the campaign's
+  state.
+- **Size**: M. **Needs**: nothing (the transcript is already saved during the call).
+- **Done when**: a test abandons a connected call mid-way and the job later sets an
+  outcome, enqueues the review and releases the lead, in a paused campaign too.
+
+### B-3 (P1) A failed transfer to a person is recorded as successful
+
+- **Now**: `transfer_to_human` marks the call "transferred to human" before asking
+  the provider to transfer.
+- **Scenario**: the provider refuses; the caller stays on a line where the agent has
+  stopped responding, and the lead is marked completed.
+- **Fix**: record the transfer only after the provider accepts it; on failure tell
+  the model so it can apologise and continue.
+- **Size**: S. **Done when**: a refused transfer leaves the call active and unmarked.
+
+### B-4 (P1) The same person can be rung by two campaigns at once
+
+- **Now**: the reservation checks for a live call on the lead row; the same phone
+  number in another campaign is another lead.
+- **Fix**: refuse the reservation while any live call to that number exists in the
+  organization.
+- **Size**: S. **Done when**: two campaigns holding the same number cannot both
+  hold a live call to it.
+
+### B-5 (P1) No stop when a provider is failing
+
+- **Now**: nothing watches for consecutive failures. A speech or model outage makes
+  each answered call silent; it is recorded as "no answer" and the lead is retried.
+- **Scenario**: a revoked key at 9:00; by 9:30 a few hundred people have answered a
+  silent call from the customer's number, several times each.
+- **Impact**: reputation damage and wasted spend, automatically, at scale.
+- **Fix**: a circuit breaker per campaign: after N consecutive calls that connected
+  but produced no agent audio or ended with a pipeline error, the campaign pauses
+  itself with that reason. Provider health probes before dialing come with phase 6.
+- **Size**: M. **Done when**: N simulated silent calls pause the campaign and the
+  pause reason names the cause.
+
+### B-6 (P1) No explicit timeouts on the live path
+
+- **Now**: the live model client has the library default (ten minutes); tool calls
+  can wait the provider's 15 seconds or SQLite's busy timeout; the media socket
+  waits indefinitely for its first messages before any authentication.
+- **Fix**: a short model deadline with a spoken fallback, a tool deadline, and a
+  deadline on the socket handshake.
+- **Size**: S. **Done when**: a socket that sends nothing is closed after the
+  deadline; a model that does not answer produces the fallback line (needs a real
+  call to confirm end to end).
+
+### B-7 (P1) Several processes multiply pacing, limits and budget
+
+Same as D-6. Per-lead duplicates are prevented, but each process runs its own loop,
+so concurrency, daily limits and budget are each exceeded once per process.
+
+### B-8 (P1) No draining on shutdown
+
+Same as E-7. Also the provider's instructions have nothing after the media stream,
+so a caller whose stream ends abnormally hears silence and a hang-up.
+
+### B-9 (P2) One bad call stalls reconciliation
+
+- **Now**: part of the per-call handling in `reconcile_calls` is outside the
+  `try`; adopting a provider call found by number can collide with the unique call
+  id when that call belongs to another record.
+- **Scenario**: the pass raises on the same call every minute and nothing after it
+  is ever reconciled.
+- **Fix**: isolate each call; skip provider ids that are already owned.
+- **Size**: S. **Done when**: a call that raises is skipped and the rest of the
+  batch is processed.
+
+### B-10 (P2) The media socket's claim on a call is not atomic (earlier C-8)
+
+- **Now**: "not yet streamed" is checked in one transaction and set in another.
+- **Fix**: one conditional update that claims the call during authorization.
+- **Size**: S. **Done when**: two simultaneous sockets for one call: exactly one is
+  accepted.
+
+### B-11 (P2) Ended calls can linger as active
+
+- **Now**: finalize sets the end time but not the status; if the provider's final
+  report is lost, or an inbound number has no status callback, the call holds a
+  concurrency slot until the time limit plus five minutes.
+- **Fix**: finalize moves a still-active call to an inferred end state through the
+  state machine (the provider can still correct it).
+- **Size**: S.
+
+### B-12 (P2) An opt-out depends on the model choosing the right tool
+
+- **Now**: if the model logs the outcome "do not call" instead of calling the
+  do-not-call tool, or only the review detects it, the lead is completed but the
+  number is not added to the list, so another campaign can call it.
+- **Fix**: finalize adds the number whenever the outcome is "do not call".
+- **Size**: S. **Done when**: an outcome of "do not call" from either source
+  suppresses the number.
+
+### B-13 (P2) Recording and consent
+
+- **Now**: recording starts when the call is answered, before the spoken
+  disclosure; the disclosure is a prompt instruction and is not verified; an
+  objection ends the call but the recording is neither stopped nor deleted; only a
+  link from the status report is stored; there is no retention period for
+  recordings, transcripts or notes; inbound calls are not recorded.
+- **Impact**: the rules for recording and for AI disclosure differ by country and
+  state. A single global behaviour cannot be compliant everywhere.
+- **Fix**: per-organization, per-market settings (record or not, disclosure
+  wording, retention); stop and delete the recording on objection; a retention job.
+- **Size**: L. **Needs**: A-11. **Not started.**
+
+### B-14 (P2) Latency: what is measured and what is missing
+
+- **Now**: per call, count, median, 95th percentile and maximum of speech-to-text
+  first result, model first token, voice first audio, turn end to first audio, and
+  barge-in; stored at finalize (so lost in B-2).
+- **Missing**: answer to the agent's first audio, call setup time, a per-turn
+  series, tool durations, aggregation across calls, alerts.
+- **Fix**: record the first two per call, and export all of them as metrics (E-2).
+- **Size**: M.
+
+### B-15 (P2) Silent language fallbacks; no provider fallback
+
+- **Now**: a language tag the adapter cannot map is dropped without a word; the
+  silence goodbye falls back to English; saving languages activates the playbook
+  even when the response lists provider gaps (start and inbound assignment are then
+  refused). There is no second provider to fall back to.
+- **Fix**: log every fallback as a warning with the call; a capability-aware
+  fallback only when a second provider is configured that supports the language and
+  streaming mode. Not built: it needs real providers to test.
+- **Size**: M.
+
+### B-16 (P2) No admission control
+
+- **Now**: inbound calls and the total across campaigns are unlimited.
+- **Fix**: a limit on concurrent calls per organization and per deployment; beyond
+  it inbound callers hear a polite message and outbound waits.
+- **Size**: S.
+
+### B-17 (P3) Smaller items
+
+- A repeated final report for an old call can move a lead that is being called
+  again back to "pending" (no second call results).
+- No replay protection on webhooks (handlers are idempotent); switching signature
+  validation off is accepted without a warning.
+- An attempt is counted when the lead is reserved, even if the provider then
+  refuses the call.
 
 ---
 
