@@ -365,6 +365,8 @@ def describe_organization(s: Session, org: Organization) -> dict[str, Any]:
         "created_at": org.created_at.isoformat() if org.created_at else None,
         "users": len(people),
         "active_users": sum(1 for active in people if active),
+        # The caller numbers assigned to it (for the operator, who assigns them).
+        "from_numbers": list(((org.settings_json or {}).get("from_numbers")) or []),
     }
 
 
