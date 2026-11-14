@@ -78,6 +78,18 @@ def upgrade(engine: Engine) -> str:
         return outcome
 
 
+def require_current(engine: Engine) -> None:
+    """Refuse to go on unless the database is at this release's version. Used when
+    migrations are a deploy step of their own (AUTO_MIGRATE=false)."""
+    with engine.connect() as connection:
+        current, head = current_revision(connection), head_revision()
+    if current != head:
+        raise RuntimeError(
+            f"the database is at version {current or 'none (empty or never migrated)'}; this release needs {head}. "
+            "Run `callagent db upgrade` (after a backup), then start again. AUTO_MIGRATE is off, so nothing was changed."
+        )
+
+
 def integrity_problems(connection: Connection) -> list[str]:
     """Rows that break a uniqueness rule, in words. Empty on a healthy database."""
     config = Config()

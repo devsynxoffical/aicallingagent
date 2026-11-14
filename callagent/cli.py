@@ -493,7 +493,7 @@ def db_status():
     head = migrate.head_revision()
     console.print(f"database: {current or 'not tracked yet'}   newest migration: {head}")
     if current != head:
-        console.print("[yellow]Run `callagent db upgrade` (the server also upgrades when it starts).[/yellow]")
+        console.print("[yellow]Run `callagent db upgrade` (the server also upgrades when it starts, unless AUTO_MIGRATE=false).[/yellow]")
 
 
 @db_app.command("upgrade")
@@ -502,7 +502,7 @@ def db_upgrade():
     from .db import get_engine
 
     try:
-        get_engine()
+        get_engine(migrate=True)  # this command is the explicit step, whatever AUTO_MIGRATE says
     except RuntimeError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
@@ -528,29 +528,46 @@ def db_check():
 
 
 @db_app.command("backup")
-def db_backup(to: Path = typer.Option(None, help="Directory to write the backup into. Default: DATA_DIR/backups")):
-    """Copy the database and uploaded files into a new backup directory. Safe while the server runs."""
+def db_backup(
+    to: Path = typer.Option(None, help="Directory to write the backup into. Default: BACKUP_DIR, else DATA_DIR/backups"),
+    keep_days: int = typer.Option(None, help="Afterwards, remove backups older than this many days (the newest three are always kept)."),
+):
+    """Copy the database and uploaded files into a new backup directory. Safe while the
+    server runs. Encrypted when BACKUP_ENCRYPTION_KEY is set."""
     from . import backup
 
     settings = get_settings()
+    destination = to or settings.backup_dir or settings.data_dir / "backups"
     try:
-        path = backup.create_backup(to or settings.data_dir / "backups", settings)
-        manifest = backup.verify_backup(path)
+        path = backup.create_backup(destination, settings)
+        manifest = backup.verify_backup(path, key=backup._key_of(settings))
+        removed = backup.prune_backups(destination, keep_days) if keep_days is not None else []
     except backup.BackupError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
-    console.print(f"[green]Backup written and verified:[/green] {path}")
+    console.print(f"[green]Backup written and verified:[/green] {path}" + (" (encrypted)" if manifest.get("encrypted") else " [yellow](not encrypted: set BACKUP_ENCRYPTION_KEY)[/yellow]"))
     console.print(f"schema {manifest['schema_revision']}, rows: {manifest['rows']}")
+    if removed:
+        console.print(f"Removed {len(removed)} backup(s) older than {keep_days} days.")
     console.print("Copy this directory off this machine: a backup on the same disk does not survive losing the disk.")
+
+
+@db_app.command("backup-key")
+def db_backup_key():
+    """Print a new backup encryption key. Put it in BACKUP_ENCRYPTION_KEY and in a secret
+    store that is not where the backups are: without it, nobody can restore them."""
+    from . import backup
+
+    print(backup.new_key())
 
 
 @db_app.command("verify-backup")
 def db_verify_backup(path: Path):
-    """Check a backup's files against its checksums."""
+    """Check a backup's files against its checksums; with BACKUP_ENCRYPTION_KEY set, also that the key opens it."""
     from . import backup
 
     try:
-        manifest = backup.verify_backup(path)
+        manifest = backup.verify_backup(path, key=backup._key_of(get_settings()))
     except backup.BackupError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
@@ -580,7 +597,33 @@ def serve(host: str = typer.Option(None), port: int = typer.Option(None), reload
     missing = settings.missing_for_calls()
     if missing:
         console.print(f"[yellow]Missing for live calls: {', '.join(missing)}[/yellow]")
-    uvicorn.run("callagent.server:app", host=host or settings.server_host, port=port or settings.server_port, reload=reload)
+    if reload:  # development: restart on change, no draining
+        uvicorn.run("callagent.server:app", host=host or settings.server_host, port=port or settings.server_port, reload=True)
+        return
+
+    class DrainingServer(uvicorn.Server):
+        """On the first stop signal, calls in progress are given time to finish before
+        the server closes their connections. A second signal stops at once."""
+
+        _draining = False
+
+        def handle_exit(self, sig, frame):
+            if self._draining or not self.started:
+                return super().handle_exit(sig, frame)
+            self._draining = True
+            import asyncio
+
+            from . import server as engine
+
+            async def finish():
+                try:
+                    await engine.stop_gracefully()
+                finally:
+                    uvicorn.Server.handle_exit(self, sig, frame)
+
+            asyncio.get_event_loop().create_task(finish())
+
+    DrainingServer(uvicorn.Config("callagent.server:app", host=host or settings.server_host, port=port or settings.server_port, log_config=None)).run()
 
 
 def _api(method: str, path: str, **kwargs):

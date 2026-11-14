@@ -122,3 +122,100 @@ def test_restoring_over_live_data_needs_an_explicit_yes(settings, sample_playboo
     db.reset_engine_for_tests(settings.database_url)
     with db.session_scope() as s:
         assert s.execute(text("SELECT COUNT(*) FROM leads WHERE first_name = 'changed after the backup'")).scalar() == 0
+
+
+# ----------------------------------------------------------------------------- encrypted backups (audit E-4)
+
+
+def test_an_encrypted_backup_restores_into_an_empty_database_with_every_row_and_file(settings, sample_playbook, tmp_path):
+    key = backup.new_key()
+    sealed_settings = settings.model_copy(update={"backup_encryption_key": key})
+    _fill(settings, sample_playbook)
+    path = backup.create_backup(tmp_path / "backups", sealed_settings)
+
+    manifest = backup.verify_backup(path)  # damage can be detected without the key
+    assert manifest["encrypted"] is True and sorted(p.name for p in path.iterdir()) == sorted([*manifest["files"], "manifest.json"])
+    assert all(name.endswith(".enc") for name in manifest["files"])
+    # Nothing readable is left on disk: not a lead's notes, not a transcript, not the uploaded file.
+    for file in path.iterdir():
+        if file.name != "manifest.json":
+            content = file.read_bytes()
+            assert b"pricing document" not in content and "تجربة".encode() not in content and b"bonjour" not in content and b"SQLite format" not in content
+    backup.verify_backup(path, key=backup.parse_key(key))  # and with the key: it opens, and what it opens is what was sealed
+
+    _destroy(settings)
+    restored = backup.restore_backup(path, sealed_settings, replace_existing=True)
+    assert restored["restored_rows"] == manifest["rows"] and manifest["rows"]["leads"] == 25 and manifest["rows"]["call_runs"] == 25
+    db.reset_engine_for_tests(settings.database_url)
+    with db.session_scope() as s:
+        assert s.query(db.Lead).filter(db.Lead.notes == "تجربة – accentué").count() == 25
+    assert (settings.data_dir / "uploads" / "1" / "1" / "7.pdf").read_bytes() == b"%PDF-1.4 the pricing document"
+    assert not list(settings.data_dir.glob(".restore-*")) and not list(settings.data_dir.glob(".uploads-replaced-*"))  # no staging left behind
+
+
+def test_an_encrypted_backup_cannot_be_read_without_its_key_and_fails_before_anything_is_touched(settings, sample_playbook, tmp_path):
+    key = backup.new_key()
+    _fill(settings, sample_playbook)
+    path = backup.create_backup(tmp_path / "backups", settings.model_copy(update={"backup_encryption_key": key}))
+
+    with pytest.raises(backup.BackupError, match="is encrypted"):
+        backup.restore_backup(path, settings, replace_existing=True)
+    with pytest.raises(backup.BackupError, match="not the one it was made with"):
+        backup.restore_backup(path, settings.model_copy(update={"backup_encryption_key": backup.new_key()}), replace_existing=True)
+    with pytest.raises(backup.BackupError, match="not a backup key"):
+        backup.parse_key("hunter2")
+
+    # Both refusals happened in staging: the live data is exactly as it was.
+    db.reset_engine_for_tests(settings.database_url)
+    with db.session_scope() as s:
+        assert s.query(db.Lead).count() == 25
+    assert (settings.data_dir / "uploads" / "1" / "1" / "7.pdf").exists()
+    assert not list(settings.data_dir.glob(".restore-*"))
+
+
+def test_an_encrypted_file_that_was_cut_short_or_changed_is_refused(tmp_path):
+    key = backup.parse_key(backup.new_key())
+    plain, sealed, opened = tmp_path / "plain", tmp_path / "sealed", tmp_path / "opened"
+    plain.write_bytes(os.urandom(3 * (1 << 20) + 12345))  # several pieces and a short last one
+    backup._encrypt_file(plain, sealed, key)
+    backup._decrypt_file(sealed, opened, key)
+    assert opened.read_bytes() == plain.read_bytes()
+
+    whole = sealed.read_bytes()
+    piece = 4 + (1 << 20) + 16  # one sealed piece: its length, the data, the authentication tag
+    for name, damaged in [("cut after the first piece", whole[: 14 + piece]), ("one byte changed", whole[:5000] + bytes([whole[5000] ^ 1]) + whole[5001:]),
+                          ("two pieces swapped", whole[:14] + whole[14 + piece : 14 + 2 * piece] + whole[14 : 14 + piece] + whole[14 + 2 * piece :])]:
+        sealed.write_bytes(damaged)
+        with pytest.raises(backup.BackupError):
+            backup._decrypt_file(sealed, opened, key)
+
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    backup._encrypt_file(empty, sealed, key)
+    backup._decrypt_file(sealed, opened, key)
+    assert opened.read_bytes() == b""
+
+
+def test_old_backups_are_removed_but_never_the_newest_three(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    for days in (40, 30, 20, 10, 1):
+        directory = tmp_path / f"backup-{(now - timedelta(days=days)).strftime('%Y%m%dT%H%M%SZ')}"
+        directory.mkdir()
+        (directory / "manifest.json").write_text("{}")
+    (tmp_path / "not-a-backup").mkdir()
+    removed = backup.prune_backups(tmp_path, keep_days=14)
+    assert len(removed) == 2 and len(backup.list_backups(tmp_path)) == 3 and (tmp_path / "not-a-backup").exists()
+    assert backup.prune_backups(tmp_path, keep_days=0) == []  # even "keep nothing" leaves the newest three
+
+
+def test_a_scheduled_backup_is_taken_when_the_newest_is_too_old_and_not_before(settings, sample_playbook, tmp_path):
+    _fill(settings, sample_playbook)
+    scheduled = settings.model_copy(update={"backup_every_hours": 6, "backup_dir": tmp_path / "scheduled", "backup_encryption_key": backup.new_key()})
+    assert backup.backup_if_due(settings) is None  # not switched on
+    first = backup.backup_if_due(scheduled)
+    assert first is not None and backup.verify_backup(first)["encrypted"] is True
+    assert backup.backup_if_due(scheduled) is None  # one was just taken
+    first.rename(first.with_name("backup-20200101T000000Z"))  # as if it were years old
+    assert backup.backup_if_due(scheduled) is not None

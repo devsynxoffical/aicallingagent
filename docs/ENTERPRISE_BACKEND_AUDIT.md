@@ -63,7 +63,7 @@ Kept current as work lands. A finding not listed here is open.
 | A-9 Inbound number conflict names the owner | Fixed (the disclosure); ownership of numbers still open with A-11 | `test_every_new_row_is_filed_under_its_campaigns_organization` |
 | A-10 One all-powerful API token | Partly: it is now the operator's credential (creates organizations, names the one to act in). Per-organization API keys: open | `test_the_organization_comes_from_the_account_never_from_the_request` |
 | Defence in depth (asked for in the brief) | Added: PostgreSQL row-level security on every tenant table (16 today), migration 0008 | `tests/test_row_level_security.py` runs unfiltered queries as an ordinary role; the whole isolation suite also runs on PostgreSQL with the policies enforced |
-| D-5 Migrations and new databases differ | Partly: an upgraded PostgreSQL database and a new one are compared column by column; rollback of 0007 tested. Migration at start-up and concurrent index builds: open | `test_an_upgraded_database_and_a_new_one_have_the_same_schema`, `test_the_upgrade_can_be_rolled_back_and_applied_again` |
+| D-5 Migrations and new databases differ | Fixed except concurrent index builds: an upgraded database and a new one are compared column by column on both databases; rollbacks of the organization and ledger migrations are tested; with `AUTO_MIGRATE=false` a process refuses a database that is not at its version and changes nothing | `test_an_upgraded_database_and_a_new_one_have_the_same_schema`, `test_with_automatic_migration_off_a_process_refuses_an_out_of_date_database` |
 | D-8 Schema integrity | Partly: CHECK constraints on the four status columns. Missing foreign keys and the appointment time: open | Same migration tests |
 | D-9 Missing indexes | Partly: the three indexes added. Pruning of old jobs and sessions: open | Index names asserted in the migration test |
 
@@ -97,13 +97,22 @@ Kept current as work lands. A finding not listed here is open.
 
 | E-1 Logging not configured | Fixed: JSON lines with request, call, job and organization ids; phone numbers and email addresses masked; the request id is stored on the jobs a request causes. See `OBSERVABILITY.md` | `test_phone_numbers_and_email_addresses_never_reach_the_logs`, `test_a_request_has_an_id_that_is_on_its_log_lines_its_answer_and_the_job_it_caused`, `test_a_jobs_log_lines_carry_the_job_the_request_and_the_call` |
 | C-15 Personal data in logs | Fixed: the voice library is held at warning, client libraries at warning, masking on every line | `test_the_voice_librarys_chatter_stays_out_and_its_warnings_come_through_masked` |
-| E-2 No metrics, empty health check | Fixed: `/health/live`, `/health/ready` (database, schema version, worker), `/metrics` for the operator, 15 alert rules in `ops/`. Error reporting to an external service and dashboards: not built. The rules have not been loaded into a monitoring system | `test_readiness_turns_red_when_the_database_stops_answering`, `test_the_metrics_page_shows_requests_jobs_calls_and_ai_use`, `test_the_shipped_alert_rules_refer_only_to_metrics_that_exist` |
+| E-2 No metrics, empty health check | Fixed: `/health/live`, `/health/ready` (database, schema version, worker), `/metrics` for the operator, 16 alert rules in `ops/`. Error reporting to an external service and dashboards: not built. The rules have not been loaded into a monitoring system | `test_readiness_turns_red_when_the_database_stops_answering`, `test_the_metrics_page_shows_requests_jobs_calls_and_ai_use`, `test_the_shipped_alert_rules_refer_only_to_metrics_that_exist` |
 | E-3, A-13 No audit trail | Fixed for the trail: every attempt to change something through the API and every sign-in on a known account, readable by the organization's admins only. Request bodies are not kept. Password reset by email and a second factor: open | `test_every_attempt_to_change_something_is_recorded_with_who_and_how_it_ended`, `test_the_audit_trail_is_for_an_organizations_admins_and_nobody_elses` |
 | B-14 Latency: what is missing | Partly: the per-call response time is a metric with an alert; per-stage latency stays on the call record | `ops/prometheus-alerts.yml` (`CallsAnswerSlowly`) |
 
 | D-1 The ledger holds estimates, only for telephony | Fixed for the ledger's shape: a line per call and per AI use with quantity, unit, rates applied, currency and basis; corrections only as new lines; the provider's price as a correction (optional). Speech services and text messages are not separate lines; no amount has been compared with an invoice. See `BILLING_ARCHITECTURE.md` | `tests/test_billing.py` on SQLite and PostgreSQL |
 | D-2 Spend read from a floating-point copy | Fixed: spend, the budget and a call's displayed cost are sums of ledger lines | `test_the_engines_figure_is_corrected_by_the_carriers_without_changing_the_first_line`, `test_when_the_carrier_reports_first_the_engines_ending_adds_nothing` |
 | D-3 The budget can be exceeded by manual or concurrent calls | Fixed for outbound calls: checked in the transaction that reserves the lead, with the campaign locked, for every way a call is started. The AI cost of calls in progress is not reserved; inbound calls are never refused | `test_of_many_claims_against_a_budget_that_covers_one_call_exactly_one_is_placed`, `test_what_was_spent_and_what_is_in_progress_both_count_against_the_budget` |
+
+| D-4 Lists and reports load whole tables | Partly: the lead list counts and pages in the database and loads only the page's calls (measured: 8 to about 115 requests per second with 1,600 leads on PostgreSQL). The campaign report, the timeline and the export still load everything | `test_every_filter_of_the_lead_list_gives_what_filtering_everything_by_hand_gives`, `test_a_page_of_leads_costs_the_same_number_of_queries_however_long_the_list` |
+| D-6, B-7 One process does everything; several multiply pacing | Fixed for dialing and reconciliation: a lease in the database decides which process dials; the others serve the API, audio and jobs; a clean stop hands over at once, a crash within the lease time. Running several processes has not been tried outside tests | `tests/test_leader.py` on SQLite and PostgreSQL |
+| E-4 Backups manual, unencrypted, same disk | Fixed except the last: optional AES-256-GCM encryption with tamper detection, a scheduled mode with retention, a restore that stages and checks before it touches anything, a drill on both databases. The engine still does not copy backups off the machine | `tests/test_backup.py` |
+| E-5 Container and compose | Written, not built here (no container daemon in this environment): two-stage build, ordinary user, health check on readiness, PostgreSQL driver and tools, compose with PostgreSQL and a stop grace period. No lock file | CI job `image` builds and runs it |
+| E-6 No continuous integration | Written, not yet run: the engine's tests on SQLite and PostgreSQL, the image build, a dependency scan as a warning; the console's types, unit tests, build and scan. The console's browser tests are not in CI (they need the engine's repository) | `.github/workflows/ci.yml` in both repositories |
+| E-7, B-8 No draining on shutdown | Built: on a stop signal the process stops dialing, reports not ready and waits for its calls up to a limit. Tested with stand-in calls; the signal handling has not been exercised with a real call | `test_stopping_waits_for_calls_in_progress_and_says_not_ready_meanwhile` |
+| E-8 Console: headers, rate limiting, body limits | Partly: security headers including a content policy; the limiter keyed on the address the console's own proxy reports; 1 MB limit on JSON through the proxy. Open: the engine token kept in the cookie when signing in with it; engine error text passed to the browser; the limiter is per process | console `src/lib/rate-limit.test.ts` |
+| E-9 Unbounded uploads on the engine | Fixed: 30 MB limit on any request body, refused before it is read | `test_a_request_body_over_the_limit_is_refused_whether_or_not_it_says_how_large_it_is` |
 
 Found and fixed along the way (not in the audit, caught by the new tests): on SQLite
 a job or event written as the first change of a transaction survived a rollback of
@@ -112,6 +121,29 @@ that transaction (the driver does not open a transaction before a savepoint); th
 before checking whose campaign it was; the migration could not drop PostgreSQL's
 uniqueness constraint on campaign names, and could not add a referencing column on
 SQLite; a new database never received what only a migration creates.
+
+### Still open
+
+Not in the table above means not done. In order of what they block:
+
+| Finding | What it blocks |
+| --- | --- |
+| A-11 Telephony number, transfer number, booking webhook and rates are one set per deployment | A second customer on the same deployment |
+| A-10 API keys per organization | Integrations by a customer |
+| Real provider validation (every B and C finding was tested with stand-ins) | Any production use |
+| A-12 Sign-in attempts limited per address on the engine | A known account can be locked out repeatedly |
+| A-13 Password reset by email, a second factor | Self-service; stronger sign-in |
+| B-13 Recording and consent per market | Launch in each market: a legal decision |
+| B-15 Provider fallback | Deliberately not automatic; a manual switch procedure is not written either |
+| B-16 Admission control across campaigns of a deployment | Protection against too many concurrent calls overall |
+| D-4 (rest) Report, timeline and export in SQL | Large campaigns |
+| D-7 A timed-out job's thread keeps running (other than AI requests) | Wasted work on slow crawls |
+| D-8, D-9 (rest) Missing foreign keys; pruning of old jobs, sessions, events and audit rows | Table growth over months |
+| D-11 (rest) Coach, native phrasing and lead import as queued jobs | Long requests |
+| D-12 Row locks for read-modify-write of JSON columns | Lost updates under concurrency on PostgreSQL |
+| C-10 (rest) A call pinned to the playbook version recorded at dial time | Exact reproduction of a call |
+| C-16, B-17 Smaller items | - |
+| Data retention and erasure | Privacy obligations |
 
 ## Order of work
 

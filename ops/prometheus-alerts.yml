@@ -118,3 +118,10 @@ groups:
         annotations:
           summary: An audit entry could not be written.
           action: The log line "an audit entry could not be written" says which action and by whom.
+      - alert: ScheduledBackupFailing
+        expr: increase(callagent_backup_failures_total[6h]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: A scheduled backup failed.
+          action: The log line "the scheduled backup failed" has the reason. Take one by hand (callagent db backup) once it is fixed.
+

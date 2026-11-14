@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from sqlalchemy import select
 from fastapi.testclient import TestClient
 
 from callagent import db
@@ -303,3 +304,81 @@ def test_timeline_counts_calls_per_day_with_no_gaps_and_nothing_invented(client)
     assert sum(d["answered"] for d in days) == 3 and sum(d["conversions"] for d in days) == 2
     assert sum(1 for d in days if d["calls"] == 0) >= 5  # quiet days are zeros, not missing and not filled in
     assert len(http.get("/api/timeline?days=500", headers=headers).json()["days"]) == 90  # capped
+
+
+# ----------------------------------------------------------------------------- the lead list pages in the database (audit D-4)
+
+
+def _many_leads(n: int) -> None:
+    with db.session_scope() as s:
+        c = db.get_campaign_by_name(s, "q4")
+        for i in range(n):
+            lead = db.Lead(campaign_id=c.id, phone_e164=f"+1415888{i:04d}", first_name=["Maria", "Tom", "Ana", "Omar"][i % 4], last_name=f"L{i}",
+                           company=["Clinic North", "Taylor & Co", ""][i % 3], status=["completed", "pending", "callback"][i % 3])
+            s.add(lead)
+            s.flush()
+            if i % 5 != 0:  # one in five was never reviewed: unscored
+                apply_evidence(lead, {"fits_target_customer": "yes" if i % 2 else "no", "has_need": "yes" if i % 3 else "unknown", "decision_maker": "yes" if i % 4 == 1 else "unknown",
+                                      "timeline": "now" if i % 7 == 1 else "unknown"})
+            for attempt in range(i % 3):  # none, one or two calls, the last one deciding the buying intent
+                s.add(db.CallRun(lead_id=lead.id, campaign_id=c.id, status="completed", disposition="not_interested", stream_connected=True,
+                                 transcript=[{"role": "user", "text": "x" * 500}], summary={"review": _review(buying_intent_score=(i * 13 + attempt * 31) % 101)}))
+
+
+def test_every_filter_of_the_lead_list_gives_what_filtering_everything_by_hand_gives(client):
+    from callagent.intelligence.api import _lead_row
+
+    _many_leads(60)
+    with db.session_scope() as s:  # the reference: every lead with all its calls, filtered here the plain way
+        c = db.get_campaign_by_name(s, "q4")
+        leads = s.execute(select(db.Lead).where(db.Lead.campaign_id == c.id).order_by(db.Lead.score.desc().nulls_last(), db.Lead.id)).scalars().all()
+        everything = [_lead_row(lead, list(s.execute(select(db.CallRun).where(db.CallRun.lead_id == lead.id).order_by(db.CallRun.id)).scalars())) for lead in leads]
+
+    def by_hand(category=None, status=None, intent=None, min_score=None, max_score=None, q=None):
+        rows = []
+        for row in everything:
+            if category and row["category"] != category or status and row["status"] != status or intent and row["buying_intent"] != intent:
+                continue
+            if min_score is not None and (row["score"] is None or row["score"] < min_score) or max_score is not None and (row["score"] is None or row["score"] > max_score):
+                continue
+            if q and q.strip().lower() not in f"{row['name']} {row['company']} {row['phone']}".lower():
+                continue
+            rows.append(row)
+        return rows
+
+    cases = [{}, {"status": "callback"}, {"category": "hot"}, {"category": "cold"}, {"category": "unscored"}, {"intent": "high"}, {"intent": "low"}, {"min_score": 40}, {"max_score": 39},
+             {"min_score": 20, "max_score": 60}, {"q": "maria"}, {"q": "Taylor &"}, {"q": "8880012"}, {"q": " OMAR l1"}, {"status": "completed", "intent": "medium"},
+             {"category": "warm", "q": "clinic", "min_score": 10}, {"intent": "high", "category": "hot", "status": "pending"}, {"q": "nobody by this name"}]
+    for filters in cases:
+        expected = by_hand(**filters)
+        answer = client.get("/api/campaigns/q4/leads", params={**filters, "limit": 200}).json()
+        assert answer["total"] == len(expected), filters
+        assert answer["leads"] == expected, filters  # the same leads, in the same order, with the same details
+        page = client.get("/api/campaigns/q4/leads", params={**filters, "limit": 7, "offset": 5}).json()
+        assert (page["total"], page["leads"]) == (len(expected), expected[5:12]), filters
+
+
+def test_a_page_of_leads_costs_the_same_number_of_queries_however_long_the_list(client):
+    from sqlalchemy import event
+
+    def queries_for(params) -> int:
+        seen = []
+
+        def count(_conn, _cursor, statement, *_rest):
+            seen.append(statement)
+
+        engine = db.get_engine()
+        event.listen(engine, "before_cursor_execute", count)
+        try:
+            assert client.get("/api/campaigns/q4/leads", params=params).status_code == 200
+        finally:
+            event.remove(engine, "before_cursor_execute", count)
+        return len(seen)
+
+    _many_leads(20)
+    small = {name: queries_for(params) for name, params in (("page", {"limit": 10}), ("search", {"q": "maria", "limit": 10}), ("intent", {"intent": "high", "limit": 10}))}
+    with db.session_scope() as s:  # ten times the list
+        c = db.get_campaign_by_name(s, "q4")
+        s.add_all([db.Lead(campaign_id=c.id, phone_e164=f"+1415999{i:04d}", first_name="Extra", status="pending") for i in range(200)])
+    large = {name: queries_for(params) for name, params in (("page", {"limit": 10}), ("search", {"q": "maria", "limit": 10}), ("intent", {"intent": "high", "limit": 10}))}
+    assert large == small and max(small.values()) <= 6, (small, large)

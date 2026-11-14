@@ -127,10 +127,11 @@ async def reconcile_calls(settings: Settings | None = None, provider=twilio_clie
     return counts
 
 
-async def reconcile_forever(interval_seconds: float = 60) -> None:
+async def reconcile_forever(interval_seconds: float = 60, should_run=lambda: True) -> None:
     while True:
         try:
-            await reconcile_calls()
+            if should_run():  # with several processes, only the one that leads asks the provider
+                await reconcile_calls()
         except asyncio.CancelledError:
             raise
         except Exception:

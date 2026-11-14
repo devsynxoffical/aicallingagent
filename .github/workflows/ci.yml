@@ -1,0 +1,65 @@
+name: engine
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: callagent_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+          pip install -e ".[dev,postgres]" pyyaml
+      - name: The code compiles and imports
+        run: |
+          python -m compileall -q callagent
+          python -c "import callagent.server"
+      # Runs on SQLite, where the application's own checks are the only protection.
+      - name: Tests on SQLite
+        run: python -m pytest -q
+      # Runs again on PostgreSQL as an ordinary role: row-level security, real locks,
+      # the migration from the previous release, and the backup and restore drill.
+      - name: Tests on PostgreSQL
+        env:
+          TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/callagent_test
+          PGPASSWORD: postgres
+        run: python -m pytest -q
+      - name: Known vulnerabilities in dependencies
+        run: |
+          pip install pip-audit
+          pip-audit --skip-editable || echo "::warning::pip-audit reported findings; review them"
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: The image builds and runs as an ordinary user
+        run: |
+          docker build -t callagent:ci .
+          test "$(docker run --rm callagent:ci id -u)" != "0"
+          docker run --rm callagent:ci callagent --help > /dev/null

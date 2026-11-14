@@ -159,6 +159,8 @@ class Lead(Base):
         Index("uq_leads_campaign_phone", "campaign_id", "phone_e164", unique=True),
         # The dialer's "who is due next" query.
         Index("ix_leads_due", "campaign_id", "status", "next_attempt_at"),
+        # "Is this person on a call from another campaign of ours right now", asked before every dial.
+        Index("ix_leads_org_phone", "organization_id", "phone_e164"),
         CheckConstraint("status IN ('pending', 'queued', 'calling', 'completed', 'callback', 'failed', 'dnc')", name="ck_leads_status"),
     )
 
@@ -608,6 +610,19 @@ class Event(Base):
     __table_args__ = (Index("uq_events_key", "key", unique=True),)
 
 
+class Lease(Base):
+    """Who currently holds a job that only one process may do (running the dial loops,
+    asking the provider about quiet calls). A holder renews before ``expires_at``; when
+    it stops renewing, another process takes over after that moment."""
+
+    __tablename__ = "leases"
+
+    name: Mapped[str] = mapped_column(String(40), primary_key=True)
+    holder: Mapped[str] = mapped_column(String(120))
+    expires_at: Mapped[datetime] = mapped_column(TZDateTime)
+    acquired_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+
 class JobAttempt(Base):
     """History: one row per time a job was run, with how it ended."""
 
@@ -691,16 +706,22 @@ def _configure_sqlite(engine) -> None:
 _SQLITE_NO_BEGIN = ("SELECT", "PRAGMA", "BEGIN", "COMMIT", "ROLLBACK", "EXPLAIN", "WITH")
 
 
-def get_engine(database_url: str | None = None):
+def get_engine(database_url: str | None = None, *, migrate: bool | None = None):
+    """The engine, created on first use. ``migrate`` overrides AUTO_MIGRATE (the
+    `callagent db upgrade` command always migrates)."""
     global _engine, _SessionLocal
     if _engine is None:
-        from .migrate import upgrade
+        from .migrate import require_current, upgrade
 
-        url = database_url or get_settings().database_url
+        settings = get_settings()
+        url = database_url or settings.database_url
         engine = create_engine(url, future=True, **_engine_options(url))
         if url.startswith("sqlite"):
             _configure_sqlite(engine)
-        upgrade(engine)
+        if settings.auto_migrate if migrate is None else migrate:
+            upgrade(engine)
+        else:
+            require_current(engine)
         bootstrap_organizations(engine)
         _SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
         _engine = engine
@@ -774,13 +795,25 @@ def _default_organization_id_in_flush(session: Session) -> int:
     return found
 
 
+_default_organization: int | None = None  # the default organization's id never changes once it exists; forgotten when the engine is replaced
+
+
 def default_organization_id(s: Session) -> int:
+    global _default_organization
     org = s.execute(select(Organization).where(Organization.name == DEFAULT_ORGANIZATION)).scalar_one_or_none()
     if org is None:
         org = Organization(name=DEFAULT_ORGANIZATION)
         s.add(org)
         s.flush()
+        return org.id  # not remembered until it is committed and read back
+    _default_organization = org.id
     return org.id
+
+
+def known_default_organization() -> int | None:
+    """The default organization's id if this process has already read it, without a
+    database round trip. Every request made with the engine's API token needs it."""
+    return _default_organization
 
 
 def campaign_organization_id(s: Session, campaign: "Campaign") -> int:
@@ -823,11 +856,12 @@ def add_missing_columns(conn) -> list[str]:
 
 
 def reset_engine_for_tests(database_url: str) -> None:
-    global _engine, _SessionLocal
+    global _engine, _SessionLocal, _default_organization
     if _engine is not None:
         _engine.dispose()
     _engine = None
     _SessionLocal = None
+    _default_organization = None
     get_engine(database_url)
 
 

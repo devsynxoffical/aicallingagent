@@ -323,3 +323,92 @@ def test_the_shipped_alert_rules_refer_only_to_metrics_that_exist():
     defined = {metric.name for metric in observability.REGISTRY.collect()}
     for name in set(re.findall(r"callagent_[a-z_]+", " ".join(rule["expr"] for rule in rules))):
         assert re.sub(r"_(total|bucket|count|sum)$", "", name) in defined or name in defined, name
+
+
+# ----------------------------------------------------------------------------- limits and stopping (audit E-7, E-9, D-5)
+
+
+def test_a_request_body_over_the_limit_is_refused_whether_or_not_it_says_how_large_it_is():
+    from fastapi import FastAPI, Request
+
+    app = FastAPI()
+    read = []
+
+    @app.post("/upload")
+    async def upload(request: Request):
+        body = await request.body()
+        read.append(len(body))
+        return {"bytes": len(body)}
+
+    app.add_middleware(observability.BodyLimit, max_bytes=1024)
+    with TestClient(app) as client:
+        assert client.post("/upload", content=b"x" * 1024).json() == {"bytes": 1024}  # at the limit: fine
+        too_large = client.post("/upload", content=b"x" * 1025)
+        assert too_large.status_code == 413 and "larger than" in too_large.json()["detail"]
+
+        def pieces():  # no Content-Length: the size is only known as it arrives
+            for _ in range(8):
+                yield b"y" * 400
+
+        streamed = client.post("/upload", content=pieces())
+        assert streamed.status_code == 413
+    assert read == [1024]  # the oversized bodies never reached the application whole
+
+
+def test_the_engine_has_a_body_limit_in_front_of_every_route(client):
+    assert any(m.cls is observability.BodyLimit for m in client.app.user_middleware)
+    limit = next(m for m in client.app.user_middleware if m.cls is observability.BodyLimit).kwargs["max_bytes"]
+    assert limit == 30 * 1024 * 1024  # above the 25 MB a document may be, below anything that could fill a disk
+
+
+async def test_stopping_waits_for_calls_in_progress_and_says_not_ready_meanwhile(client, monkeypatch):
+    import asyncio
+
+    from callagent import server
+
+    monkeypatch.setenv("SHUTDOWN_DRAIN_SECONDS", "5")
+    get_settings.cache_clear()
+    monkeypatch.setattr(server, "leadership", None)
+    observability.active_calls.update({41, 42})
+    try:
+        stopping = asyncio.create_task(server.stop_gracefully())
+        await asyncio.sleep(0.2)
+        assert not stopping.done()  # two calls are on the line: it waits
+        not_ready = await asyncio.to_thread(client.get, "/health/ready")
+        assert not_ready.status_code == 503 and "finishing calls in progress" in not_ready.json()["checks"]["accepting"]
+        observability.active_calls.clear()  # both callers hung up
+        assert await asyncio.wait_for(stopping, 5) == 0
+    finally:
+        observability.active_calls.clear()
+        observability.draining = False
+
+    observability.active_calls.add(7)
+    try:
+        assert await observability.drain(0.3, poll=0.05) == 1  # the wait ran out with a call still up: reported, not hidden
+    finally:
+        observability.active_calls.clear()
+
+
+def test_with_automatic_migration_off_a_process_refuses_an_out_of_date_database(tmp_path, monkeypatch):
+    from sqlalchemy import text
+
+    from callagent import migrate
+
+    url = f"sqlite:///{tmp_path / 'old.db'}"
+    db.reset_engine_for_tests(url)  # a database at this release's version
+    with db.get_engine().begin() as connection:
+        connection.execute(text("UPDATE alembic_version SET version_num = '0009'"))  # as if left behind by an older release
+
+    monkeypatch.setenv("AUTO_MIGRATE", "false")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match=r"is at version 0009; this release needs \d+\. Run `callagent db upgrade`"):
+            db.reset_engine_for_tests(url)
+        engine = db.create_engine(url)
+        with engine.connect() as connection:
+            assert migrate.current_revision(connection) == "0009"  # refused, and nothing was changed
+        engine.dispose()
+    finally:
+        monkeypatch.delenv("AUTO_MIGRATE")
+        get_settings.cache_clear()
+        db.reset_engine_for_tests(f"sqlite:///{tmp_path / 'after.db'}")

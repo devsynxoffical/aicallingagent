@@ -510,11 +510,42 @@ callagent db restore PATH      # stop the server first
 - **Booking notifications** are signed when `BOOKING_WEBHOOK_SECRET` is set
   (`X-Callagent-Signature: sha256=<HMAC-SHA256 of the body>`) and carry the same
   `X-Callagent-Delivery` id on every retry, so your endpoint can ignore repeats.
-- **One process per database** for now: a second process would run a second dial loop.
-  People still cannot be rung twice, but pacing and concurrency limits would double.
-- Where things stand, and what is not done: `docs/PRODUCTION_READINESS.md`. Design and
-  procedures: `docs/DATABASE_DESIGN.md`, `docs/RELIABILITY_PLAN.md`,
-  `docs/SECURITY_REVIEW.md`, `docs/DISASTER_RECOVERY.md`, `docs/LOAD_TEST_RESULTS.md`.
+- **Several processes on one database** are safe: one of them dials (a lease in the
+  database, handed over when that process stops) and all of them serve the API, the
+  audio of calls and background jobs. This has been tested, not yet run in a deployment.
+- **Seeing what happens.** Logs are JSON lines with the request, call and job each
+  line belongs to, with phone numbers and email addresses masked. `/health/live` and
+  `/health/ready` for probes; `/metrics` (Prometheus) for the operator; alert rules in
+  `ops/prometheus-alerts.yml`. `GET /api/audit` lists who changed what.
+- **What it costs.** `GET /api/usage` is the usage ledger (time-based cost per call,
+  AI use, corrections); `GET /api/ai-usage` is AI use by workflow and model. These
+  are measurements at configured rates and list prices, not invoices.
+- **Backups.** `callagent db backup`, encrypted when `BACKUP_ENCRYPTION_KEY` is set
+  (`callagent db backup-key` makes one), on a schedule with `BACKUP_EVERY_HOURS`.
+  Copying them off the machine is yours to arrange.
+- **Stopping.** `callagent serve` waits for calls in progress when it is told to
+  stop (`SHUTDOWN_DRAIN_SECONDS`). Give your process manager a longer grace period.
+
+### Where things stand
+
+**No part of this has handled a real phone call.** It was built and tested without
+provider credentials; every provider in the tests is a stand-in. Read
+`docs/PRODUCTION_READINESS.md` before relying on anything here.
+
+| Document | What it covers |
+| --- | --- |
+| `docs/PRODUCTION_READINESS.md` | What is verified, what is only built, what is blocked, what is not done |
+| `docs/ENTERPRISE_BACKEND_AUDIT.md` | The audit: every finding, its status and the test that shows it |
+| `docs/ENTERPRISE_ARCHITECTURE.md` | Modules, their boundaries, how it scales |
+| `docs/DATABASE_DESIGN.md` | Tables, rules the database enforces, migrations, organizations |
+| `docs/EVENT_ARCHITECTURE.md` | The event log and background job queues |
+| `docs/CALLING_ENGINE_RELIABILITY.md` | How a call stays correct when something fails |
+| `docs/AI_ORCHESTRATION.md` | How the AI model is used, bounded and metered |
+| `docs/BILLING_ARCHITECTURE.md` | The usage ledger and budgets |
+| `docs/OBSERVABILITY.md` | Logs, health, metrics, alerts, audit trail |
+| `docs/SECURITY_REVIEW.md` | Security by area, and what is open |
+| `docs/PERFORMANCE_TESTING.md`, `docs/LOAD_TEST_RESULTS.md` | What was measured, how, and the numbers |
+| `docs/DISASTER_RECOVERY.md` | Backups, restoring, stopping and starting |
 
 ## Tests
 

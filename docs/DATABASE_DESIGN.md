@@ -207,3 +207,19 @@ line replaces the unique (call, kind) index; `quantity`, `unit`, `currency`, `ba
 refers to the line a correction corrects; `campaign_id` and `call_run_id` may be
 empty. Existing lines are given their key and keep their amounts. The downgrade is
 refused while corrections or AI lines exist.
+
+## Leases and one more index (migration 0013)
+
+- `leases`: one row per job that only one process may do (today: `dialer`), with its
+  holder and expiry. Not a tenant table: it holds no customer data. Taking and
+  renewing a lease is one conditional `UPDATE`, so two processes asking at the same
+  moment cannot both hold it.
+- `ix_leads_org_phone` on leads (organization, phone): the check made before every
+  dial that the same number is not on a call from another campaign of the
+  organization. On a large, busy PostgreSQL database build it beforehand with
+  `CREATE INDEX CONCURRENTLY` under that name; the migration then finds it and does
+  nothing.
+
+With `AUTO_MIGRATE=false`, none of these run when a process starts: `callagent db
+upgrade` applies them, and a process refuses to start against a database that is
+not at its version.

@@ -11,12 +11,13 @@ it says so. The findings that drive the planned changes are in
                │  server-side proxy, session cookie
                ▼
  phone ◄──► phone provider ──webhooks, audio stream──► calling engine (this repository)
- provider                                              one Python process:
+ provider                                              one or more Python processes, each:
                                                          HTTP API (FastAPI)
                                                          media WebSocket, one voice pipeline per call
-                                                         dial loop per running campaign
                                                          background job worker
-                                                         call reconciler
+                                                       and in exactly one of them (a lease):
+                                                         dial loop per running campaign
+                                                         call reconciler, scheduled backups
                                                               │
                                                               ▼
                                                         PostgreSQL (or SQLite for one machine)
@@ -32,8 +33,9 @@ same code when load requires it (section 6): background workers, and later the v
 pipeline.
 
 The database is the source of truth for everything: call state, jobs, events, the
-usage ledger. There is no message broker and no cache. Neither is introduced until a
-measurement shows the database queue or a query is the bottleneck.
+usage ledger, and which process dials. There is no message broker and no cache.
+Neither is introduced until a measurement shows the database queue or a query is the
+bottleneck (`PERFORMANCE_TESTING.md`).
 
 ## 2. Modules today
 
@@ -61,7 +63,10 @@ packages; "lazy" means imported inside a function).
 | `jobs` | 384 | Durable queue in the database: queues, priority, fairness, lease, retry, dead letter | db |
 | `events` | 132 | Durable event log written with the change; one job per consumer | db, jobs |
 | `background` | 307 | Job handlers and worker start/stop | jobs; handlers' modules (lazy) |
-| `backup` | 206 | Backup, verify, restore | config |
+| `billing` | 215 | The usage ledger: lines, corrections, spend, summaries | db, events |
+| `observability` | 402 | Log format and masking, request ids, metrics, readiness, audit entries, body limit, draining | db (lazy) |
+| `leader` | 132 | The lease that decides which process dials | db |
+| `backup` | 385 | Backup (optionally encrypted), verify, staged restore, retention, schedule | config |
 | `cli` | 927 | Command line | most modules |
 | `languages` | 133 | Language codes and detection | - |
 
@@ -90,7 +95,7 @@ area marked *absent* has no code today.
 | Users and permissions | `accounts` (three roles, policy by route) | Built, per organization |
 | Calling engine | `dialer`, `server` (webhooks) | Built. See `CALLING_ENGINE_RELIABILITY.md` |
 | Call session | `voice` | Built |
-| Campaign engine | `dialer.campaign_runner`, `dialer.rules` | Built; single process (D-6) |
+| Campaign engine | `dialer.campaign_runner`, `dialer.rules`, `leader` | Built; with several processes, one dials |
 | Lead management | `leads`, `intelligence.scoring` | Built |
 | AI orchestration | `llm`; `voice.llm_service` for the live conversation | Built: deadlines, bounded retries, concurrency limit, usage and cost records. See `AI_ORCHESTRATION.md` |
 | Speech providers | `providers` | Built, with capability checks; no health checks, no automatic fallback (deliberate) |
@@ -102,9 +107,9 @@ area marked *absent* has no code today.
 | Calendar integrations | booking webhook only (`voice.tools`, `background`) | Minimal |
 | CRM integrations | - | *Absent* |
 | Notifications | text message from a call (`voice.tools`) | Minimal |
-| Billing and usage | `dialer.lifecycle` (ledger), `dialer.rules` (spend, budget), `llm` (AI usage) | Telephony cost is an estimate from configured rates (D-1); AI usage is recorded but not yet in the ledger |
-| Analytics and reporting | `intelligence.report`, routes in `server` | Built; in-memory (D-4) |
-| Monitoring and audit | - | *Absent* (E-1 to E-3) |
+| Billing and usage | `billing` (ledger), `dialer.rules` (budget), `llm` (AI usage) | Built as a ledger of measured usage with corrections, and budgets enforced from it. No invoices, payments or balances. See `BILLING_ARCHITECTURE.md` |
+| Analytics and reporting | `intelligence.report`, routes in `server` | Built; the lead list pages in the database, the report is still computed in memory (D-4) |
+| Monitoring and audit | `observability` | Built: structured logs, health, metrics, alert rules, audit trail. No dashboards, no external error reporting. See `OBSERVABILITY.md` |
 
 ## 4. Rules between modules
 
@@ -159,15 +164,19 @@ socket as above.
 with a timeout → done, or retried with backoff, or dead after the attempt limit →
 every attempt is recorded → a dead job can be retried by hand.
 
-## 6. Scaling plan (not built unless stated)
+## 6. Scaling
 
-| Part | Today | When it becomes the limit | Change |
+What exists, what was measured, and what the next step is when a part becomes the
+limit. Nothing here has been run on more than one machine.
+
+| Part | Today | When it becomes the limit | Next step |
 | --- | --- | --- | --- |
-| API | In the one process | CPU or thread pool saturation by reads (measured: `LOAD_TEST_RESULTS.md`) | SQL-side filtering and paging (D-4), then several API instances behind a load balancer; needs D-6 first |
-| Dial loop, reconciler | In the one process | More than one instance must run | Leader lease in the database (D-6) |
-| Background workers | In the one process: four queues with their own limits, on their own thread pool | Analysis backlog, or CPU-heavy parsing affecting calls | A worker-only process from the same image |
-| Voice pipelines | In the one process, one event loop | Audio latency under concurrent calls (not yet measured: needs provider credentials) | Several call-serving instances; the provider's media socket already reaches whichever instance the webhook named |
-| Database | One PostgreSQL | Connection or query limits | Pooler, read replica for reports, partition `call_runs` by month only when its size is measured to hurt |
+| API | Every process serves it | CPU, or the report endpoint on large campaigns (measured: `LOAD_TEST_RESULTS.md`) | More processes behind a load balancer (built for: the lease below); the report in SQL (D-4) |
+| Dial loops, reconciler, scheduled backups | In the one process that holds the lease; another takes over when it stops | Not expected: pacing is by design | - |
+| Background workers | In every process: four queues with their own limits, on their own thread pool; a job is leased to one worker | Analysis backlog, or CPU-heavy parsing next to calls | A worker-only process from the same image (not built: every process also serves the API) |
+| Voice pipelines | In whichever process the provider's media connection reaches, one event loop per process | Audio latency under concurrent calls. **Not measured: needs provider credentials** | More processes; the ceiling per process comes from the real-call ramp in `PERFORMANCE_TESTING.md` |
+| AI requests outside calls | A limit per process (default 2 at once) | The provider's rate limit shared with live calls | A limit shared across processes; batch pricing for reviews |
+| Database | One PostgreSQL | Connections or query time | A pooler, a read replica for reports, partitioning `call_runs` by month only when its size is measured to hurt |
 
 ## 7. Decisions
 

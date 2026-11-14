@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..apideps import acting_as, get_campaign, require_api_token
 from ..config import Settings, get_settings
@@ -93,30 +93,53 @@ async def list_leads(
 
     def _list(s):
         c = get_campaign(s, name)
-        leads = s.execute(select(Lead).where(Lead.campaign_id == c.id).order_by(Lead.score.desc().nulls_last(), Lead.id)).scalars().all()
-        runs_by_lead: dict[int, list[CallRun]] = {}
-        for run in s.execute(select(CallRun).where(CallRun.campaign_id == c.id).order_by(CallRun.id)).scalars():
-            runs_by_lead.setdefault(run.lead_id, []).append(run)
-        needle = (q or "").strip().lower()
-        rows = []
-        for lead in leads:
-            row = _lead_row(lead, runs_by_lead.get(lead.id, []))
-            if category and row["category"] != category:
-                continue
-            if status and row["status"] != status:
-                continue
-            if intent and row["buying_intent"] != intent:
-                continue
-            if min_score is not None and (row["score"] is None or row["score"] < min_score):
-                continue
-            if max_score is not None and (row["score"] is None or row["score"] > max_score):
-                continue
-            if needle and needle not in f"{row['name']} {row['company']} {row['phone']}".lower():
-                continue
-            rows.append(row)
         size = max(1, min(limit, 200))
         start = max(0, offset)
-        return {"total": len(rows), "limit": size, "offset": start, "leads": rows[start : start + size]}
+        needle = (q or "").strip().lower()
+        # What the database can decide, it decides: the status and the score range.
+        matching = select(Lead).where(Lead.campaign_id == c.id)
+        if status:
+            matching = matching.where(Lead.status == status)
+        if min_score is not None:
+            matching = matching.where(Lead.score >= min_score)
+        if max_score is not None:
+            matching = matching.where(Lead.score <= max_score)
+        ordered = matching.order_by(Lead.score.desc().nulls_last(), Lead.id)
+
+        if not (category or intent or needle):
+            # The common case, a page of the list: count and page in the database.
+            total = int(s.execute(select(func.count()).select_from(matching.subquery())).scalar() or 0)
+            page = list(s.execute(ordered.limit(size).offset(start)).scalars())
+        else:
+            # These three are read from stored JSON or from several columns together.
+            # They are applied here, on the leads alone (small rows), never on their calls.
+            leads = list(s.execute(ordered).scalars())
+            if needle:
+                leads = [lead for lead in leads if needle in f"{lead.full_name} {lead.company} {lead.phone_e164}".lower()]
+            if category:
+                leads = [lead for lead in leads if ((lead.score_details or {}).get("category", "unscored") if lead.score is not None else "unscored") == category]
+            if intent:
+                # A lead's buying intent is in the review of its latest reviewed call: fetch the reviews, not the transcripts.
+                latest: dict[int, int | None] = {}
+                reviews = select(CallRun.lead_id, CallRun.summary).where(CallRun.campaign_id == c.id).order_by(CallRun.id)
+                for lead_id, summary in s.execute(reviews):
+                    review = (summary or {}).get("review")
+                    if review:
+                        latest[lead_id] = review.get("buying_intent_score")
+
+                def level(score: int | None) -> str | None:
+                    return None if score is None else ("high" if score >= 70 else "medium" if score >= 40 else "low")
+
+                leads = [lead for lead in leads if level(latest.get(lead.id)) == intent]
+            total = len(leads)
+            page = leads[start : start + size]
+
+        # Only the calls of the leads on this page are loaded in full.
+        runs_by_lead: dict[int, list[CallRun]] = {}
+        if page:
+            for run in s.execute(select(CallRun).where(CallRun.lead_id.in_([lead.id for lead in page])).order_by(CallRun.id)).scalars():
+                runs_by_lead.setdefault(run.lead_id, []).append(run)
+        return {"total": total, "limit": size, "offset": start, "leads": [_lead_row(lead, runs_by_lead.get(lead.id, [])) for lead in page]}
 
     return await run_db(_list)
 

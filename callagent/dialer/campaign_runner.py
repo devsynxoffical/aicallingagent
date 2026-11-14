@@ -77,12 +77,15 @@ def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: b
     from ..intelligence import experiments
 
     s.refresh(lead)
-    # The campaign row is locked from here to the end of the transaction, so two claims
-    # against the same budget are decided one after the other, whoever makes them.
-    campaign = s.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update()).scalar_one_or_none()
-    refusal = campaign_rules.budget_refusal(s, campaign, get_settings()) if campaign else None
-    if refusal:
-        raise LeadNotDialable(refusal)
+    campaign = s.get(Campaign, campaign_id)
+    if campaign is not None and campaign_rules.rules_of(campaign).budget_usd is not None:
+        # The campaign row is locked from here to the end of the transaction, so two claims
+        # against the same budget are decided one after the other, whoever makes them.
+        # A campaign without a budget has nothing to protect and is not serialized.
+        campaign = s.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update().execution_options(populate_existing=True)).scalar_one()
+        refusal = campaign_rules.budget_refusal(s, campaign, get_settings())
+        if refusal:
+            raise LeadNotDialable(refusal)
     # In an A/B test the lead's side, and so the playbook version, is fixed for every attempt.
     experiment_id, arm, version = experiments.assign(s, campaign, lead) if campaign else (None, None, None)
     run = CallRun(lead_id=lead.id, campaign_id=campaign_id, status="created", playbook_version=version, experiment_id=experiment_id, experiment_arm=arm)
@@ -232,6 +235,9 @@ class CampaignRunner:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         self._tasks: dict[int, asyncio.Task] = {}
+        # Whether this process is the one that dials (see callagent/leader.py). A runner
+        # used on its own (tests, one process) leads.
+        self.leading = True
 
     def is_running(self, campaign_id: int) -> bool:
         t = self._tasks.get(campaign_id)
@@ -248,7 +254,24 @@ class CampaignRunner:
                 c.stop_reason = None
 
         await run_db(_mark)
-        self._tasks[campaign_id] = asyncio.create_task(self._loop(campaign_id), name=f"campaign-{campaign_id}")
+        if self.leading:  # otherwise the process that leads sees the campaign is running and starts dialing it
+            self._tasks[campaign_id] = asyncio.create_task(self._loop(campaign_id), name=f"campaign-{campaign_id}")
+
+    async def sync(self) -> None:
+        """Dial every campaign that is marked running and has no loop here. Called by
+        the leading process when it starts leading and regularly after: a campaign
+        started through another process's API is picked up this way."""
+        if not self.leading:
+            return
+        ids = await run_db(lambda s: [c.id for c in s.execute(select(Campaign).where(Campaign.status == "running")).scalars()], unrestricted=True)
+        for campaign_id in ids:
+            if self.leading and not self.is_running(campaign_id):
+                self._tasks[campaign_id] = asyncio.create_task(self._loop(campaign_id), name=f"campaign-{campaign_id}")
+
+    async def step_down(self) -> None:
+        """This process stops dialing; campaigns keep their status for whoever leads next."""
+        self.leading = False
+        await self.shutdown()
 
     async def stop(self, campaign_id: int, status: str = "paused") -> None:
         t = self._tasks.pop(campaign_id, None)

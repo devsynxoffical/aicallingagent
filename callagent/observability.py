@@ -117,7 +117,7 @@ def configure_logging(level: str = "INFO", style: str = "json", voice_level: str
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):  # the web server configures its own handlers: replace them
         server_logger = logging.getLogger(name)
         server_logger.handlers, server_logger.propagate = [], True
-    for noisy in ("httpx", "httpcore", "anthropic", "twilio.http_client"):  # these log each request's address at INFO
+    for noisy in ("httpx", "httpx2", "httpcore", "anthropic", "twilio.http_client"):  # these log each request's address at INFO
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     try:
@@ -153,6 +153,8 @@ CALLS_FINISHED = Counter("callagent_calls_finished_total", "Calls that ended, by
 CALL_MODEL_FAILURES = Counter("callagent_call_model_failures_total", "Turns of a live call the AI model failed to answer", registry=REGISTRY)
 CALL_RESPONSE = Histogram("callagent_call_response_seconds", "Per call: median time from the caller finishing to the agent's first audio", buckets=(0.3, 0.5, 0.8, 1, 1.25, 1.5, 2, 3, 5), registry=REGISTRY)
 CAMPAIGNS_STOPPED = Counter("callagent_campaigns_stopped_total", "Campaigns the engine stopped by itself, by kind of reason", ["reason"], registry=REGISTRY)
+BACKUP_LAST = Gauge("callagent_backup_last_success_timestamp_seconds", "When the last scheduled backup was taken and verified (0: none since this process started)", registry=REGISTRY)
+BACKUP_FAILURES = Counter("callagent_backup_failures_total", "Scheduled backups that failed", registry=REGISTRY)
 AUDIT_UNRECORDED = Counter("callagent_audit_unrecorded_total", "Audit entries that could not be written", registry=REGISTRY)
 
 # Read from the database and the process at the moment of a scrape.
@@ -250,6 +252,8 @@ def readiness(s, worker_running: bool) -> dict[str, Any]:
         except Exception as e:
             checks["schema"] = f"unknown ({type(e).__name__})"
     checks["worker"] = "ok" if worker_running else "not running"
+    if draining:
+        checks["accepting"] = "stopping: finishing calls in progress, taking no new work"
     ok = all(value == "ok" for value in checks.values())
     READY.set(1 if ok else 0)
     return {"ready": ok, "checks": checks}
@@ -328,3 +332,71 @@ class RequestContext:
         except Exception:
             AUDIT_UNRECORDED.inc()
             log.exception("an audit entry could not be written (%s %s by %s, status %s)", method, route, actor, status)
+
+
+class BodyLimit:
+    """Refuse a request whose body is larger than the limit: at once when it says so
+    (Content-Length), and as soon as it has sent that much when it does not."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app, self.max_bytes = app, max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        declared = dict(scope.get("headers", [])).get(b"content-length")
+        if declared and declared.isdigit() and int(declared) > self.max_bytes:
+            return await self._refuse(send)
+        received, refused = 0, False
+
+        async def counted():
+            nonlocal received, refused
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    refused = True
+                    return {"type": "http.disconnect"}  # the application stops reading; nothing more is buffered
+            return message
+
+        started = False
+
+        async def sending(message):
+            nonlocal started
+            if refused and not started:
+                started = True
+                return await self._refuse(send)
+            if not refused:
+                started = started or message["type"] == "http.response.start"
+                await send(message)
+
+        try:
+            await self.app(scope, counted, sending)
+        except Exception:
+            if not refused:
+                raise  # not ours: an application that stops reading because we cut the body short is expected
+        if refused and not started:
+            await self._refuse(send)
+
+    async def _refuse(self, send) -> None:
+        body = json.dumps({"detail": f"the request is larger than {self.max_bytes // (1024 * 1024)} MB"}).encode()
+        await send({"type": "http.response.start", "status": 413, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+
+# ----------------------------------------------------------------------------- stopping without cutting calls off
+
+active_calls: set[int] = set()  # calls whose audio this process is carrying right now
+draining = False
+
+
+async def drain(seconds: float, poll: float = 1.0) -> int:
+    """Wait for the calls this process carries to finish, up to ``seconds``. Returns how
+    many were still in progress when the wait ended."""
+    import asyncio
+
+    deadline = time.monotonic() + seconds
+    while active_calls and time.monotonic() < deadline:
+        await asyncio.sleep(poll)
+    return len(active_calls)
+

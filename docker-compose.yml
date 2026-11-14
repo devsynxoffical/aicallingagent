@@ -1,12 +1,39 @@
+# The engine with PostgreSQL. Provider keys and the database password come from .env
+# (copy .env.example). Nothing here is a production topology: one machine, one engine
+# process, the database on the same host, no TLS. See docs/PRODUCTION_READINESS.md.
 services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: callagent
+      POSTGRES_USER: callagent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U callagent -d callagent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   callagent:
     build: .
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://callagent:${POSTGRES_PASSWORD}@db:5432/callagent
+      DATA_DIR: /app/data
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data
-    environment:
-      DATABASE_URL: sqlite:////app/data/callagent.db
-      DATA_DIR: /app/data
+      - appdata:/app/data
+    # Longer than SHUTDOWN_DRAIN_SECONDS (180 by default): calls in progress are allowed to finish.
+    stop_grace_period: 200s
     restart: unless-stopped
+
+volumes:
+  pgdata:
+  appdata:

@@ -1,79 +1,97 @@
 # Security review
 
-Reviewed 2026-11-13 by reading the code; no penetration test, no dependency scan and no
-test against a real provider were performed. Status reflects the code on this branch.
+State of the code on this branch on 2026-11-14. Reviewed by reading the code and by
+the automated tests named below. **Not done: a penetration test, a review by anyone
+outside this work, a dependency scan with results read, and any test against a real
+provider or a deployed instance.** Ids such as A-10 refer to
+`ENTERPRISE_BACKEND_AUDIT.md`.
 
 ## Summary
 
-Several customer organizations can now share one deployment on PostgreSQL. Each
-request is confined to the organization of the account that makes it, by the
-application on every route and again by PostgreSQL row-level security; a test calls
-every addressable route as another organization and gets 404 each time with nothing
-changed (`tests/test_tenancy.py`, run on SQLite and on PostgreSQL as an ordinary
-role), and another runs deliberately unfiltered queries against the policies
-(`tests/test_row_level_security.py`). People sign in with their own accounts and one
-of three roles, checked on every route (`tests/test_accounts.py`).
+Several customer organizations can share one deployment on PostgreSQL. A request is
+confined to the organization of the account that makes it, by the application on
+every route and again by PostgreSQL row-level security. People sign in with their
+own accounts and one of three roles, checked on the server on every route. Every
+attempt to change something is recorded with who made it. Logs carry no phone
+numbers or email addresses. Backups can be encrypted.
 
-What still stands between this and selling to a second customer is listed in
-`ENTERPRISE_BACKEND_AUDIT.md`: telephony, booking webhook, transfer number and cost
-rates are still one set per deployment (A-11), so a second organization would dial
-from the first one's number and post bookings to the first one's webhook; the engine
-API token is a single all-powerful secret (A-10); there is no audit trail (A-13).
+What still stands between this and selling to a second customer:
 
-## Review by area
+1. **Telephony settings are one set per deployment** (A-11): the phone number calls
+   come from, the transfer number, the booking webhook and the cost rates. A second
+   organization would dial from the first one's number.
+2. **The engine's API token is one all-powerful secret** (A-10). It is the
+   deployment operator's credential; there are no API keys per organization.
+3. **No password reset by email and no second factor** (A-13).
+4. **No data retention or erasure**: transcripts and lead data are kept until
+   someone deletes them in the database.
+5. **Nothing has been attacked on purpose.**
 
-| Area | State | Detail | Audit |
-| --- | --- | --- | --- |
-| Authentication | Weak by design | One static bearer token for all of `/api/*`, compared in constant time. No users, expiry or rotation; `approved_by` is free text from the client | S-1 |
-| Roles | None | Whoever holds the token can do everything | S-1 |
-| Organization isolation | **Not enforced** | Campaigns, calls and leads are looked up by global name or id. `GET /api/calls/{id}` returns any call. Leads, calls, appointments and the do-not-call list carry no organization column | S-1, D-3 |
-| Provider webhooks | Good | Twilio's signature is checked on every webhook, on by default, against the public URL. The load test signs its requests instead of switching the check off | |
-| Webhook replay | Mitigated | Twilio signatures have no timestamp, so a captured request can be sent again. Replays now change nothing: status goes through the state machine, usage has one row per call, inbound calls are unique per provider call id | S-3 |
-| Signature check can be disabled | Open | `TWILIO_VALIDATE_SIGNATURE=false` is accepted silently, also in production | S-3 |
-| Media WebSocket | Good, one gap | Public endpoint; requires the per-call random token from our own TwiML, a call that is not finished and a matching call id. The single-use check is not atomic | C-8 |
-| Outgoing booking webhook | Improved | Signed with HMAC-SHA256 when `BOOKING_WEBHOOK_SECRET` is set; stable delivery id for de-duplication. Unsigned if no secret is configured | C-9 |
-| Dashboard | Good | Token checked server-side, kept in an httpOnly SameSite=Strict cookie, never sent to page scripts; all engine access through a server-side proxy limited to `/api/*`; cross-site changes refused (see the `devytalk` repository's tests) | |
-| Rate limiting | None on the engine | The dashboard limits sign-in attempts; the engine's API has no limits | S-2 |
-| Input validation | Mostly good | Request bodies are validated by schema; phone numbers normalized; lead upload has **no size limit** | S-2 |
-| File uploads | Mostly good | Type checked against content, 25 MB limit, stored under a generated name outside any served path. Word and PowerPoint files have no decompressed-size limit | S-6 |
-| Website crawling (SSRF) | Mostly good | http(s) only; every hop resolved and refused unless the address is public; size and redirect limits. The address is resolved again by the HTTP client after the check (DNS rebinding) | S-5 |
-| SQL injection | No finding | All queries go through SQLAlchemy with bound parameters. Migration and backup code build SQL only from constants |
-| Secrets | Acceptable | Read from the environment. Never returned by the API. Not in backups (tested). The PostgreSQL password is passed to backup tools in the environment, not on the command line. The API token may be auto-generated into a file with mode 600; set it explicitly in production | |
-| Secrets and personal data in logs | Open | Caller numbers are logged for inbound calls; provider errors can contain numbers. No redaction | S-4 |
-| Prompt injection | Open | Text from uploaded documents and crawled websites is returned to the model next to tools that send texts, transfer calls and book meetings. Tools act only on the current lead, which limits the damage | AI-3 |
-| CSV export | Open | Cells are not protected against spreadsheet formulas | S-7 |
-| Audit log | None | State-changing actions are not recorded with who did them | S-8 |
-| Data retention and erasure | None | Transcripts and lead data are kept forever; no erase operation | S-8 |
-| Database access | Acceptable | Foreign keys enforced; uniqueness enforced; least-privilege database roles and row-level security not set up | D-3 |
-| Dependencies | Open | Lower-bound versions, no lock file, no vulnerability scan; the container runs as root | S-9 |
-| Transport | Deployment concern | The server speaks plain HTTP; TLS must be terminated in front of it. Twilio requires HTTPS/WSS for webhooks and media |
+## By area
 
-## Fixed in this round
+| Area | State | Evidence or detail |
+| --- | --- | --- |
+| Authentication | Built | Passwords hashed with scrypt and a per-password salt; session tokens are random, stored only as a SHA-256, expire after 12 hours, and end at sign-out or deactivation; the same answer for an unknown email, a wrong password and a deactivated account. `tests/test_accounts.py` |
+| Brute force | Partly | An account locks for 15 minutes after 5 wrong passwords. The console limits sign-in attempts per address, keyed on the address its own proxy reports, not one the client can choose. The engine has no limit per address (A-12), so someone can lock a known account out repeatedly |
+| Roles | Built | viewer, operator, admin, decided on the server from the declared route; the console's hiding of buttons is a convenience only. A test calls every route as every role |
+| Organization isolation | Built, two layers | Application: every lookup goes through the caller's organization; another organization's object answers 404. Database: row-level security on 17 tables, forced on the owner too, set per transaction. `tests/test_tenancy.py` calls every addressable route as another organization, on SQLite and on PostgreSQL as an ordinary role; `tests/test_row_level_security.py` runs unfiltered queries against the policies |
+| Row-level security in a deployment | **Depends on the database role** | A superuser or a role with BYPASSRLS is not bound by the policies. `/api/status` reports `enforced`, `bypassed` or `missing`; run the engine as an ordinary role |
+| The operator's token | Open (A-10) | One static secret for the whole deployment, compared in constant time. It creates organizations, corrects the ledger, reads metrics, and acts in any organization it names. Set it explicitly, keep it in a secret store, rotate by changing it and restarting |
+| Provider webhooks | Built | The phone provider's signature is checked on every webhook, against the public URL. Switching the check off (`TWILIO_VALIDATE_SIGNATURE=false`) is logged as an error at start; it is still possible |
+| Webhook replay | Mitigated | The provider's signatures carry no timestamp, so a captured request can be sent again. A replay changes nothing: statuses only move forward, the ledger has one line per key, inbound calls are unique per provider call id |
+| Media WebSocket | Built | Public endpoint; needs the per-call random token from our own instructions to the provider; the claim is a single conditional update, so exactly one connection gets a call; a connection that does not complete its opening exchange in 10 seconds is dropped |
+| In-call actions | Built | The agent can only use the tools its campaign enables, checked on the server; bookings, callbacks and texts are bounded; links in texts only to hosts in the approved playbook; a transfer is recorded only when the provider accepted it. `tests/test_call_safety.py` |
+| Prompt injection | Reduced, not removed | Document passages, lead details and transcripts are marked as data with a rule that they contain no instructions; tools act only on the current lead and within the limits above; nothing the model writes goes live without a person's approval. A document can still state a false fact that the agent repeats; the review of each call lists statements the playbook does not support |
+| Outgoing booking webhook | Built | Signed with HMAC-SHA256 when `BOOKING_WEBHOOK_SECRET` is set, with a delivery id that is the same on every retry. Unsigned when no secret is configured |
+| Website reading (SSRF) | Built | http(s) only; every hop resolved and refused unless public; the connection goes to the address that was checked, so a second DNS answer cannot redirect it; size and redirect limits |
+| File uploads | Built | 25 MB; type checked against content; Office files refused when they unpack to more than 300 MB; PDFs over 600 pages refused; stored under a generated name outside any served path |
+| Request size | Built | 30 MB for any request body to the engine, refused before it is read; 1 MB for JSON through the console |
+| Input validation | Built | Request bodies validated by schema; phone numbers normalised; numbers in the AI reviewer's answers range-checked |
+| SQL injection | No finding | Queries go through SQLAlchemy with bound parameters; migration and backup code build SQL from constants only |
+| Secrets | Acceptable | Read from the environment; never returned by the API; not in backups (tested); the database password goes to backup tools in the environment, not the command line. The API token may be generated into a file with mode 600: set it explicitly in a deployment |
+| Personal data in logs | Built | Phone numbers and email addresses masked on every line including exception text; the voice library held at warning so prompts and spoken sentences are not logged; request bodies never logged. `tests/test_observability.py` |
+| Audit trail | Built | Every attempt to change something through the API, refused ones included, and sign-ins on known accounts; readable by the organization's admins only; request bodies not stored. Rows are append-only in the code, not in the database |
+| Metrics | Built | Operator only; no label identifies a person, a number or an organization |
+| Public endpoints | Low | `/health`, `/health/live` and `/health/ready` say nothing about configuration. `/docs` and `/openapi.json` are public and describe the API's shape |
+| CSV export | Built | Cells that a spreadsheet would run as formulas are neutralised |
+| Backups | Built | Optional AES-256-GCM encryption with tamper detection; without a key they are written in the clear and the command says so. The key is the operator's to keep safe |
+| Console (browser side) | Partly | Session in an httpOnly SameSite=Strict cookie, never visible to page scripts; all engine access through a server-side proxy limited to `/api/*`; cross-site changes refused; security headers on every response including a content policy that refuses other origins, framing and plugins. The policy allows inline scripts (the framework needs them without per-request nonces), so it does not stop a script injected into a page. Open (E-8): signing in with the engine's token stores that non-expiring token in the cookie; the engine's error text reaches the browser unchanged |
+| Data retention and erasure | **Open** | No retention period, no erase operation for a person's data, no export of one person's data |
+| Recording and consent | **Needs a decision per market** (B-13) | The opening can disclose the AI and the recording; what is required where is a legal question |
+| Dependencies | Open | Lower-bound versions, no lock file. CI runs a vulnerability scan as a warning, not a gate; nobody has read its output yet |
+| Container | Built, not built here | Runs as an ordinary user, with a health check; the image could not be built in this environment (no container daemon) and is first exercised by CI |
+| Transport | Deployment concern | The server speaks plain HTTP; TLS must be terminated in front of it. The phone provider requires HTTPS and WSS |
+| Several engine processes | Built | The database decides who dials (a lease), who gets a lead, a call and a job |
 
-- Double dialing and dialing a suppressed number through a race (C-1).
-- Duplicate call records from a webhook delivered twice (D-2).
-- Replayed status callbacks double-counting usage (B-1, S-3).
-- Booking webhooks: unsigned, unretried, blocking the live call (C-9).
-- Restore refuses a tampered backup; backups contain no secrets (D-8).
+## Checked by tests
 
-## What has to happen before a second customer
+| Property | Test |
+| --- | --- |
+| No route gives one organization another's data, and nothing of the other's changes | `test_every_route_refuses_another_organizations_identifiers` (sqlite, postgres) |
+| The database itself confines an unfiltered query | `tests/test_row_level_security.py` |
+| Each role can do what it is for and nothing more | `test_each_role_can_do_what_it_is_for_and_nothing_more` |
+| The organization comes from the account, never from the request | `test_the_organization_comes_from_the_account_never_from_the_request` |
+| A refused attempt is recorded with who made it; no request body is kept | `test_every_attempt_to_change_something_is_recorded_with_who_and_how_it_ended` |
+| No phone number or email address reaches the logs | `test_phone_numbers_and_email_addresses_never_reach_the_logs` |
+| A tool the campaign did not enable is refused even if the model names it | `test_a_tool_the_campaign_did_not_enable_is_refused_even_if_the_model_names_it` |
+| A page is fetched from the address that was checked | `test_a_page_is_fetched_from_the_address_that_was_checked` |
+| Of many connections with one valid token, one gets the call | `test_of_many_sockets_presenting_the_same_valid_token_exactly_one_gets_the_call` |
+| An encrypted backup shows nothing without its key and refuses tampering | `tests/test_backup.py` |
+| The ledger is corrected only by the operator, and not across organizations | `test_the_ledger_is_read_by_its_organization_and_corrected_only_by_the_operator` |
+| The limiter's key cannot be chosen by the client; headers are set | console `src/lib/rate-limit.test.ts` |
 
-1. API keys stored hashed, each belonging to one organization and one role
-   (owner, operator, read-only). The existing token becomes the default
-   organization's owner key so current installs keep working.
-2. `organization_id` on leads, calls, appointments and the do-not-call list; campaign
-   names unique per organization; every query filtered by the caller's organization;
-   objects of another organization answer 404, not 403.
-3. A test suite that creates two organizations and tries every route of one with the
-   other's key. This is the acceptance test for isolation.
-4. On PostgreSQL, row-level security policies as a second line of defence.
-5. An audit log of approvals, rollbacks, campaign starts and exports, with the key
-   that made them.
+## Before a second customer
 
-## Smaller items, in order
+1. Telephony, webhook, transfer number and rates per organization (A-11).
+2. API keys per organization, stored hashed, with a role (A-10).
+3. The engine running as an ordinary database role, with `/api/status` showing
+   row-level security `enforced`.
+4. A retention period and an erase operation, decided with the customer.
+5. An outside security review, and the dependency scan read and acted on.
 
-Rate limits and an upload size cap (S-2); log redaction (S-4); refuse to start with
-signature checking off outside development (S-3); decompressed-size limit (S-6);
-pin the crawler's connection to the checked address (S-5); formula-safe CSV (S-7);
-lock file, non-root container and a scan step (S-9); atomic WebSocket claim (C-8);
-tool limits and untrusted-content marking for retrieved text (AI-3).
+## Smaller items
+
+A limit on sign-in attempts per address on the engine (A-12); password reset and a
+second factor (A-13); the API description behind sign-in; a lock file and the scan
+as a gate; database permissions that forbid changing audit and ledger rows; a
+session for the engine token instead of the token itself in the console's cookie.

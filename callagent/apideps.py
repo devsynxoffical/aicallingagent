@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from . import accounts
 from .config import Settings, get_settings, resolve_api_token
-from .db import Campaign, current_organization, default_organization_id, run_db
+from .db import Campaign, current_organization, default_organization_id, known_default_organization, run_db
 
 # The deployment's operator names the organization to act in with this header. It is
 # honoured for the engine API token only; from anyone else it is ignored.
@@ -38,7 +38,8 @@ async def require_api_token(
             org = accounts.find_organization(s, acting_in)
             return accounts.operator_principal(org.id) if org is not None else None
 
-        principal = await run_db(_operator)
+        known = None if acting_in else known_default_organization()
+        principal = accounts.operator_principal(known) if known is not None else await run_db(_operator)
         if principal is None:
             raise HTTPException(status_code=404, detail="no such organization")
     else:

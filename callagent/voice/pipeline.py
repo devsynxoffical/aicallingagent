@@ -41,7 +41,7 @@ from datetime import timedelta
 
 from ..db import CallRun, Campaign, Lead, campaign_organization_id, run_blocking, run_db, utcnow
 from ..llm import attributed, prompt_hash, record_live_call
-from ..observability import call_id
+from ..observability import active_calls, call_id
 from ..dialer import lifecycle
 from ..languages import LanguageSwitch, LanguageTracker
 from ..playbook.prompt_builder import build_system_prompt
@@ -152,12 +152,15 @@ async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: d
     lead, playbook, campaign_id, stored_sid, direction, knowledge = await load_call_context(call_run_id)
     if direction == "inbound":
         mode = "inbound"
+    active_calls.add(call_run_id)  # a stop signal waits for this to empty (observability.drain)
     try:
         await _run_call(websocket, stream_sid, stored_sid or call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings, direction, knowledge)
     except Exception as e:
         log.exception("call %s: could not start the voice pipeline", call_run_id)
         await mark_call_setup_failed(call_run_id, f"pipeline setup failed: {e}", settings)
         raise
+    finally:
+        active_calls.discard(call_run_id)
 
 
 async def _run_call(websocket, stream_sid, call_sid, body, call_run_id, mode, lead, playbook, campaign_id, settings, direction="outbound", knowledge=None) -> None:

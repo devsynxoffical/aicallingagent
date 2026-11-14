@@ -114,7 +114,7 @@ console; only the end-to-end response time is a metric.
 
 ## 4. Alerts
 
-`ops/prometheus-alerts.yml` holds 15 rules, each with a summary and what to do:
+`ops/prometheus-alerts.yml` holds 16 rules, each with a summary and what to do:
 
 | Area | Rules |
 | --- | --- |
@@ -122,7 +122,7 @@ console; only the end-to-end response time is a metric.
 | Calls | A campaign stopped because the provider is failing; the model failing during calls; slow answers on calls |
 | Background work | Call-related work waiting; analysis backlog; jobs that gave up; AI provider unavailable |
 | Capacity | Database pool nearly full; call-path threads backed up |
-| Records | Usage not recorded; audit not recorded |
+| Records | Usage not recorded; audit not recorded; a scheduled backup failed |
 
 The thresholds are starting points, set by reasoning and not from traffic. Review
 them after the first weeks of real calls.

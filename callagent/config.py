@@ -126,6 +126,27 @@ class Settings(BaseSettings):
     # Threads for database work on the request and call path (short operations with
     # deadlines), and separately for slow background work (model calls, crawls, document
     # parsing, imports). Two pools, so a backlog of the second kind cannot delay the first.
+    # Apply waiting migrations when a process starts. Switch off where the schema is
+    # changed as its own deploy step (`callagent db upgrade`): a process then refuses to
+    # start against a database that is not at this release's version.
+    auto_migrate: bool = True
+    # The largest request body accepted, in megabytes. Uploads are the largest legitimate ones (25 MB).
+    max_request_megabytes: int = 30
+    # On a stop signal: how long to wait for calls in progress to finish before stopping anyway.
+    shutdown_drain_seconds: int = 180
+
+    # Backups. A key makes them unreadable without it: create one with `callagent db
+    # backup-key` and keep it somewhere the backups are not.
+    backup_encryption_key: str | None = None
+    # Take a backup whenever the newest is older than this many hours (0 = not scheduled),
+    # into BACKUP_DIR (default DATA_DIR/backups), keeping them this many days.
+    backup_every_hours: float = 0
+    backup_dir: Path | None = None
+    backup_keep_days: int = 14
+
+    # With several engine processes, one dials. It renews its claim three times per this
+    # many seconds; if it stops, another takes over after at most this long.
+    leader_lease_seconds: int = 30
     db_threads: int = 16
     background_threads: int = 4
 

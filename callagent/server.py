@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from decimal import Decimal
 import hmac
 import csv
@@ -21,7 +22,7 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from . import background, billing, events, jobs, llm, observability
+from . import background, billing, events, jobs, leader, llm, observability
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
@@ -49,6 +50,7 @@ from .voice.pipeline import run_call
 log = logging.getLogger("callagent.server")
 
 runner: CampaignRunner | None = None
+leadership: "leader.Leadership | None" = None
 
 
 @asynccontextmanager
@@ -60,29 +62,86 @@ async def lifespan(app: FastAPI):
     missing = settings.missing_for_calls()
     if missing:
         log.warning("Not configured for live calls yet, missing: %s", ", ".join(missing))
-    # Resume campaigns that were running when the process last stopped.
-    ids = await run_db(lambda s: [c.id for c in s.execute(select(Campaign).where(Campaign.status == "running")).scalars()])
-    for cid in ids:
-        await runner.start(cid)
+    if not settings.twilio_validate_signature:
+        # A development switch. Left on in a deployment, anyone who can reach the server can report call statuses.
+        log.error("TWILIO_VALIDATE_SIGNATURE is off: provider webhooks are accepted without checking who sent them. Never run a deployment like this.")
     # Training documents that were waiting or half-read when the process stopped.
     await resume_unfinished()
     # Background jobs that were queued, or left running by a process that stopped.
     await background.recover_training_runs()
     background.start_worker()
+
+    # Dialing and reconciliation belong to one process at a time. This one starts as a
+    # follower and takes the lead if nobody holds it; campaigns that were running when
+    # the last leader stopped resume the moment a process leads.
+    runner.leading = False
+
+    async def lead():
+        runner.leading = True
+        await runner.sync()
+
+    global leadership
+    leadership = this_process = leader.Leadership(leader.DIALER, settings.leader_lease_seconds, on_gained=lead, on_lost=runner.step_down)
+    await this_process.tick()  # decided before the first request is served
+    this_process.start()
+
+    async def keep_in_step():
+        while True:
+            await asyncio.sleep(max(2, settings.leader_lease_seconds / 3))
+            try:
+                await runner.sync()
+            except Exception:
+                log.exception("could not look for campaigns to dial")
+
+    in_step = asyncio.create_task(keep_in_step(), name="campaign-sync")
+
+    async def scheduled_backups():
+        """Only when BACKUP_EVERY_HOURS is set, and only in the process that leads."""
+        from . import backup
+
+        while True:
+            if runner.leading:
+                try:
+                    made = await run_blocking(backup.backup_if_due, settings)
+                    if made is not None:
+                        observability.BACKUP_LAST.set(time.time())
+                        log.info("scheduled backup written and verified: %s", made)
+                except Exception:
+                    observability.BACKUP_FAILURES.inc()
+                    log.exception("the scheduled backup failed")
+            await asyncio.sleep(300)
+
+    backups = asyncio.create_task(scheduled_backups(), name="backups") if settings.backup_every_hours > 0 else None
     # Calls that went quiet are resolved by asking the provider, for every campaign.
-    reconciler = asyncio.create_task(reconcile_forever(), name="call-reconciler")
+    reconciler = asyncio.create_task(reconcile_forever(should_run=lambda: runner.leading), name="call-reconciler")
     yield
-    reconciler.cancel()
-    try:
-        await reconciler
-    except (asyncio.CancelledError, Exception):
-        pass
+    for task in filter(None, (reconciler, in_step, backups)):
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     await background.stop_worker()
+    await this_process.stop()  # stops the dial loops and hands the lease over
     await runner.shutdown()
 
 
 app = FastAPI(title="callagent", lifespan=lifespan)
-app.add_middleware(observability.RequestContext)  # request id, timing, audit trail
+app.add_middleware(observability.BodyLimit, max_bytes=get_settings().max_request_megabytes * 1024 * 1024)
+app.add_middleware(observability.RequestContext)  # request id, timing, audit trail (outermost: added last)
+
+
+async def stop_gracefully() -> int:
+    """A stop signal arrived. Stop placing calls and report "not ready" so no new work
+    is sent here, then wait for the calls in progress to finish. Returns how many were
+    cut off because the wait ran out."""
+    observability.draining = True
+    if leadership is not None:
+        await leadership.stop()  # no new outbound calls from here; another process may take over dialing
+    left = await observability.drain(get_settings().shutdown_drain_seconds)
+    if left:
+        log.warning("stopping with %s call(s) still in progress; they are finished by the queue after a restart", left)
+    return left
 
 
 @app.exception_handler(AIError)
@@ -350,7 +409,8 @@ def _campaign_out(s, c: Campaign) -> CampaignOut:
         budget_usd=campaign_rules.rules_of(c).budget_usd,
         readiness_score=int((c.playbook_json or {}).get("readiness_score", 0)),
         stats=campaign_stats(s, c.id),
-        running=_runner().is_running(c.id),
+        # Dialed by this process, or (when another process leads) marked running for that one to dial.
+        running=_runner().is_running(c.id) or (not _runner().leading and c.status == "running"),
     )
 
 
