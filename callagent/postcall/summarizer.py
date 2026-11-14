@@ -258,9 +258,13 @@ async def finalize_call(
         if run is None or lead is None:
             return
         settings = campaign_settings(s, run.campaign_id, base_settings)
-        from .. import background, events, jobs
+        from .. import background, events, jobs, observability
 
         run.disposition = disposition
+        observability.CALLS_FINISHED.labels(direction, disposition).inc()
+        response = ((latency or {}).get("response") or {}).get("p50")
+        if response:
+            observability.CALL_RESPONSE.observe(response)
         jobs.complete_by_key(s, background.call_finalize_key(call_run_id))  # ended the normal way: its safety net is not needed
         events.emit(s, "CallFinalized", key=f"call:{call_run_id}:finalized", subject="call", subject_id=call_run_id, organization_id=run.organization_id,
                     campaign_id=run.campaign_id, call_run_id=call_run_id, payload={"disposition": disposition, "reviewed": review is not None, "direction": direction})

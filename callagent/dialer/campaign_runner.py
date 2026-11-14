@@ -265,13 +265,14 @@ class CampaignRunner:
         self._tasks.pop(campaign_id, None)
 
         def _mark(s):
-            from .. import events
+            from .. import events, observability
 
             c = s.get(Campaign, campaign_id)
             if c:
                 c.status = status
                 if reason:
                     c.stop_reason = reason[:300]
+                    observability.CAMPAIGNS_STOPPED.labels(observability.stop_reason_kind(reason)).inc()
                 # One event per stop: the moment is part of the key, so a later stop is a new fact.
                 events.emit(s, "CampaignStopped", key=f"campaign:{c.id}:stopped:{utcnow().isoformat()}", subject="campaign", subject_id=c.id,
                             organization_id=c.organization_id, campaign_id=c.id, payload={"status": status, "reason": reason or ""})

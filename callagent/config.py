@@ -124,6 +124,14 @@ class Settings(BaseSettings):
     db_threads: int = 16
     background_threads: int = 4
 
+    # Logs: one JSON object per line ("json") or readable lines for a terminal ("text").
+    log_level: str = "INFO"
+    log_format: str = "json"
+    # The voice library prints call instructions and every spoken sentence below this level.
+    voice_log_level: str = "WARNING"
+    # What a monitoring system presents to read /metrics. Unset: only the engine's API token is accepted.
+    metrics_token: str | None = None
+
     # AI model use outside live calls (reviews, coaching, training). At most this many
     # requests run at once, so a backlog of analysis cannot use up the capacity the
     # live conversations need from the same provider account.

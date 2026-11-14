@@ -394,6 +394,33 @@ class UsageRecord(Base):
     __table_args__ = (Index("uq_usage_records_call_kind", "call_run_id", "kind", unique=True),)
 
 
+class AuditEntry(Base):
+    """Who changed what, when and from where. One row per attempt to change something
+    through the API (successful or refused) and per sign-in attempt on a known account.
+    Rows are only ever added: no code updates or deletes them.
+
+    The request body is never stored: it can hold passwords and customer data. What
+    is stored is which operation, on which object, and how it ended.
+    """
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    actor: Mapped[str] = mapped_column(String(254))  # the person's email, or "api token"
+    actor_role: Mapped[str] = mapped_column(String(12), default="")
+    action: Mapped[str] = mapped_column(String(80))  # the operation's name, e.g. start_campaign, sign_in
+    method: Mapped[str] = mapped_column(String(8), default="")
+    route: Mapped[str] = mapped_column(String(200), default="")  # the route as declared, without values
+    target: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # what it was aimed at: the route's own parameters
+    status: Mapped[int] = mapped_column(Integer, default=0)  # how it ended: the HTTP status
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    address: Mapped[str | None] = mapped_column(String(64), nullable=True)  # where the request came from
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, default=utcnow)
+
+    __table_args__ = (Index("ix_audit_log_org_created", "organization_id", "created_at"),)
+
+
 AI_OUTCOMES = ("ok", "refused", "overloaded", "timeout", "unreachable", "busy", "failed")
 
 
@@ -508,6 +535,8 @@ class Job(Base):
     # never waits behind analysis or document reading. Within a queue, higher priority first.
     queue: Mapped[str] = mapped_column(String(20), default="default")
     priority: Mapped[int] = mapped_column(Integer, default=0)
+    # The id of the request that caused this work, so its log lines can be found from the request's.
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=5)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=300)
@@ -899,7 +928,7 @@ def dumps(obj: Any) -> str:
 # Every table whose rows belong to one organization. Row-level security covers exactly these.
 TENANT_TABLES = (
     "campaigns", "leads", "call_runs", "appointments", "do_not_call", "usage_records", "training_documents", "knowledge_chunks",
-    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events", "ai_usage",
+    "playbook_versions", "experiments", "training_runs", "users", "website_requests", "jobs", "events", "ai_usage", "audit_log",
 )
 # Rows of these may belong to no organization (the deployment's own housekeeping and facts).
 _SHARED_WHEN_UNOWNED = ("jobs", "events")

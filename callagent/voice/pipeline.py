@@ -41,6 +41,7 @@ from datetime import timedelta
 
 from ..db import CallRun, Campaign, Lead, campaign_organization_id, run_blocking, run_db, utcnow
 from ..llm import attributed, prompt_hash, record_live_call
+from ..observability import call_id
 from ..dialer import lifecycle
 from ..languages import LanguageSwitch, LanguageTracker
 from ..playbook.prompt_builder import build_system_prompt
@@ -146,6 +147,7 @@ async def mark_call_setup_failed(call_run_id: int, error: str, base_settings: Se
 async def run_call(websocket: WebSocket, stream_sid: str, call_sid: str, body: dict[str, Any], settings: Settings | None = None) -> None:
     settings = settings or get_settings()
     call_run_id = int(body.get("call_run_id", 0))
+    call_id.set(call_run_id)  # every log line of this conversation carries it
     mode = str(body.get("mode", "live"))
     lead, playbook, campaign_id, stored_sid, direction, knowledge = await load_call_context(call_run_id)
     if direction == "inbound":

@@ -45,6 +45,8 @@ async def require_api_token(
         principal = await run_db(lambda s: accounts.principal_for_session(s, given))
         if principal is None:
             raise HTTPException(status_code=401, detail="missing or invalid API token, or the session has ended")
+    # Known from here on, whether or not they are allowed: a refused attempt is recorded with who made it.
+    request.state.caller = principal
     route = getattr(request.scope.get("route"), "path", request.url.path)
     needed = accounts.required_role(request.method, route)
     if not accounts.allows(principal, needed):

@@ -182,7 +182,9 @@ def test_each_role_can_do_what_it_is_for_and_nothing_more(client):
                 refused[role].add((method, path))
 
     changes = {(m, p) for m, p in routes if m != "GET" and not p.startswith(("/api/auth/", "/api/users"))}
-    users = {(m, p) for m, p in routes if p.startswith("/api/users")}
+    # Who has access, and the record of who did what: for admins, reading included.
+    users = {(m, p) for m, p in routes if p.startswith(("/api/users", "/api/audit"))}
+    assert ("GET", "/api/audit") in users
     # Organizations are managed by the deployment's operator, which no role inside an organization is.
     platform = {(m, p) for m, p in routes if p.startswith("/api/organizations")}
     assert platform == {("GET", "/api/organizations"), ("POST", "/api/organizations")}

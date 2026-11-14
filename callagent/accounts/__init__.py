@@ -82,7 +82,7 @@ def required_role(method: str, route: str) -> str:
     method = method.upper()
     if route.startswith("/api/organizations"):
         return PLATFORM
-    if route.startswith("/api/users"):
+    if route.startswith("/api/users") or route.startswith("/api/audit"):
         return "admin"
     if route.startswith("/api/auth/"):
         return "viewer"
@@ -297,16 +297,26 @@ def login(s: Session, email: str, password: str) -> LoginResult:
     if user is None:
         verify_password(password or "", _DUMMY_HASH)
         return LoginResult(ok=False, status=401, error=_WRONG)
+    def noted(action: str, status: int) -> None:
+        # Sign-ins on a known account are part of its organization's audit trail.
+        from ..observability import audit_entry
+
+        audit_entry(s, organization_id=user.organization_id, actor=user.email, role=user.role, action=action, method="POST", route="/api/auth/login", status=status)
+
     if user.locked_until is not None and user.locked_until > now:
         minutes = max(1, int((user.locked_until - now).total_seconds() // 60) + 1)
+        noted("sign_in_refused_locked", 429)
         return LoginResult(ok=False, status=429, error=f"too many failed sign-in attempts; try again in {minutes} minutes")
     if not verify_password(password or "", user.password_hash):
         user.failed_logins = (user.failed_logins or 0) + 1
-        if user.failed_logins >= MAX_FAILED_LOGINS:
+        locked = user.failed_logins >= MAX_FAILED_LOGINS
+        if locked:
             user.locked_until = now + timedelta(minutes=LOCK_MINUTES)
             user.failed_logins = 0
+        noted("sign_in_failed_account_locked" if locked else "sign_in_failed", 401)
         return LoginResult(ok=False, status=401, error=_WRONG)
     if not user.active:
+        noted("sign_in_refused_deactivated", 401)
         return LoginResult(ok=False, status=401, error=_WRONG)
     token = "dts_" + secrets.token_urlsafe(32)
     expires = now + timedelta(hours=SESSION_HOURS)
@@ -314,6 +324,7 @@ def login(s: Session, email: str, password: str) -> LoginResult:
     user.failed_logins = 0
     user.locked_until = None
     user.last_login_at = now
+    noted("sign_in", 200)
     s.flush()
     return LoginResult(ok=True, token=token, expires_at=expires.isoformat(), user=describe(user))
 

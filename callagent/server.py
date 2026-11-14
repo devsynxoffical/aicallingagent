@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import csv
 import io
 import logging
@@ -19,15 +20,15 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from . import background, events, jobs, llm
+from . import background, events, jobs, llm, observability
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
 from .apideps import acting_as, current_principal, organization_id, require_api_token
 from .intake import intake_router, requests_router
-from .config import Settings, get_settings
+from .config import Settings, get_settings, resolve_api_token
 from .llm import AIError, AITransientError, attributed
-from .db import ACTIVE_CALL_STATUSES, Appointment, get_engine, row_level_security, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow, run_blocking
+from .db import ACTIVE_CALL_STATUSES, Appointment, AuditEntry, get_engine, row_level_security, CallRun, Campaign, Lead, campaign_stats, get_campaign_by_name, is_dnc, run_db, utcnow, run_blocking
 from .dialer import twilio_client
 from .dialer import rules as campaign_rules
 from .dialer.reconcile import reconcile_forever
@@ -53,6 +54,7 @@ runner: CampaignRunner | None = None
 async def lifespan(app: FastAPI):
     global runner
     settings = get_settings()
+    observability.configure_logging(settings.log_level, settings.log_format, settings.voice_log_level)
     runner = CampaignRunner(settings)
     missing = settings.missing_for_calls()
     if missing:
@@ -79,6 +81,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="callagent", lifespan=lifespan)
+app.add_middleware(observability.RequestContext)  # request id, timing, audit trail
 
 
 @app.exception_handler(AIError)
@@ -362,8 +365,62 @@ def _speech_problems(pb: Playbook, settings: Settings) -> list[str]:
 
 
 @app.get("/health")
-async def health(settings: Settings = Depends(get_settings)):
-    return {"ok": True, "missing_for_calls": settings.missing_for_calls()}
+async def health():
+    """Kept for callers that only ask "is it up". What is not configured is shown to
+    signed-in callers at /api/status, not here."""
+    return {"ok": True}
+
+
+@app.get("/health/live")
+async def health_live():
+    """The process is running and answering. Says nothing about whether it can work."""
+    return {"alive": True}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Whether this process can do its work: the database answers, its schema is the one
+    this release needs, and the background worker runs. 503 with the failing check otherwise."""
+    try:
+        result = await asyncio.wait_for(run_db(lambda s: observability.readiness(s, background.worker_running()), unrestricted=True), timeout=5)
+    except Exception as e:
+        observability.READY.set(0)
+        result = {"ready": False, "checks": {"database": f"unreachable ({type(e).__name__})"}}
+    return JSONResponse(result, status_code=200 if result["ready"] else 503)
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics(authorization: str | None = Header(default=None), settings: Settings = Depends(get_settings)):
+    """Figures for a monitoring system, in Prometheus text format. They cover every
+    organization of the deployment, so they are for its operator: METRICS_TOKEN, or
+    the engine's API token."""
+    given = (authorization or "").removeprefix("Bearer ").strip().encode()
+    allowed = [token.encode() for token in (settings.metrics_token, resolve_api_token(settings)) if token]
+    if not given or not any(hmac.compare_digest(given, token) for token in allowed):
+        raise HTTPException(401, "a monitoring token is required", headers={"WWW-Authenticate": "Bearer"})
+    snapshot = await run_db(observability.gather, unrestricted=True)
+    return Response(observability.render(snapshot, background.worker_running()), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/api/audit", dependencies=[Depends(require_api_token)])
+async def audit_log(actor: str | None = None, action: str | None = None, limit: int = 100, before_id: int | None = None):
+    """Who changed what in the caller's organization, newest first. For its admins."""
+
+    def _q(s):
+        query = select(AuditEntry).where(AuditEntry.organization_id == organization_id())
+        if actor:
+            query = query.where(AuditEntry.actor == actor.strip().lower())
+        if action:
+            query = query.where(AuditEntry.action == action)
+        if before_id is not None:
+            query = query.where(AuditEntry.id < before_id)
+        return [
+            {"id": e.id, "at": e.created_at.isoformat(), "actor": e.actor, "role": e.actor_role, "action": e.action, "method": e.method, "route": e.route,
+             "target": e.target or {}, "status": e.status, "request_id": e.request_id, "address": e.address}
+            for e in s.execute(query.order_by(AuditEntry.id.desc()).limit(max(1, min(limit, 500)))).scalars()
+        ]
+
+    return await run_db(_q)
 
 
 @app.get("/api/jobs", dependencies=[Depends(require_api_token)])

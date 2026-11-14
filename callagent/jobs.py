@@ -27,6 +27,7 @@ import logging
 import os
 import random
 import socket
+import time
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
@@ -34,6 +35,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import observability
 from .db import CallRun, Job, JobAttempt, run_db, utcnow
 
 log = logging.getLogger(__name__)
@@ -107,7 +109,7 @@ def enqueue(
     job = Job(
         kind=kind, key=key[:200], payload=dict(payload or {}), run_at=utcnow() + timedelta(seconds=delay_seconds),
         max_attempts=max_attempts, timeout_seconds=timeout_seconds, call_run_id=call_run_id, organization_id=organization_id,
-        queue=queue or _queue_of.get(kind, "default"), priority=priority,
+        queue=queue or _queue_of.get(kind, "default"), priority=priority, request_id=observability.request_id.get(),
     )
     try:
         with s.begin_nested():  # a concurrent enqueue of the same key loses here, without undoing the caller's work
@@ -134,7 +136,8 @@ def _take(s: Session, candidate: Job, worker: str, now: datetime) -> dict[str, A
     s.refresh(candidate)
     s.add(JobAttempt(job_id=candidate.id, attempt=candidate.attempts, worker=worker, started_at=now))
     return {"id": candidate.id, "kind": candidate.kind, "key": candidate.key, "queue": candidate.queue, "payload": dict(candidate.payload or {}),
-            "attempt": candidate.attempts, "max_attempts": candidate.max_attempts, "timeout_seconds": candidate.timeout_seconds}
+            "attempt": candidate.attempts, "max_attempts": candidate.max_attempts, "timeout_seconds": candidate.timeout_seconds,
+            "request_id": candidate.request_id, "call_run_id": candidate.call_run_id}
 
 
 def _in_queue(queue: str | None):
@@ -329,6 +332,11 @@ class Worker:
         fn = _handlers.get(job["kind"])
         error: str | None = None
         timed_out = False
+        # Log lines of this job carry its id, the request that caused it and the call it is about.
+        observability.job_id.set(job["id"])
+        observability.request_id.set(job.get("request_id"))
+        observability.call_id.set(job.get("call_run_id"))
+        started = time.perf_counter()
         try:
             if fn is None:
                 raise RuntimeError(f"no handler is registered for job kind '{job['kind']}'")
@@ -340,6 +348,8 @@ class Worker:
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
         status = await run_db(lambda s: finish(s, job["id"], self.name, job["attempt"], error, timed_out=timed_out))
+        observability.JOB_DURATION.labels(job["kind"]).observe(time.perf_counter() - started)
+        observability.JOBS_FINISHED.labels(job["kind"], job.get("queue") or "default", "ok" if error is None else ("dead" if status == "dead" else ("timeout" if timed_out else "retry"))).inc()
         if error:
             log.warning("job %s (%s) attempt %s/%s failed: %s -> %s", job["id"], job["kind"], job["attempt"], job["max_attempts"], error, status)
         if status == "dead" and job["kind"] in _dead_hooks:
@@ -367,6 +377,10 @@ class Worker:
             except Exception:
                 log.exception("job worker: polling failed")
             await asyncio.sleep(self.poll_seconds)
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
 
     def start(self) -> None:
         if self._task is None or self._task.done():

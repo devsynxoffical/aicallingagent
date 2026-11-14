@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable
 
+from ..observability import CALL_MODEL_FAILURES
 from .session import CallSession
 
 log = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class ModelFailure:
         if session.ended_by_agent or session.failure:
             return  # the call is already ending
         session.model_failures += 1
+        CALL_MODEL_FAILURES.inc()
         language = session.language.current if session.language else "en"
         reason = type(getattr(error, "exception", None)).__name__ if getattr(error, "exception", None) else "error"
         session.log_tool("model_failure", {"count": session.model_failures}, {"ok": False, "kind": reason})

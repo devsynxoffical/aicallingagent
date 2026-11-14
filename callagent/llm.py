@@ -187,6 +187,17 @@ def record_usage(
 
     from . import db
 
+    from . import observability
+
+    cost = cost_of(model, tokens, settings, fast=fast)
+    observability.AI_REQUESTS.labels(workflow, outcome).inc(max(1, requests))
+    observability.AI_DURATION.labels(workflow).observe(duration_ms / 1000)
+    for kind in ("input", "output", "cache_read", "cache_write"):
+        if tokens.get(kind):
+            observability.AI_TOKENS.labels(workflow, kind).inc(tokens[kind])
+    if cost:
+        observability.AI_COST.labels(workflow).inc(float(cost))
+
     ids = _attribution.get()
     try:
         with db.session_scope() as s:
@@ -211,10 +222,11 @@ def record_usage(
                     prompt_hash=fingerprint, requests=requests, attempts=attempts, input_tokens=tokens.get("input", 0),
                     output_tokens=tokens.get("output", 0), cache_read_tokens=tokens.get("cache_read", 0),
                     cache_write_tokens=tokens.get("cache_write", 0), duration_ms=duration_ms, outcome=outcome,
-                    cost_usd=cost_of(model, tokens, settings, fast=fast), request_id=(request_id or None) and str(request_id)[:80],
+                    cost_usd=cost, request_id=(request_id or None) and str(request_id)[:80],
                 )
             )
     except Exception:
+        observability.AI_UNRECORDED.inc()
         log.exception("AI usage could not be recorded (workflow %s, model %s, %s tokens in, %s out)", workflow, model, tokens.get("input"), tokens.get("output"))
 
 

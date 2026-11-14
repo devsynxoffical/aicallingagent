@@ -33,6 +33,10 @@ def start_worker() -> jobs.Worker:
     return worker
 
 
+def worker_running() -> bool:
+    return worker is not None and worker.running
+
+
 async def stop_worker() -> None:
     global worker
     if worker is not None:

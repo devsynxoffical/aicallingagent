@@ -1,0 +1,120 @@
+# Alert rules for the calling engine, for Prometheus.
+#
+# The thresholds are starting points chosen by reasoning, not from production traffic:
+# there has been none. Review each one after the first weeks of real calls.
+# Scrape /metrics with METRICS_TOKEN as a bearer token. See docs/OBSERVABILITY.md.
+groups:
+  - name: callagent-availability
+    rules:
+      - alert: EngineDown
+        expr: up{job="callagent"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: The calling engine does not answer its metrics endpoint.
+          action: Check the process and its host. Calls in progress were cut off; they are finished by the queue when the engine is back.
+      - alert: BackgroundWorkerStopped
+        expr: callagent_worker_running == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The background worker is not running; reviews, document reading and call recovery are not happening.
+          action: Restart the engine. Queued work is kept and resumes.
+      - alert: ErrorRateHigh
+        expr: sum(rate(callagent_http_requests_total{status=~"5.."}[5m])) / sum(rate(callagent_http_requests_total[5m])) > 0.02
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: More than 2% of requests fail with a server error.
+          action: Read the logs at level error for the last minutes; each line has a request_id.
+      - alert: RequestsSlow
+        expr: histogram_quantile(0.95, sum by (le) (rate(callagent_http_request_duration_seconds_bucket[10m]))) > 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: 95% of requests take longer than one second.
+          action: Look at database pool use and thread pool backlog on the same dashboard.
+
+  - name: callagent-calls
+    rules:
+      - alert: CampaignStoppedProviderFailing
+        expr: increase(callagent_campaigns_stopped_total{reason="provider_failure"}[15m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: A campaign stopped itself because answered calls had no agent speech.
+          action: The speech or AI provider is probably failing or its key was revoked. Check the Setup screen, then start the campaign again.
+      - alert: ModelFailingDuringCalls
+        expr: increase(callagent_call_model_failures_total[10m]) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: The AI model failed to answer several turns of live calls.
+          action: Check the AI provider's status and rate limits.
+      - alert: CallsAnswerSlowly
+        expr: histogram_quantile(0.5, sum by (le) (rate(callagent_call_response_seconds_bucket[30m]))) > 1.5
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: On a typical call the agent takes more than 1.5 seconds to start answering.
+          action: Compare the per-stage latency on recent calls (speech-to-text, model, voice) in the console.
+
+  - name: callagent-background
+    rules:
+      - alert: CallWorkWaiting
+        expr: callagent_jobs_oldest_due_seconds{queue="calls"} > 120
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: Work that belongs to calls (finishing calls, booking notifications) has waited more than two minutes.
+          action: Check that the worker runs and what the calls queue is doing (GET /api/jobs).
+      - alert: AnalysisBacklog
+        expr: callagent_jobs_oldest_due_seconds{queue=~"analysis|knowledge"} > 1800
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: Reviews or document reading have waited more than half an hour.
+          action: Usually the AI provider is slow or limited. Calls are not affected.
+      - alert: JobsGaveUp
+        expr: increase(callagent_jobs_finished_total{outcome="dead"}[30m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: A background job failed all its attempts.
+          action: See it with GET /api/jobs?status=dead; fix the cause, then retry it from the System screen.
+      - alert: AIProviderUnavailable
+        expr: sum(rate(callagent_ai_requests_total{outcome=~"overloaded|timeout|unreachable|busy"}[10m])) / sum(rate(callagent_ai_requests_total[10m])) > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: More than a fifth of AI requests end overloaded, timed out or unreachable.
+          action: Check the provider's status and this account's limits. Reviews and training runs are retried by the queue.
+
+  - name: callagent-capacity
+    rules:
+      - alert: DatabasePoolNearlyFull
+        expr: callagent_db_pool_in_use / callagent_db_pool_size > 0.9
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Nearly all database connections are in use.
+          action: Requests will start to wait. Look for slow queries; raise DB_POOL_SIZE only if the database has room.
+      - alert: CallPathThreadsBackedUp
+        expr: callagent_thread_pool_backlog{pool="db"} > 10
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: Database work on the request and call path is waiting for a thread.
+          action: Live calls may be delayed. Check database latency first.
+
+  - name: callagent-records
+    rules:
+      - alert: UsageNotRecorded
+        expr: increase(callagent_ai_usage_unrecorded_total[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: AI usage could not be written; usage and cost reports will be short by it.
+          action: The log line "AI usage could not be recorded" has the token counts.
+      - alert: AuditNotRecorded
+        expr: increase(callagent_audit_unrecorded_total[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: An audit entry could not be written.
+          action: The log line "an audit entry could not be written" says which action and by whom.
