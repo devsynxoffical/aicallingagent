@@ -608,6 +608,18 @@ async def get_call(call_run_id: int):
     return await run_db(_q)
 
 
+def spreadsheet_safe(value):
+    """A cell that starts with =, +, - or @ is run as a formula by spreadsheet programs.
+    Names, notes and summaries come from lead sheets and from what people said on calls,
+    so such cells get a leading apostrophe and are shown as text. Phone numbers keep
+    their plus sign: a plus followed only by digits is not a formula."""
+    if not isinstance(value, str) or not value or value[0] not in "=+-@\t\r":
+        return value
+    if value[0] == "+" and value[1:].isdigit():
+        return value
+    return "'" + value
+
+
 @app.get("/api/campaigns/{name}/export.csv", dependencies=[Depends(require_api_token)])
 async def export_csv(name: str):
     def _rows(s):
@@ -643,6 +655,6 @@ async def export_csv(name: str):
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()) if rows else ["phone"])
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows([{key: spreadsheet_safe(value) for key, value in row.items()} for row in rows])
     buf.seek(0)
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{name}-results.csv"'})

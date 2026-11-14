@@ -91,3 +91,21 @@ def test_twilio_signature_is_enforced(tmp_path, monkeypatch):
         r = c.post("/twilio/status?call_run_id=1", data={"CallStatus": "completed"})
         assert r.status_code == 403
     get_settings.cache_clear()
+
+
+def test_export_cannot_carry_spreadsheet_formulas(client, sample_playbook):
+    """Lead names and notes are typed by other people; a spreadsheet must show them as text."""
+    import csv
+    import io
+
+    from callagent import db
+    from callagent.server import spreadsheet_safe
+
+    client.post("/api/campaigns", json={"name": "export", "playbook": sample_playbook.model_copy(update={"open_questions": []}).model_dump()})
+    with db.session_scope() as s:
+        campaign = db.get_campaign_by_name(s, "export")
+        s.add(db.Lead(campaign_id=campaign.id, phone_e164="+14155550123", first_name="=HYPERLINK(\"http://evil.example\",\"click\")", company="@SUM(A1:A9)", notes="-2+3 cmd"))
+    rows = list(csv.DictReader(io.StringIO(client.get("/api/campaigns/export/export.csv").text)))
+    assert rows[0]["first_name"].startswith("'=HYPERLINK") and rows[0]["company"] == "'@SUM(A1:A9)" and rows[0]["notes"] == "'-2+3 cmd"
+    assert rows[0]["phone"] == "+14155550123"  # a phone number is not a formula
+    assert spreadsheet_safe("Maria") == "Maria" and spreadsheet_safe(3) == 3 and spreadsheet_safe("") == ""
