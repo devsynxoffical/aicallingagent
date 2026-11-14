@@ -24,6 +24,26 @@ COMPANY_COLUMNS = ("company", "business", "company name", "business name", "orga
 EMAIL_COLUMNS = ("email", "e-mail", "email address")
 TZ_COLUMNS = ("timezone", "time zone", "tz")
 NOTES_COLUMNS = ("notes", "note", "comments", "comment")
+CONSENT_COLUMNS = ("consent", "consent_basis", "consent basis", "opt_in", "opt-in", "optin", "opted in", "permission")
+CONSENT_DATE_COLUMNS = ("consent_date", "consent date", "consent_at", "opt_in_date", "opt-in date", "opted in at")
+CONSENT_SOURCE_COLUMNS = ("consent_source", "consent source", "opt_in_source", "opt-in source")
+_NO = {"", "no", "n", "false", "0", "none", "nan", "non", "لا"}
+_YES = {"yes", "y", "true", "1", "oui", "x", "نعم"}
+
+
+def consent_of(value: str) -> str | None:
+    """What a sheet's consent cell means: nothing, a plain yes ("opt_in"), or the ground it names."""
+    text = (value or "").strip()
+    if text.lower() in _NO:
+        return None
+    return "opt_in" if text.lower() in _YES else text[:60]
+
+
+def _moment(value: str):
+    if not value:
+        return None
+    parsed = pd.to_datetime(value, errors="coerce", utc=True)
+    return None if pd.isna(parsed) else parsed.to_pydatetime()
 
 
 @dataclass
@@ -32,12 +52,14 @@ class ImportReport:
     invalid_phone: int = 0
     duplicates: int = 0
     dnc: int = 0
+    with_consent: int = 0  # of the rows read, how many came with a ground for calling
     column_map: dict[str, str] = field(default_factory=dict)
     samples_invalid: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "imported": self.imported,
+            "with_consent": self.with_consent,
             "invalid_phone": self.invalid_phone,
             "duplicates": self.duplicates,
             "dnc": self.dnc,
@@ -118,6 +140,9 @@ def map_columns(df: pd.DataFrame) -> dict[str, str]:
         ("email", EMAIL_COLUMNS),
         ("timezone", TZ_COLUMNS),
         ("notes", NOTES_COLUMNS),
+        ("consent", CONSENT_COLUMNS),
+        ("consent_at", CONSENT_DATE_COLUMNS),
+        ("consent_source", CONSENT_SOURCE_COLUMNS),
     ):
         if key == "name" and "first_name" in mapping:
             continue  # a full-name column only matters when there is no first-name column
@@ -175,15 +200,33 @@ def rows_to_leads(df: pd.DataFrame, mapping: dict[str, str], default_region: str
                 "timezone": val("timezone") or None,
                 "notes": val("notes"),
                 "extra": {k: v for k, v in extra.items() if v},
+                "consent_basis": consent_of(val("consent")) if "consent" in mapping else None,
+                "consent_at": _moment(val("consent_at")),
+                "consent_source": val("consent_source")[:200],
             }
         )
     return out, report
 
 
-def import_leads(session: Session, campaign: Campaign, source: str | Path, default_region: str = "US") -> ImportReport:
+def import_leads(session: Session, campaign: Campaign, source: str | Path, default_region: str = "US", *, consent_basis: str | None = None,
+                 consent_source: str = "") -> ImportReport:
+    """Add a sheet's people to a campaign. ``consent_basis`` states one ground for
+    calling everyone in the sheet (for a list that was collected in one way); a consent
+    column in the sheet says it per person and wins where it is filled."""
+    from ..db import utcnow
+
     df = load_sheet(source)
     mapping = map_columns(df)
     rows, report = rows_to_leads(df, mapping, default_region)
+    stated = (consent_basis or "").strip()[:60] or None
+    for r in rows:
+        if r["consent_basis"] is None and stated and "consent" not in mapping:
+            r["consent_basis"], r["consent_source"] = stated, (r["consent_source"] or consent_source.strip()[:200])
+        if r["consent_basis"] and r["consent_at"] is None:
+            r["consent_at"] = utcnow()  # no date given: on record from the moment of the import
+        if not r["consent_basis"]:
+            r["consent_at"], r["consent_source"] = None, ""
+        report.with_consent += bool(r["consent_basis"])
     existing = set(
         session.execute(select(Lead.phone_e164).where(Lead.campaign_id == campaign.id)).scalars().all()
     )

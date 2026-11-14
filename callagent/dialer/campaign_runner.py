@@ -8,7 +8,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, or_, select, update
+from sqlalchemy import case, or_, select, true, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -65,6 +65,10 @@ def claim_lead_for_call(s: Session, campaign_id: int, lead_id: int, *, manual: b
         # The same person is a lead in another campaign of this organization and is on a
         # call from it right now. Ringing them a second time helps nobody; the lead stays due.
         raise LeadNotDialable(f"{lead.phone_e164} is on a call from another campaign right now")
+    owner = s.get(Campaign, campaign_id)
+    if owner is not None and campaign_rules.rules_of(owner).require_consent and not lead.consent_basis:
+        # Decided here, in the one place every outbound call passes: the dial loop, a manual dial, any other process.
+        raise LeadNotDialable("this campaign calls only people with consent on record, and there is none for this lead")
     allowed = Lead.status.not_in(NEVER_DIALABLE) if manual else Lead.status.in_(AUTO_DIALABLE)
     claimed = s.execute(
         update(Lead).where(Lead.id == lead_id, Lead.campaign_id == campaign_id, allowed).values(status="calling", attempts=Lead.attempts + 1)
@@ -149,6 +153,9 @@ def pick_next_lead(s: Session, campaign_id: int, settings: Settings) -> Lead | N
     now = utcnow()
     settings = campaign_settings(s, campaign_id, settings)
     days = campaign_rules.calling_days(s.get(Campaign, campaign_id))
+    campaign = s.get(Campaign, campaign_id)
+    # With the campaign's consent rule on, people with nothing on record are never picked.
+    on_record = Lead.consent_basis.is_not(None) if campaign is not None and campaign_rules.rules_of(campaign).require_consent else true()
     # Callbacks the prospect asked for are honored even past max_attempts, and go first.
     candidates = (
         s.execute(
@@ -158,6 +165,7 @@ def pick_next_lead(s: Session, campaign_id: int, settings: Settings) -> Lead | N
                 Lead.status.in_(("pending", "callback")),
                 or_(Lead.attempts < settings.max_attempts, Lead.status == "callback"),
                 (Lead.next_attempt_at.is_(None)) | (Lead.next_attempt_at <= now),
+                on_record,
             )
             .order_by(
                 case((Lead.status == "callback", 0), else_=1),
@@ -436,12 +444,16 @@ class CampaignRunner:
 
     def _remaining(self, s: Session, campaign_id: int) -> int:
         max_attempts = campaign_settings(s, campaign_id, self.settings).max_attempts
+        campaign = s.get(Campaign, campaign_id)
+        # People the consent rule keeps uncalled are not "remaining": a campaign with only those left is finished.
+        on_record = Lead.consent_basis.is_not(None) if campaign is not None and campaign_rules.rules_of(campaign).require_consent else true()
         return len(
             s.execute(
                 select(Lead.id).where(
                     Lead.campaign_id == campaign_id,
                     Lead.status.in_(("pending", "callback", "queued", "calling")),
                     or_(Lead.attempts < max_attempts, Lead.status == "callback"),
+                    on_record,
                 )
             ).all()
         )

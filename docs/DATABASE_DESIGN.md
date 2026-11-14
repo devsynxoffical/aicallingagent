@@ -235,3 +235,10 @@ not at its version.
   SHA-256 of the key (unique), who created it, when it was last used and revoked.
   A tenant table. The key itself is never stored.
 
+## Consent and erasure (migration 0015)
+
+- `leads.consent_basis`, `consent_at`, `consent_source`: the ground on record for
+  calling a person, when it was established and where.
+- `call_runs.content_erased_at`: when what was said on a call was removed, by an
+  erasure or by the organization's retention period.
+

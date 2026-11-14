@@ -566,6 +566,7 @@ provider credentials; every provider in the tests is a stand-in. Read
 | `docs/BILLING_ARCHITECTURE.md` | The usage ledger and budgets |
 | `docs/OBSERVABILITY.md` | Logs, health, metrics, alerts, audit trail |
 | `docs/SECURITY_REVIEW.md` | Security by area, and what is open |
+| `docs/COMPLIANCE.md` | Consent, do-not-call, erasure and retention: what is enforced, and what a lawyer must decide per market |
 | `docs/PERFORMANCE_TESTING.md`, `docs/LOAD_TEST_RESULTS.md` | What was measured, how, and the numbers |
 | `docs/DISASTER_RECOVERY.md` | Backups, restoring, stopping and starting |
 

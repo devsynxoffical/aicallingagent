@@ -22,7 +22,7 @@ from pipecat.runner.utils import parse_telephony_websocket
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from . import background, billing, db, events, jobs, leader, llm, observability, orgsettings
+from . import background, billing, db, events, jobs, leader, llm, observability, orgsettings, privacy
 from .apideps import get_campaign as _get_campaign
 from .accounts.api import public as accounts_public_router
 from .accounts.api import router as accounts_router
@@ -95,6 +95,18 @@ async def lifespan(app: FastAPI):
 
     in_step = asyncio.create_task(keep_in_step(), name="campaign-sync")
 
+    async def keep_retention():
+        """Hourly, in the process that leads: remove call content older than each organization's retention period."""
+        while True:
+            if runner.leading:
+                try:
+                    await run_db(privacy.apply_retention, unrestricted=True, slow=True)
+                except Exception:
+                    log.exception("the retention pass failed")
+            await asyncio.sleep(3600)
+
+    retention = asyncio.create_task(keep_retention(), name="retention")
+
     async def scheduled_backups():
         """Only when BACKUP_EVERY_HOURS is set, and only in the process that leads."""
         from . import backup
@@ -115,7 +127,7 @@ async def lifespan(app: FastAPI):
     # Calls that went quiet are resolved by asking the provider, for every campaign.
     reconciler = asyncio.create_task(reconcile_forever(should_run=lambda: runner.leading), name="call-reconciler")
     yield
-    for task in filter(None, (reconciler, in_step, backups)):
+    for task in filter(None, (reconciler, in_step, backups, retention)):
         task.cancel()
         try:
             await task
@@ -767,16 +779,84 @@ async def get_campaign(name: str):
 
 
 @app.post("/api/campaigns/{name}/leads", dependencies=[Depends(require_api_token)])
-async def upload_leads(name: str, file: UploadFile = File(...), settings: Settings = Depends(get_settings)):
+async def upload_leads(name: str, file: UploadFile = File(...), consent: str | None = None, consent_source: str = "", settings: Settings = Depends(get_settings)):
+    """Add a sheet of people to a campaign. ``consent`` states one ground for calling
+    everyone in the sheet (for example ``opt_in``), with ``consent_source`` saying where
+    it was obtained; a consent column in the sheet says it per person instead."""
     suffix = Path(file.filename or "leads.csv").suffix or ".csv"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(await file.read())
         path = tmp.name
     try:
-        report = await run_db(lambda s: import_leads(s, _get_campaign(s, name), path, settings.default_phone_region), slow=True)  # parsing a sheet can take a while
+        report = await run_db(lambda s: import_leads(s, _get_campaign(s, name), path, settings.default_phone_region, consent_basis=consent, consent_source=consent_source),
+                              slow=True)  # parsing a sheet can take a while
     finally:
         Path(path).unlink(missing_ok=True)
     return report.as_dict()
+
+
+# ----------------------------------------------------------------------------- do-not-call list, erasure
+
+
+class DoNotCallIn(BaseModel):
+    phone: str = Field(min_length=3, max_length=40)
+    reason: str = Field(default="", max_length=200)
+
+
+@app.get("/api/do-not-call", dependencies=[Depends(require_api_token)])
+async def do_not_call_list(q: str | None = None, limit: int = 100, before_id: int | None = None):
+    """The numbers the caller's organization never calls, newest first."""
+    return await run_db(lambda s: privacy.list_do_not_call(s, organization_id(), q, limit, before_id))
+
+
+@app.post("/api/do-not-call", status_code=201, dependencies=[Depends(require_api_token)])
+async def do_not_call_add(body: DoNotCallIn, settings: Settings = Depends(get_settings)):
+    """Add one number. It is never called again, and comes out of every call list at once."""
+    result = await run_db(lambda s: privacy.import_do_not_call(s, organization_id(), [body.phone], body.reason or "added by hand", settings.default_phone_region))
+    if result["invalid"]:
+        raise HTTPException(400, f"'{body.phone}' is not a phone number")
+    return result
+
+
+@app.post("/api/do-not-call/import", dependencies=[Depends(require_api_token)])
+async def do_not_call_import(file: UploadFile = File(...), reason: str = "imported list", settings: Settings = Depends(get_settings)):
+    """Add a list of numbers: a public do-not-call register, or another system's
+    suppression list. One number per line, or a sheet whose first column holds them."""
+    text = (await file.read()).decode("utf-8-sig", errors="replace")
+    numbers = [line.split(",")[0].split(";")[0].split("\t")[0].strip().strip('"') for line in text.splitlines()]
+    return await run_db(lambda s: privacy.import_do_not_call(s, organization_id(), numbers, reason, settings.default_phone_region), slow=True)
+
+
+@app.delete("/api/do-not-call/{entry_id}", dependencies=[Depends(require_api_token)])
+async def do_not_call_remove(entry_id: int):
+    """Take a number off the list. For an admin: it allows the number to be called again."""
+
+    def _remove(s):
+        entry = privacy.remove_do_not_call(s, organization_id(), entry_id)
+        if entry is None:
+            raise HTTPException(404, "no such entry")
+        return privacy.describe_entry(entry)
+
+    return await run_db(_remove)
+
+
+class EraseIn(BaseModel):
+    phone: str = Field(min_length=3, max_length=40)
+    keep_on_do_not_call: bool = Field(default=True, description="Keep the number on the do-not-call list, so the person is never called again.")
+
+
+@app.post("/api/people/erase", dependencies=[Depends(require_api_token)])
+async def erase_person(body: EraseIn, settings: Settings = Depends(get_settings)):
+    """Remove what the caller's organization holds about the person with this number:
+    their details, what was said on their calls, messages they sent. Cannot be undone."""
+
+    def _erase(s):
+        try:
+            return privacy.erase_person(s, organization_id(), body.phone, settings.default_phone_region, keep_on_do_not_call=body.keep_on_do_not_call)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+
+    return await run_db(_erase)
 
 
 def _cannot_call(s, settings: Settings) -> str | None:

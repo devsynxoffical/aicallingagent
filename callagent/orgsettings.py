@@ -50,6 +50,8 @@ class OrganizationSettings(BaseModel):
     booking_webhook_secret: str | None = Field(default=None, max_length=200)
     cost_per_connected_minute_usd: float | None = Field(default=None, ge=0, le=100)
     cost_per_call_attempt_usd: float | None = Field(default=None, ge=0, le=100)
+    # After this many days, what was said on a call (transcript, review, recording link) is removed. Empty: kept.
+    retention_days: int | None = Field(default=None, ge=1, le=3650)
 
     @field_validator("from_numbers")
     @classmethod
@@ -120,6 +122,7 @@ def describe(org: Organization, settings: Settings) -> dict[str, Any]:
         "cost_per_connected_minute_usd": own.cost_per_connected_minute_usd if own.cost_per_connected_minute_usd is not None else settings.cost_per_connected_minute_usd,
         "cost_per_call_attempt_usd": own.cost_per_call_attempt_usd if own.cost_per_call_attempt_usd is not None else settings.cost_per_call_attempt_usd,
         "can_place_calls": bool(own.from_numbers or (is_default(org) and settings.twilio_from_number)),
+        "retention_days": own.retention_days,
     }
 
 
@@ -127,12 +130,14 @@ def _save(org: Organization, new: OrganizationSettings) -> None:
     org.settings_json = new.model_dump(exclude_none=True)
 
 
-def set_by_admin(org: Organization, *, human_transfer_number: str | None, booking_webhook_url: str | None, booking_webhook_secret: str | None, keep_secret: bool) -> None:
-    """What an organization's own admin decides. ``keep_secret``: the secret was not sent, leave it as it is."""
+def set_by_admin(org: Organization, *, human_transfer_number: str | None, booking_webhook_url: str | None, booking_webhook_secret: str | None, keep_secret: bool,
+                 retention_days: int | None = None, keep_retention: bool = True) -> None:
+    """What an organization's own admin decides. ``keep_secret`` / ``keep_retention``: that value was not sent, leave it as it is."""
     current = of(org)
     try:
         new = OrganizationSettings(**{**current.model_dump(), "human_transfer_number": human_transfer_number, "booking_webhook_url": booking_webhook_url,
-                                      "booking_webhook_secret": current.booking_webhook_secret if keep_secret else (booking_webhook_secret or None)})
+                                      "booking_webhook_secret": current.booking_webhook_secret if keep_secret else (booking_webhook_secret or None),
+                                      "retention_days": current.retention_days if keep_retention else retention_days})
     except ValueError as e:
         raise SettingsError(_first_problem(e)) from None
     if new.booking_webhook_url is None:

@@ -86,8 +86,10 @@ def two(client):
         s.add(request)
         s.flush()
         key, _secret = accounts.create_api_key(s, acme_id, "Acme integration", "viewer", "test")
+        db.add_dnc(s, "+14155550177", acme_id, "Acme opt-out")
+        suppressed = s.execute(select(db.DoNotCall).where(db.DoNotCall.phone_e164 == "+14155550177")).scalar_one()
         ids = {"call_run_id": call.id, "job_id": dead.id, "user_id": member["id"], "request_id": request.id, "document_id": document.json()["id"],
-               "lead_id": lead.id, "number": draft.version, "experiment_id": 1, "name": "Acme only", "key_id": key.id}
+               "lead_id": lead.id, "number": draft.version, "experiment_id": 1, "name": "Acme only", "key_id": key.id, "entry_id": suppressed.id}
     return {"acme": acme, "bolt": bolt, "acme_id": acme_id, "bolt_id": bolt_id, "ids": ids}
 
 
@@ -106,6 +108,7 @@ def snapshot(acme_id):
             "requests": [(r.id, r.status) for r in s.execute(select(WebsiteRequest).where(WebsiteRequest.organization_id == acme_id)).scalars()],
             "campaigns": s.execute(select(func.count()).select_from(Campaign).where(Campaign.organization_id == acme_id)).scalar_one(),
             "keys": [(k.id, k.revoked_at) for k in accounts.list_api_keys(s, acme_id)],
+            "do_not_call": sorted(s.execute(select(db.DoNotCall.phone_e164).where(db.DoNotCall.organization_id == acme_id)).scalars()),
             "settings": dict(s.get(db.Organization, acme_id).settings_json or {}),
         }
 
@@ -230,7 +233,7 @@ def test_an_opt_out_belongs_to_the_organization_that_was_asked(client, two):
         assert db.add_dnc(s, "+14155550150", acme_id) is False  # once per organization
 
     sheet = {"file": ("leads.csv", io.BytesIO(b"Phone\n+14155550150\n"), "text/csv")}
-    assert client.post("/api/campaigns/Acme only/leads", files=sheet, headers=acme).json() == {"imported": 0, "invalid_phone": 0, "duplicates": 0, "dnc": 1, "column_map": {"phone": "Phone"}, "samples_invalid": []}
+    assert client.post("/api/campaigns/Acme only/leads", files=sheet, headers=acme).json() == {"imported": 0, "with_consent": 0, "invalid_phone": 0, "duplicates": 0, "dnc": 1, "column_map": {"phone": "Phone"}, "samples_invalid": []}
     sheet = {"file": ("leads.csv", io.BytesIO(b"Phone\n+14155550150\n"), "text/csv")}
     theirs = client.post("/api/campaigns/Bolt leads/leads", files=sheet, headers=bolt).json()
     assert (theirs["imported"], theirs["dnc"]) == (1, 0)  # Bolt was never asked, and learns nothing about Acme's list

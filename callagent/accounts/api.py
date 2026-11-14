@@ -197,6 +197,7 @@ class OrganizationSettingsIn(BaseModel):
     human_transfer_number: str | None = Field(default=None, description="Where a call is handed to a person. Empty: the agent cannot transfer.")
     booking_webhook_url: str | None = Field(default=None, description="Where booked meetings are reported. https only. Empty: nowhere.")
     booking_webhook_secret: str | None = Field(default=None, description="Signs each report. Leave out to keep the one already set; it is never shown.")
+    retention_days: int | None = Field(default=None, ge=1, le=3650, description="Remove what was said on a call this many days after it ended. Leave out to keep the current setting; null to keep everything.")
 
 
 @router.get("/organization/settings")
@@ -216,7 +217,8 @@ async def set_organization_settings(body: OrganizationSettingsIn, request: Reque
         org = s.get(Organization, principal.organization_id)
         try:
             orgsettings.set_by_admin(org, human_transfer_number=body.human_transfer_number, booking_webhook_url=body.booking_webhook_url,
-                                     booking_webhook_secret=body.booking_webhook_secret, keep_secret="booking_webhook_secret" not in body.model_fields_set)
+                                     booking_webhook_secret=body.booking_webhook_secret, keep_secret="booking_webhook_secret" not in body.model_fields_set,
+                                     retention_days=body.retention_days, keep_retention="retention_days" not in body.model_fields_set)
         except orgsettings.SettingsError as e:
             raise HTTPException(400, str(e)) from None
         return orgsettings.describe(org, get_settings())

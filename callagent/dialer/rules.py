@@ -38,6 +38,7 @@ class CampaignRules(BaseModel):
     max_opt_out_rate: float | None = Field(default=None, gt=0, le=1, description="Stop if more than this share of answered calls end in a do-not-call request.")
     opt_out_min_calls: int = Field(default=30, ge=5, description="Answered calls needed before the opt-out rate is judged.")
     scoring_weights: dict[str, int] | None = Field(default=None, description="Lead-score weights; see intelligence/scoring.py.")
+    require_consent: bool = Field(default=False, description="Call only people with a ground for calling on record (their consent, an existing relationship). Others stay in the list uncalled.")
 
     @field_validator("calling_days")
     @classmethod

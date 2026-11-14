@@ -67,6 +67,9 @@ OPERATOR_ROUTES = frozenset(
         ("POST", "/api/campaigns/{name}/experiments/{experiment_id}/stop"),
         ("POST", "/api/jobs/{job_id}/retry"),
         ("POST", "/api/requests/{request_id}/handled"),
+        # Adding to the do-not-call list only ever makes fewer calls. Taking a number off it, and erasing a person, are an admin's.
+        ("POST", "/api/do-not-call"),
+        ("POST", "/api/do-not-call/import"),
     }
 )
 

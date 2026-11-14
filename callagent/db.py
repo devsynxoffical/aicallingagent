@@ -134,6 +134,12 @@ class Lead(Base):
     organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id"), index=True)
     phone_e164: Mapped[str] = mapped_column(String(32), index=True)
+    # On what ground this person may be called, when that was established and where: "opt_in"
+    # from a web form, "existing_customer", ... Empty means nothing is on record. A campaign
+    # can be told to call only people with something on record (rules: require_consent).
+    consent_basis: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    consent_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    consent_source: Mapped[str] = mapped_column(String(200), default="")
     raw_phone: Mapped[str] = mapped_column(String(64), default="")
     first_name: Mapped[str] = mapped_column(String(120), default="")
     last_name: Mapped[str] = mapped_column(String(120), default="")
@@ -192,6 +198,9 @@ class CallRun(Base):
     experiment_arm: Mapped[str | None] = mapped_column(String(10), nullable=True)
     # Playbook version this call ran, so results can be compared between versions.
     playbook_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Set when what was said on the call (transcript, review, recording link) was removed:
+    # at the person's request, or because the organization's retention period passed.
+    content_erased_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
     # The number this call was placed from (one of its organization's), kept so that a
     # text, a transfer and any question to the provider about this call use the same one.
     from_number: Mapped[str | None] = mapped_column(String(20), nullable=True)

@@ -18,8 +18,9 @@ numbers or email addresses. Backups can be encrypted.
 What still stands between this and selling to a second customer:
 
 1. **No password reset by email and no second factor** (A-13).
-2. **No data retention or erasure**: transcripts and lead data are kept until
-   someone deletes them in the database.
+2. **No legal review.** Consent, do-not-call lists, erasure and retention are
+   mechanisms an organization configures (`COMPLIANCE.md`); whether a configuration
+   satisfies the law of a market has not been checked by anyone qualified.
 3. **One phone provider account serves every organization.** Each organization has
    its own caller numbers, assigned by the operator, but they are all numbers of
    the deployment's account.
@@ -57,7 +58,7 @@ What still stands between this and selling to a second customer:
 | CSV export | Built | Cells that a spreadsheet would run as formulas are neutralised |
 | Backups | Built | Optional AES-256-GCM encryption with tamper detection; without a key they are written in the clear and the command says so. The key is the operator's to keep safe |
 | Console (browser side) | Partly | Session in an httpOnly SameSite=Strict cookie, never visible to page scripts; all engine access through a server-side proxy limited to `/api/*`; cross-site changes refused; security headers on every response including a content policy that refuses other origins, framing and plugins. The policy allows inline scripts (the framework needs them without per-request nonces), so it does not stop a script injected into a page. Open (E-8): signing in with the engine's token stores that non-expiring token in the cookie; the engine's error text reaches the browser unchanged |
-| Data retention and erasure | **Open** | No retention period, no erase operation for a person's data, no export of one person's data |
+| Data retention and erasure | Built | A person is erased by phone number (details, call content, website messages, stored notifications), by an admin; call content is removed after the organization's retention period. Recordings at the phone provider and old backups are not reached. See `COMPLIANCE.md` |
 | Recording and consent | **Needs a decision per market** (B-13) | The opening can disclose the AI and the recording; what is required where is a legal question |
 | Dependencies | Open | Lower-bound versions, no lock file. CI runs a vulnerability scan as a warning, not a gate; nobody has read its output yet |
 | Container | Built | Runs as an ordinary user (checked in CI, where the image is built), with a health check that has not been seen to pass yet |
@@ -85,7 +86,7 @@ What still stands between this and selling to a second customer:
 
 1. The engine running as an ordinary database role, with `/api/status` showing
    row-level security `enforced`.
-2. A retention period and an erase operation, decided with the customer.
+2. The questions in `COMPLIANCE.md`, section 4, answered for the market by someone qualified.
 3. An outside security review, and the dependency scan read and acted on.
 
 ## Smaller items
