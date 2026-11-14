@@ -20,6 +20,7 @@ def sample_playbook():
 
 POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 APP_ROLE = "callagent_app_test"
+APP_ROLE_PASSWORD = "only-for-the-test-database"  # a server that asks for passwords needs the role to have one
 
 
 def postgres_app_url() -> str:
@@ -33,10 +34,11 @@ def postgres_app_url() -> str:
     with admin.connect() as c:
         if not c.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": APP_ROLE}).scalar():
             c.execute(text(f"CREATE ROLE {APP_ROLE} LOGIN NOSUPERUSER NOBYPASSRLS"))
+        c.execute(text(f"ALTER ROLE {APP_ROLE} PASSWORD '{APP_ROLE_PASSWORD}'"))
         c.execute(text("DROP SCHEMA public CASCADE"))
         c.execute(text(f"CREATE SCHEMA public AUTHORIZATION {APP_ROLE}"))
     admin.dispose()
-    return make_url(POSTGRES_URL).set(username=APP_ROLE, password=None).render_as_string(hide_password=False)
+    return make_url(POSTGRES_URL).set(username=APP_ROLE, password=APP_ROLE_PASSWORD).render_as_string(hide_password=False)
 
 
 @pytest.fixture(autouse=True)
