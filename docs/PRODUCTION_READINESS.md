@@ -25,10 +25,10 @@ Every statement below falls into exactly one of these:
 | **Blocked** | Cannot be done without credentials or infrastructure that is not available here |
 | **Not built** | Does not exist |
 
-Test runs behind this report: the engine's suite, 394 tests on SQLite and 446 with
+Test runs behind this report: the engine's suite, 395 tests on SQLite and 447 with
 PostgreSQL 16 (the same tests, plus those that need PostgreSQL: row-level security,
 real locks, `pg_dump` and `pg_restore`); the console's 70 unit tests and 25 browser
-tests against the engine. All pass. No test is skipped except those that need
+tests against the engine. All pass, locally and (except the browser tests) in CI. No test is skipped except those that need
 PostgreSQL when it is not configured.
 
 ## 1. What the audit found
@@ -140,9 +140,9 @@ Each line names what a test proves. The test names are in the audit's status tab
 | Draining calls on a stop signal | The waiting logic is tested with stand-in calls. A real server process was started, sent a stop signal with no call in progress, and stopped cleanly in two seconds. It has never waited for a real call |
 | Several engine processes | The lease, the job leases and the lead reservation are each tested. Two real processes behind a load balancer have not been run |
 | Scheduled backups | The "is one due" logic and the backup itself are tested; the loop inside the server has not run for hours |
-| The container image | Built by CI, where it runs as an ordinary user and starts the command line. It has not been run as a server, and its health check has not been seen to pass |
+| The container image | Built by CI, where it runs as an ordinary user, starts the command line and carries the PostgreSQL 16 backup tools. It has not been run as a server, and its health check has not been seen to pass |
 | The compose file | Written; never started (no container daemon in the environment this was built in) |
-| The CI workflows | Run on GitHub for both repositories. The first engine run found a fault in the tests' own database setup (a role without a password), since fixed. The dependency scan step reports as a warning and its output has not been read |
+| The CI workflows | Run on GitHub for both repositories, and green. The engine's first runs found two faults that the local setup had hidden, both fixed: the tests' database role had no password, and the backup tools were newer than the database server (a backup written that way is refused on restore; the backup now refuses the mismatch up front). The dependency scan step reports as a warning and its output has not been read |
 | The alert rules | Valid, and refer only to metrics that exist; never loaded into a monitoring system or seen to fire |
 | Live-call AI usage | The accumulation is tested with synthetic usage reports; the voice library's real reports have not been seen |
 | The 0012 and 0013 migrations on a large database | Tested on small ones. The index of 0013 should be built concurrently beforehand on a large, busy PostgreSQL database |
