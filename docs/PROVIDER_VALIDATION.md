@@ -6,8 +6,8 @@ Everything else in this repository was tested with stand-ins.
 | Provider | State |
 | --- | --- |
 | Deepgram (speech to text) | **Partly validated** on 2026-11-15: models, languages, options and accuracy on clean audio, over HTTPS. Live streaming not tested |
+| ElevenLabs (voice) | **Partly validated** on 2026-11-15: the key, the model, the engine's voice settings and telephone-format speech in English, French and Arabic, over HTTPS. The live connection a call uses not tested |
 | Twilio (phone) | Not validated: no credentials |
-| ElevenLabs (voice) | Not validated: no credentials |
 | Anthropic (the agent's model) | Not validated: no credentials |
 
 No phone call has been placed.
@@ -87,6 +87,50 @@ python tools/check_stt.py --audio-dir recordings --language en --language fr --f
 `recordings/` holds `<language>-<n>.wav` (8 kHz, mono, 16-bit) and a `phrases.json`
 with what is said in each. Recordings of real people on a real phone are what
 matters; put those there.
+
+## ElevenLabs, 2026-11-15
+
+Run from the build sandbox with a real ElevenLabs account on the free plan.
+
+- The key is accepted, the account has 21 ready-made voices, and the engine's model
+  (`eleven_flash_v2_5`) lists English, French and Arabic.
+- Speech was requested with the settings the engine sends (stability 0.45,
+  similarity 0.8, style 0.25, speaker boost on, speed 1.0) in the telephone format
+  (`ulaw_8000`), 16 sentences in three languages, plus five lines of an agent's part.
+  Every request succeeded on the free plan.
+- **First audio arrived 190 ms after the request (median; worst 457 ms, the first
+  one), over 16 requests** on the HTTPS streaming endpoint, through the sandbox's
+  proxy. A call uses a WebSocket connection that stays open, which was not tested,
+  so this is an indication and not the figure a caller would experience.
+
+What it does not establish: the live connection, interruption (stopping speech when
+the caller talks over it), how the voice sounds to a person on a real phone, and the
+free plan's licence, which does not cover commercial use.
+
+## Deepgram hearing the ElevenLabs voice, 2026-11-15
+
+The same sentences as above, spoken by ElevenLabs instead of Deepgram's own voices,
+so the recogniser is no longer hearing its own company's speech. Still clean,
+synthetic, single-speaker audio.
+
+| Language | Sentences | Words that differ | Real mistakes |
+| --- | --- | --- | --- |
+| English | 6 | 8 of 71 | 0: digits, `03:30`, an email address written out |
+| French | 5 | 3 of 58 | 0: digits and a hyphen |
+| Arabic | 5 | 14 of 42 | 4, one of which changes the meaning |
+
+**Arabic is now a result, and it is weaker than the other two.** Of the 14
+differences, 9 are spelling conventions (a plain alef for one with hamza, a final
+ha for ta marbuta, `12` for the words) that a reader would not call mistakes. The
+real ones: two short words dropped ("نحن", "من"), one word heard in a dialect form
+("واحنا" for "ونحن"), and **"الساعة الثالثة" (three o'clock) heard as "السعر
+الثالث" (the third price)**. That last one is in a sentence asking for a callback
+at a time, which is exactly where a mistake costs a meeting. Arabic calls need a
+check on real recordings before anything is promised to a customer, and Soniox
+should be compared on the same recordings.
+
+This was the multi-language question too: English and French gave the same output
+in multi-language mode as in single-language mode.
 
 ## Found while re-testing everything on a Sunday
 

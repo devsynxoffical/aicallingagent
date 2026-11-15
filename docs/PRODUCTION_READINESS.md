@@ -164,8 +164,11 @@ None of this is a provider validation.
 
 **Update, 2026-11-15:** a Deepgram key was added and speech recognition was run
 against the real provider over HTTPS: models, options and accuracy on clean English
-and French audio. Live streaming, Arabic and everything about the other three
-providers are still untested. Results and limits: `PROVIDER_VALIDATION.md`.
+and French audio. An ElevenLabs key followed the same day: the engine's voice settings
+produce telephone-format speech in English, French and Arabic, and Deepgram's Arabic
+was measured on it (weaker than the other two). The live connections a call uses,
+the phone provider and the AI model are still untested. Results and limits:
+`PROVIDER_VALIDATION.md`.
 
 | What | Needs |
 | --- | --- |
