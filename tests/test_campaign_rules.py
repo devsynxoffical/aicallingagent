@@ -112,7 +112,7 @@ def test_campaign_attempt_limit_and_retry_delay_drive_the_dialer(tmp_path):
 
 
 def test_higher_priority_leads_are_dialed_first(tmp_path):
-    cid = _campaign(tmp_path)
+    cid = _campaign(tmp_path, calling_days=[0, 1, 2, 3, 4, 5, 6])  # about order, not the calendar
     with db.session_scope() as s:
         s.add(db.Lead(campaign_id=cid, phone_e164="+14155550101", timezone="UTC"))
         s.add(db.Lead(campaign_id=cid, phone_e164="+14155550102", timezone="UTC", priority=5))

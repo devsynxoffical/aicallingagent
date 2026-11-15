@@ -162,6 +162,11 @@ None of this is a provider validation.
 
 ## 7. Blocked by missing credentials
 
+**Update, 2026-11-15:** a Deepgram key was added and speech recognition was run
+against the real provider over HTTPS: models, options and accuracy on clean English
+and French audio. Live streaming, Arabic and everything about the other three
+providers are still untested. Results and limits: `PROVIDER_VALIDATION.md`.
+
 | What | Needs |
 | --- | --- |
 | A real outbound and inbound call, in each language | Phone, speech and AI provider accounts, a phone number |

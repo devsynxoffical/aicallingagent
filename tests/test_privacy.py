@@ -83,7 +83,8 @@ def test_one_ground_can_be_stated_for_a_whole_list_and_a_column_in_the_sheet_win
 def test_a_campaign_that_requires_consent_never_calls_someone_without_it(client):
     upload(client, "First Name,Phone,Consent\nAda,+14155550101,yes\nGrace,+14155550102,\nLinus,+14155550104,\n")
     people, cid = leads(), campaign_id()
-    assert client.put("/api/campaigns/q4/rules", json={"require_consent": True}).status_code == 200
+    # Every day of the week: this is about who may be called, not when.
+    assert client.put("/api/campaigns/q4/rules", json={"require_consent": True, "calling_days": [0, 1, 2, 3, 4, 5, 6]}).status_code == 200
 
     with session_scope() as s:  # the dial loop only ever picks the person on record
         picked = pick_next_lead(s, cid, get_settings())
@@ -99,7 +100,7 @@ def test_a_campaign_that_requires_consent_never_calls_someone_without_it(client)
     assert leads()["+14155550102"].status == "pending"  # still in the list, uncalled
 
     # Without the rule the campaign calls everyone, as before.
-    client.put("/api/campaigns/q4/rules", json={})
+    client.put("/api/campaigns/q4/rules", json={"calling_days": [0, 1, 2, 3, 4, 5, 6]})
     with session_scope() as s:
         assert pick_next_lead(s, cid, get_settings()).phone_e164 == "+14155550102"
 
